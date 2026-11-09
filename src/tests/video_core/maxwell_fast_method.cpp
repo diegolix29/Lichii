@@ -75,15 +75,16 @@ struct GpuSplitTestAccess {
         return GpuSplit::RingWords - 1;
     }
 
+    /// The front waits for the back to reach a position (WaitFor).
+    static bool FrontWaits(const GpuSplit& split) {
+        return split.wait_target.load() != ~u64{0};
+    }
+
     static u64 Execute(GpuSplit& split, u64 position, u64 available) {
         const size_t index = position & GpuSplit::RingMask;
         const size_t size = split.Execute(
             &split.ring[index], std::min<u64>(available - position, GpuSplit::RingWords - index));
         return position + (size != 0 ? size : GpuSplit::RingWords - index);
-    }
-
-    static bool FrontWaits(const GpuSplit& split) {
-        return split.wait_target.load() != ~u64{0};
     }
 
     /// The position a read waits for the back to reach (WaitForWrites).
@@ -244,25 +245,38 @@ struct DmaReadVerifyScope {
     bool previous;
 };
 
-/// A Turing MME instruction that sends the next macro parameter to `method` (as in
-/// native_macro_fifo.cpp); `end` makes the instruction after it the macro's last.
-std::array<u32, 3> FifoInstruction(u32 method, bool end) {
+/// A Turing MME instruction from its fields (TuringMacroInterpreter::Decode); a lane left alone
+/// adds the zero register to itself.
+struct Mme {
+    bool end{};
+    std::array<u32, 2> op{}, dst{24, 24}, src_a{24, 24}, src_b{24, 24}, imm{};
+    std::array<u32, 2> out_method{}, out_emit{};
+};
+
+std::array<u32, 3> Encode(const Mme& fields) {
     std::array<u32, 3> bits{};
-    const auto field = [&](u32 offset, u32 count, u32 value) {
+    const auto field = [&bits](u32 offset, u32 count, u32 value) {
         for (u32 bit = 0; bit < count; ++bit) {
             bits[(offset + bit) / 32] |= ((value >> bit) & 1) << ((offset + bit) % 32);
         }
     };
-    field(0, 1, end);
+    field(0, 1, fields.end ? 1 : 0);
     for (u32 lane = 0; lane < 2; ++lane) {
-        field(15 + lane * 36, 5, 24);
-        field(20 + lane * 36, 5, 24);
-        field(25 + lane * 36, 5, 24);
+        field(10 + lane * 36, 5, fields.op[lane]);
+        field(15 + lane * 36, 5, fields.dst[lane]);
+        field(20 + lane * 36, 5, fields.src_a[lane]);
+        field(25 + lane * 36, 5, fields.src_b[lane]);
+        field(30 + lane * 36, 16, fields.imm[lane]);
+        field(82 + lane * 7, 3, fields.out_method[lane]);
+        field(85 + lane * 7, 4, fields.out_emit[lane]);
     }
-    field(30, 16, method);
-    field(82, 3, 5);
-    field(85, 4, 3);
     return {bits[2], bits[1], bits[0]};
+}
+
+/// A Turing MME instruction that sends the next macro parameter to `method` (as in
+/// native_macro_fifo.cpp); `end` makes the instruction after it the macro's last.
+std::array<u32, 3> FifoInstruction(u32 method, bool end) {
+    return Encode(Mme{.end = end, .imm = {method, 0}, .out_method = {5, 0}, .out_emit = {3, 0}});
 }
 
 } // Anonymous namespace
@@ -954,6 +968,125 @@ TEST_CASE("Split drain waits for the back's idle hook",
     }
 }
 
+TEST_CASE("Split command list fetches wait only for the writers before the last host sync",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    std::array<std::atomic<bool>, 3> release{};
+    std::atomic<bool> done{};
+    bool waited{};
+    std::thread waiter;
+    Access::Start(split, f.system);
+    SCOPE_EXIT {
+        split.Stop();
+    };
+    // Runs before Stop: a failed check must not leave the back in an entry or the waiter waiting.
+    SCOPE_EXIT {
+        for (auto& flag : release) {
+            flag = true;
+        }
+        if (waiter.joinable()) {
+            waiter.join();
+        }
+    };
+    // An entry the back stays in until its flag is set.
+    const auto blocking = [&split](std::atomic<bool>& flag) {
+        split.Defer([&flag] {
+            while (!flag.load()) {
+                std::this_thread::yield();
+            }
+        });
+    };
+    const auto finishes = [&done] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+        while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        return done.load();
+    };
+
+    // A writer sent after the last host-level wait: the fetch does not wait for it.
+    split.NoteSync();
+    blocking(release[0]);
+    split.NoteWriter();
+    split.Publish();
+    REQUIRE_FALSE(split.WaitForSyncedWriters());
+
+    // A wait after it orders that writer before the fetch, but not the writer sent after the wait.
+    split.NoteSync();
+    blocking(release[1]);
+    split.NoteWriter();
+    split.Publish();
+    waiter = std::thread([&] {
+        waited = split.WaitForSyncedWriters();
+        done = true;
+    });
+    // The back reports its position at the target only if the front waits before it passes it.
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (!Access::FrontWaits(split) && !done.load() &&
+           std::chrono::steady_clock::now() < wait_deadline) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    REQUIRE_FALSE(done.load());
+    release[0] = true;
+    REQUIRE(finishes());
+    waiter.join();
+    REQUIRE(waited);
+    release[1] = true;
+    split.Drain(VideoCommon::DrainSite::Other);
+
+    // Other work before the wait is not a writer: the fetch does not wait for it either.
+    split.Defer([] {});
+    split.NoteWriter();
+    split.Drain(VideoCommon::DrainSite::Other);
+    blocking(release[2]);
+    split.NoteSync();
+    split.Publish();
+    REQUIRE_FALSE(split.WaitForSyncedWriters());
+    release[2] = true;
+    split.Drain(VideoCommon::DrainSite::Other);
+
+    // Nor for other work between the last writer before the wait and the wait, when another
+    // writer follows the wait.
+    std::atomic<bool> other{};
+    std::atomic<bool> later{};
+    std::atomic<bool> other_done{};
+    bool other_waited{true};
+    std::thread other_waiter;
+    SCOPE_EXIT {
+        other = true;
+        later = true;
+        if (other_waiter.joinable()) {
+            other_waiter.join();
+        }
+    };
+    split.Defer([] {});
+    split.NoteWriter();
+    split.Drain(VideoCommon::DrainSite::Other);
+    blocking(other);
+    split.NoteSync();
+    blocking(later);
+    split.NoteWriter();
+    split.Publish();
+    other_waiter = std::thread([&] {
+        other_waited = split.WaitForSyncedWriters();
+        other_done = true;
+    });
+    const auto other_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (!other_done.load() && std::chrono::steady_clock::now() < other_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    REQUIRE(other_done.load());
+    other_waiter.join();
+    REQUIRE_FALSE(other_waited);
+    other = true;
+    later = true;
+    split.Drain(VideoCommon::DrainSite::Other);
+}
+
 TEST_CASE("Split restart resets writer positions without replaying old releases",
           "[video_core][gpu_split_dependencies]") {
     using Access = VideoCommon::GpuSplitTestAccess;
@@ -1043,7 +1176,8 @@ TEST_CASE("Maxwell3D's split front uploads macro code sent as one multi-method r
     CHECK(std::equal(code.begin(), code.end(), macros.native_code.begin() + pointer * 3));
 }
 
-TEST_CASE("Split macro DMA reads wait only for the queued work that can write the words",
+TEST_CASE("Split macro DMA reads wait only for the queued work that can write the words, or run "
+          "on the back",
           "[video_core][gpu_split_dependencies]") {
     using Access = VideoCommon::GpuSplitTestAccess;
     using Writes = VideoCommon::GpuSplit::Writes;
@@ -1107,16 +1241,19 @@ TEST_CASE("Split macro DMA reads wait only for the queued work that can write th
 
     // The 3D engine's front, against a running back: macro 0 reads one word with
     // MME_DMA_READ_FIFOED at the address in its first two parameters and sends it to a scratch
-    // register (the load after the read takes the word).
+    // register (the load after the read takes the word). It also clears a data RAM word, which
+    // keeps it on the front. Macro 1 is the same without that and runs on the back; macro 2 (on
+    // the front) copies the scratch register to the next one.
     auto& engine = f.fast;
     engine.SetNativeTuringMacroMode(true);
     constexpr u32 state = MAXWELL3D_REG_INDEX(shadow_scratch) + 1;
+    constexpr u32 copy = state + 1;
     VideoCommon::GpuSplit split;
     Access::Start(split, f.system);
     SCOPE_EXIT {
         split.Stop();
     };
-    std::array<std::atomic<bool>, 4> release{};
+    std::array<std::atomic<bool>, 6> release{};
     std::atomic<bool> done{};
     std::thread reader;
     SCOPE_EXIT {
@@ -1131,8 +1268,20 @@ TEST_CASE("Split macro DMA reads wait only for the queued work that can write th
         engine.FrontCallMethod(f.system, split, method, argument, true);
     };
     std::vector<u32> code;
-    for (const auto instruction : {FifoInstruction(0x154, false), FifoInstruction(0x155, false),
-                                   FifoInstruction(0x158, true), FifoInstruction(state, false)}) {
+    const Mme clear_data_ram{
+        .op = {0, 31}, .imm = {state, 0}, .out_method = {5, 0}, .out_emit = {3, 0}};
+    // Macro 2: the value of `state` (MME register read) sent to `copy`, then a no-op.
+    const Mme read_state{.end = true,
+                         .op = {22, 0},
+                         .src_a = {25, 24},
+                         .imm = {state, copy},
+                         .out_method = {6, 0},
+                         .out_emit = {1, 0}};
+    for (const auto instruction :
+         {FifoInstruction(0x154, false), FifoInstruction(0x155, false),
+          FifoInstruction(0x158, true), Encode(clear_data_ram), FifoInstruction(0x154, false),
+          FifoInstruction(0x155, false), FifoInstruction(0x158, true),
+          FifoInstruction(state, false), Encode(read_state), Encode(Mme{})}) {
         code.insert(code.end(), instruction.begin(), instruction.end());
     }
     front(MAXWELL3D_REG_INDEX(load_mme.instruction_ptr), 0);
@@ -1140,16 +1289,25 @@ TEST_CASE("Split macro DMA reads wait only for the queued work that can write th
                                 code.data(), static_cast<u32>(code.size()),
                                 static_cast<u32>(code.size()));
     front(MAXWELL3D_REG_INDEX(load_mme.start_address_ptr), 0);
-    front(MAXWELL3D_REG_INDEX(load_mme.start_address), 0);
-    const auto dma_read = [&](GPUVAddr address) {
-        engine.FrontCallMethod(f.system, split, 0xe00, static_cast<u32>(address >> 32), false);
-        engine.FrontCallMethod(f.system, split, 0xe01, static_cast<u32>(address), false);
-        engine.FrontCallMethod(f.system, split, 0xe01, 1, true);
+    for (const u32 start : {0U, 4U, 8U}) {
+        front(MAXWELL3D_REG_INDEX(load_mme.start_address), start);
+    }
+    const auto dma_read = [&](GPUVAddr address, u32 macro = 0xe00) {
+        engine.FrontCallMethod(f.system, split, macro, static_cast<u32>(address >> 32), false);
+        engine.FrontCallMethod(f.system, split, macro + 1, static_cast<u32>(address), false);
+        engine.FrontCallMethod(f.system, split, macro + 1, 1, true);
     };
-    const auto read_on_reader = [&](GPUVAddr address) {
+    const auto read_on_reader = [&](GPUVAddr address, u32 macro = 0xe00) {
         done = false;
-        reader = std::thread([&, address] {
-            dma_read(address);
+        reader = std::thread([&, address, macro] {
+            dma_read(address, macro);
+            done = true;
+        });
+    };
+    const auto copy_on_reader = [&] {
+        done = false;
+        reader = std::thread([&] {
+            front(0xe04, 0);
             done = true;
         });
     };
@@ -1250,4 +1408,48 @@ TEST_CASE("Split macro DMA reads wait only for the queued work that can write th
         split.Drain(VideoCommon::DrainSite::Other);
         CHECK(engine.regs.reg_array[state] == 0x33333333);
     }
+
+    // Macro 1 runs on the back: the front goes on past that work, and the back reads the word
+    // after the upload queued behind it.
+    front(state, 0x77777777);
+    blocking(release[4], Writes::Anywhere);
+    upload(word, 0x55555555);
+    read_on_reader(word, 0xe02);
+    REQUIRE(finishes());
+    reader.join();
+    release[4] = true;
+    split.Drain(VideoCommon::DrainSite::Other);
+    CHECK(engine.regs.reg_array[state] == 0x55555555);
+
+    // The front's copy of the register is stale: a write of the value it holds is still sent
+    // (the back sinks it until the next macro).
+    front(state, 0x77777777);
+    front(0xe04, 0);
+    split.Drain(VideoCommon::DrainSite::Other);
+    CHECK(engine.regs.reg_array[state] == 0x77777777);
+
+    // A front macro that reads the register waits for the back's macro and gets its value.
+    blocking(release[5], Writes::Noted);
+    upload(word, 0x66666666);
+    dma_read(word, 0xe02);
+    copy_on_reader();
+    REQUIRE(waits());
+    release[5] = true;
+    REQUIRE(finishes());
+    reader.join();
+    split.Drain(VideoCommon::DrainSite::Other);
+    CHECK(engine.regs.reg_array[copy] == 0x66666666);
+
+    // A replay takes the shadow RAM entry the back's macro tracked from the back.
+    using Control = Maxwell3D::Regs::ShadowRamControl;
+    front(state, 0x99999999);
+    upload(word, 0x88888888);
+    dma_read(word, 0xe02);
+    front(ShadowControl, static_cast<u32>(Control::Replay));
+    front(state, 0);
+    front(ShadowControl, static_cast<u32>(Control::Track));
+    front(0xe04, 0);
+    split.Drain(VideoCommon::DrainSite::Other);
+    CHECK(engine.regs.reg_array[state] == 0x88888888);
+    CHECK(engine.regs.reg_array[copy] == 0x88888888);
 }

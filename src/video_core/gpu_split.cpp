@@ -147,6 +147,7 @@ void GpuSplit::Stop() {
     write_position = 0;
     last_writer_position = 0;
     last_sync_position = 0;
+    synced_writer_position = 0;
     semaphore_writes.clear();
     semaphore_writes_limit = 1024;
     last_any_write = 0;
@@ -338,6 +339,10 @@ u64 GpuSplit::DeviceWritesTarget(DAddr address, u64 size) const {
 bool GpuSplit::WaitForWrites(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) {
     return WaitFor(std::min(WritesTarget(memory, address, size), write_position),
                    DrainSite::MacroDmaWrites);
+}
+
+bool GpuSplit::WaitForSyncedWriters() {
+    return WaitFor(std::min(synced_writer_position, write_position), DrainSite::ListWriters);
 }
 
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {

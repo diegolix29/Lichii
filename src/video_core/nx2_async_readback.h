@@ -17,7 +17,8 @@
 // the bytes to guest memory (BufferCache::FinishReadDownloads). Pages the guest reads after each
 // GPU write get their download right behind the write. A macro DMA read on the split's front
 // waits only for the queued work that can write its words (Maxwell3D::FrontDmaRead,
-// GpuSplit::WaitForWrites).
+// GpuSplit::WaitForWrites); macros whose code reads memory into their FIFO run on the back
+// instead (Maxwell3D::FrontRunOnBack).
 //
 // Diagnostics, off unless set:
 // - EDEN_NX2_READ_CHECK=n: 1 in n read downloads (1 checks them all) is compared with a
@@ -108,6 +109,19 @@ struct Counters {
     std::atomic<u64> clear_landings{};
     std::atomic<u64> clear_waits{};
     std::atomic<u64> clear_wait_ns{};
+    /// Macros that read memory, run on the split's back in its front's place
+    /// (Maxwell3D::FrontRunOnBack): the calls and the back's time in them, their DMA reads, those
+    /// that found GPU-modified words to flush and the time the reads spent writing the caches out
+    /// (part of the calls' time)
+    std::atomic<u64> back_macros{};
+    std::atomic<u64> back_macro_ns{};
+    std::atomic<u64> back_dma_reads{};
+    std::atomic<u64> back_dma_flushes{};
+    std::atomic<u64> back_dma_flush_ns{};
+    /// The front's waits for such macros to run: for registers they wrote, for shadow RAM entries
+    /// they set, and for those sent before the macro code changes
+    std::atomic<u64> back_waits{};
+    std::atomic<u64> back_wait_ns{};
     std::atomic<u64> window_start{};
 };
 
@@ -152,6 +166,25 @@ inline void CountClearLanding(u64 ns) {
     Add(g_counters.clear_wait_ns, ns);
 }
 
+/// The split's back ran a macro in its front's place for ns.
+inline void CountBackMacro(u64 ns) {
+    Add(g_counters.back_macros, 1);
+    Add(g_counters.back_macro_ns, ns);
+}
+
+/// A DMA read of such a macro spent ns writing the caches out, flushing GPU-modified words.
+inline void CountBackDmaRead(bool flushed, u64 ns) {
+    Add(g_counters.back_dma_reads, 1);
+    Add(g_counters.back_dma_flushes, flushed ? 1 : 0);
+    Add(g_counters.back_dma_flush_ns, ns);
+}
+
+/// The front waited ns for such a macro to run.
+inline void CountBackWait(u64 ns) {
+    Add(g_counters.back_waits, 1);
+    Add(g_counters.back_wait_ns, ns);
+}
+
 /// Logs the totals every 10 s and resets them, on whichever thread counting comes first.
 inline void MaybeReport() {
     auto& c = g_counters;
@@ -192,6 +225,13 @@ inline void MaybeReport() {
     const u64 clear_landings = take(c.clear_landings);
     const u64 clear_waits = take(c.clear_waits);
     const u64 clear_wait_ns = take(c.clear_wait_ns);
+    const u64 back_macros = take(c.back_macros);
+    const u64 back_macro_ns = take(c.back_macro_ns);
+    const u64 back_dma_reads = take(c.back_dma_reads);
+    const u64 back_dma_flushes = take(c.back_dma_flushes);
+    const u64 back_dma_flush_ns = take(c.back_dma_flush_ns);
+    const u64 back_waits = take(c.back_waits);
+    const u64 back_wait_ns = take(c.back_wait_ns);
     constexpr auto async = static_cast<size_t>(Read::Async);
     constexpr auto in_flight = static_cast<size_t>(Read::InFlight);
     LOG_INFO(HW_GPU,
@@ -202,14 +242,18 @@ inline void MaybeReport() {
              "GPU wait {:.0f} times, {:.1f} ms | macro DMA reads {:.0f}, {:.0f} waited for the "
              "split's back ({:.1f} ms), {:.0f} drained it | GPU thread landed read downloads before "
              "writes guest memory doesn't hold {:.0f} times, {:.0f} waited for the host GPU "
-             "({:.1f} ms)",
+             "({:.1f} ms) | split's back ran {:.0f} macros that read memory ({:.1f} ms), their DMA "
+             "reads {:.0f}, {:.0f} flushed GPU-modified words ({:.1f} ms writing caches out) | "
+             "front waited for them {:.0f} times ({:.1f} ms)",
              per_second(reads[async]), ms_per_second(read_ns[async]),
              per_second(reads[in_flight]), ms_per_second(read_ns[in_flight]),
              ms_per_second(flush_ns), per_second(reader_waits), ms_per_second(reader_wait_ns),
              static_cast<double>(reader_max_wait_ns) / 1e6, per_second(gpu_side_waits),
              ms_per_second(gpu_side_wait_ns), per_second(dma_reads), per_second(dma_waited),
              ms_per_second(dma_wait_ns), per_second(dma_drained), per_second(clear_landings),
-             per_second(clear_waits), ms_per_second(clear_wait_ns));
+             per_second(clear_waits), ms_per_second(clear_wait_ns), per_second(back_macros),
+             ms_per_second(back_macro_ns), per_second(back_dma_reads), per_second(back_dma_flushes),
+             ms_per_second(back_dma_flush_ns), per_second(back_waits), ms_per_second(back_wait_ns));
 }
 
 } // namespace VideoCore::AsyncReadback
