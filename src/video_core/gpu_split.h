@@ -19,6 +19,10 @@ namespace Core {
 class System;
 }
 
+namespace Tegra {
+class MemoryManager;
+}
+
 namespace Tegra::Engines {
 class EngineInterface;
 }
@@ -35,12 +39,14 @@ enum class DrainSite : u32 {
     ListWriters,    ///< GPU-written command lists: the dispatches and copies sent before them
     ListSync,       ///< Command lists on draw-written pages: the work before the last host sync
     ListFlush,      ///< Command lists on GPU-written pages: drain and flush the pages
-    MacroDmaRead,   ///< The front's macros read memory (MME DMA)
+    MacroDmaRead,   ///< The front's macros read memory (MME DMA) the caches may still write
+    MacroDmaWrites, ///< Those reads: the queued work that can write the words (WaitForWrites)
     MacroDmaFlush,  ///< Those words are in the buffer cache
     GpSyncFence,    ///< A GP entry's sync bit (sync_memory_operations)
     Map,            ///< GPU memory maps before later command reads
     FrontStart,     ///< The front takes an engine's macros over
     FrontVerify,    ///< EDEN_NX2_FRONT_VERIFY
+    RingFull,       ///< The ring is full: the front waits for the back to make room
     Count,
 };
 
@@ -82,9 +88,10 @@ inline void Count(std::atomic<u64>& counter, u64 amount = 1) {
 }
 
 inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
-    "other",       "fetch drain",     "acquire",    "semaphore flush", "fence release",
-    "list writers", "list sync",      "list flush", "macro dma read",  "macro dma flush",
-    "gp sync fence", "map",           "front start", "front verify",
+    "other",           "fetch drain",   "acquire",    "semaphore flush", "fence release",
+    "list writers",    "list sync",     "list flush", "macro dma read",  "macro dma writes",
+    "macro dma flush", "gp sync fence", "map",        "front start",     "front verify",
+    "ring full",
 };
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -149,10 +156,17 @@ public:
     void MaybeStart(Core::System& system);
     void Stop();
 
+    /// What the sender of an entry tells about the guest memory the back writes running it, for
+    /// the front's reads of guest memory (WaitForWrites).
+    enum class Writes : u8 {
+        Anywhere, ///< Unknown: a read anywhere waits for the entry
+        Noted,    ///< Nothing, or what the sender notes right after sending it (NoteWrite)
+    };
+
     /// An engine method write, executed as DmaPusher would (method sink, ConsumeSink, call).
     /// `segment`: the engine's current_dma_segment for the call, when the engine reads it.
     void Method(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, bool is_last,
-                const GPUVAddr* segment) {
+                const GPUVAddr* segment, Writes writes = Writes::Anywhere) {
         SelectEngine(engine);
         const size_t words = segment != nullptr ? 2 : 1;
         u64* const entry = Reserve(words);
@@ -163,16 +177,24 @@ public:
             entry[1] = *segment;
         }
         Commit(words);
+        if (writes == Writes::Anywhere) {
+            NoteAnyWrite();
+        }
     }
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
-                     u32 amount, u32 methods_pending, const GPUVAddr* segment);
+                     u32 amount, u32 methods_pending, const GPUVAddr* segment,
+                     Writes writes = Writes::Anywhere);
     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
-    void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+    void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
+                    Writes writes = Writes::Anywhere) {
         SelectEngine(engine);
         u64* const entry = Reserve(1);
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
                    (u64{argument} << 32);
         Commit(1);
+        if (writes == Writes::Anywhere) {
+            NoteAnyWrite();
+        }
     }
 
     /// Defer flag: the call doesn't end fast draw reuse (nx2_fast_draw.h).
@@ -181,7 +203,7 @@ public:
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
     /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to.
     template <typename Func>
-    void Defer(const Func& func, u64 flags = 0) {
+    void Defer(const Func& func, u64 flags = 0, Writes writes = Writes::Anywhere) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         u64* const entry = Reserve(2 + payload);
@@ -189,6 +211,9 @@ public:
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload);
+        if (writes == Writes::Anywhere) {
+            NoteAnyWrite();
+        }
     }
     void DeferFunction(std::function<void()>&& func);
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
@@ -255,6 +280,18 @@ public:
     [[nodiscard]] std::optional<QueuedSemaphoreWrite> QueuedSemaphoreWriteAt(
         u64 device_address) const;
 
+    /// The entry just sent (Writes::Noted) writes [address, address + size) of `memory`.
+    void NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size);
+    /// The entry just sent may write guest memory anywhere.
+    void NoteAnyWrite() {
+        last_any_write = write_position;
+    }
+    /// Waits until the back executed every entry sent so far that can write guest memory in
+    /// [address, address + size) of `memory`, not the others. Returns whether one was queued.
+    /// Writes are placed by the device memory the GPU addresses map to when noted and read: GPU
+    /// maps drain the split first (GPU::MapInOrder), the unmaps it is sent count as anywhere.
+    bool WaitForWrites(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size);
+
 private:
     friend struct GpuSplitTestAccess;
 
@@ -275,6 +312,22 @@ private:
     static constexpr size_t PublishEvery = 256;
     /// Words a back waiting for work gets without a publish_every (Commit).
     static constexpr size_t PublishAfterWait = 8;
+
+    /// NoteWrite places writes by 256-byte granule of device memory, up to MaxNotedBytes long
+    /// (longer ones count as anywhere), in write_positions slots hashed by granule: granules that
+    /// share a slot share its position, so a read may wait for a write elsewhere, never miss one.
+    static constexpr u32 WriteGranuleBits = 8;
+    static constexpr u64 MaxNotedBytes = 0x4000;
+    static constexpr u32 WriteSlotBits = 10;
+
+    static size_t WriteSlot(u64 granule) {
+        return static_cast<size_t>((granule * 0x9E3779B97F4A7C15ULL) >> (64 - WriteSlotBits));
+    }
+    void NoteDeviceWrite(DAddr address, u64 size);
+    /// The position WaitForWrites waits for.
+    [[nodiscard]] u64 WritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address,
+                                   u64 size) const;
+    [[nodiscard]] u64 DeviceWritesTarget(DAddr address, u64 size) const;
 
     template <typename Func>
     static void CallThunk(const u64* payload) {
@@ -347,6 +400,11 @@ private:
     /// The front's NoteSemaphoreWrite, by word address.
     std::unordered_map<u64, SemaphoreWrite> semaphore_writes;
     size_t semaphore_writes_limit = 1024; ///< Forget what the back ran past this many
+    /// After the last entry that may write guest memory anywhere (NoteAnyWrite), the last one
+    /// NoteWrite placed, and the last placed write in each slot's granules.
+    u64 last_any_write{};
+    u64 last_noted_write{};
+    std::array<u64, size_t{1} << WriteSlotBits> write_positions{};
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.

@@ -29,7 +29,7 @@ def stutter(t, frame, ms, cause, **categories):
 
 
 def summary(t, hist, builds=(2, 1), lookups=(90, 5, 3, 2, 10, 1), gfx_ms=40.0, compute_ms=5.0,
-            cache_bytes=123456):
+            cache_bytes=123456, driver_builds=None):
     names = ("gfx_prebuilt", "gfx_background", "gfx_recorded", "gfx_new", "compute_prebuilt",
              "compute_new")
     lookup_text = ",".join(f"{name}:{count}" for name, count in zip(names, lookups))
@@ -38,7 +38,9 @@ def summary(t, hist, builds=(2, 1), lookups=(90, 5, 3, 2, 10, 1), gfx_ms=40.0, c
                    f"over100=0 hist={hist_text} cat_ms=gfx_miss:{gfx_ms},compute_miss:{compute_ms},"
                    f"pipeline_wait:3.0,shader_capture:1.0,texture:2.0,buffer:1.0,query_fence:0.0,"
                    f"present:0.5 builds=gfx:{builds[0]},compute:{builds[1]} lookups={lookup_text} "
-                   f"cache_bytes={cache_bytes}")
+                   + (f"driver_builds=binary:{driver_builds[0]},compiled:{driver_builds[1]},"
+                      f"rejected:{driver_builds[2]} " if driver_builds else "")
+                   + f"cache_bytes={cache_bytes}")
 
 
 TRACE_LOG = "".join([
@@ -63,7 +65,7 @@ TRACE_LOG = "".join([
     stutter(220.0, 900, 35.0, "pipeline_wait", pipeline_wait=12.0),
     stutter(222.0, 1000, 50.0, "other"),
     summary(225.0, {16: 590, 17: 8, 35: 1, 50: 1}, builds=(1, 0), lookups=(10, 0, 0, 1, 0, 0),
-            gfx_ms=10.0, compute_ms=0.0, cache_bytes=99100000),
+            gfx_ms=10.0, compute_ms=0.0, cache_bytes=99100000, driver_builds=(4, 2, 1)),
 ])
 
 OLD_LOG = "".join([
@@ -143,6 +145,10 @@ class CacheMetricsTest(unittest.TestCase):
         self.assertEqual(cache["graphics_hit_rate"], round(105 / 111, 4))
         self.assertEqual(cache["compute_hit_rate"], round(10 / 11, 4))
         self.assertEqual(cache["hit_rate"], round(115 / 122, 4))
+
+    def test_driver_builds(self):
+        result = cache_metrics.parse_log(self.write("trace.txt", TRACE_LOG))
+        self.assertEqual(result["cache"]["driver_builds"], {"binary": 4, "compiled": 2, "rejected": 1})
 
     def test_window_limits_frames_and_stutters(self):
         result = cache_metrics.parse_log(self.write("trace.txt", TRACE_LOG), start_s=216.0)

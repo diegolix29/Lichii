@@ -149,6 +149,9 @@ void GpuSplit::Stop() {
     last_sync_position = 0;
     semaphore_writes.clear();
     semaphore_writes_limit = 1024;
+    last_any_write = 0;
+    last_noted_write = 0;
+    write_positions.fill(0);
     published_local = 0;
     consumed_cache = 0;
     publish_every = PublishEvery;
@@ -182,9 +185,11 @@ void GpuSplit::WaitForSpace(size_t words) {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (write_position + words - consumed_cache <= RingWords) {
+            Nx2Profile::AddDrain(DrainSite::RingFull, start);
             return;
         }
         if (spins < 4096) {
@@ -273,6 +278,68 @@ std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
     return QueuedSemaphoreWrite{it->second.payload, it->second.known};
 }
 
+namespace {
+
+/// Calls `func(device_address, size)` for each mapped piece of [address, address + size) within
+/// one 4 KiB GPU page; nothing is read or written where no device memory is mapped.
+template <typename Func>
+void ForEachDeviceRange(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
+                        Func&& func) {
+    constexpr GPUVAddr page_size = 0x1000;
+    const GPUVAddr end = address + size;
+    for (GPUVAddr begin = address; begin < end;) {
+        const GPUVAddr page_end = std::min((begin & ~(page_size - 1)) + page_size, end);
+        if (const auto device = memory.GpuToCpuAddress(begin)) {
+            func(*device, page_end - begin);
+        }
+        begin = page_end;
+    }
+}
+
+} // Anonymous namespace
+
+void GpuSplit::NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) {
+    if (size > MaxNotedBytes || address + size < address) {
+        NoteAnyWrite();
+        return;
+    }
+    ForEachDeviceRange(memory, address, size,
+                       [this](DAddr device, u64 bytes) { NoteDeviceWrite(device, bytes); });
+}
+
+void GpuSplit::NoteDeviceWrite(DAddr address, u64 size) {
+    const u64 last = (address + size - 1) >> WriteGranuleBits;
+    for (u64 granule = address >> WriteGranuleBits; granule <= last; ++granule) {
+        write_positions[WriteSlot(granule)] = write_position;
+    }
+    last_noted_write = write_position;
+}
+
+u64 GpuSplit::WritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) const {
+    if (size > MaxNotedBytes || address + size < address) {
+        return std::max(last_any_write, last_noted_write);
+    }
+    u64 target = last_any_write;
+    ForEachDeviceRange(memory, address, size, [this, &target](DAddr device, u64 bytes) {
+        target = std::max(target, DeviceWritesTarget(device, bytes));
+    });
+    return target;
+}
+
+u64 GpuSplit::DeviceWritesTarget(DAddr address, u64 size) const {
+    u64 target = 0;
+    const u64 last = (address + size - 1) >> WriteGranuleBits;
+    for (u64 granule = address >> WriteGranuleBits; granule <= last; ++granule) {
+        target = std::max(target, write_positions[WriteSlot(granule)]);
+    }
+    return target;
+}
+
+bool GpuSplit::WaitForWrites(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) {
+    return WaitFor(std::min(WritesTarget(memory, address, size), write_position),
+                   DrainSite::MacroDmaWrites);
+}
+
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache >= target) {
@@ -321,7 +388,8 @@ void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
 }
 
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
-                           u32 amount, u32 methods_pending, const GPUVAddr* segment) {
+                           u32 amount, u32 methods_pending, const GPUVAddr* segment,
+                           Writes writes) {
     SelectEngine(engine);
     // Long runs (constant buffer and inline uploads) go in pieces, as when a method's data
     // continues in the next GPFIFO entry.
@@ -342,6 +410,9 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
         words += piece;
         amount -= piece;
         methods_pending -= piece;
+    }
+    if (writes == Writes::Anywhere) {
+        NoteAnyWrite();
     }
 }
 
@@ -478,7 +549,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
 #endif
     u64 read_position = 0;
     while (!stop_token.stop_requested()) {
-        Nx2Profile::Report("GPU back thread");
+        Nx2Profile::Report("GPU back thread", true);
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};

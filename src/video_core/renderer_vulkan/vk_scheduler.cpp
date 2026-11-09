@@ -245,6 +245,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
         VideoCommon::GpuSplit::CheckOwner("Scheduler::Finish");
     }
     // When finishing, we need to wait for the submission to have executed on the device.
+    const VideoCommon::StutterTrace::SiteScope site{VideoCommon::StutterTrace::Site::SchedulerFinish};
     const u64 presubmit_tick = CurrentTick();
     const bool profile = VideoCommon::Nx2Profile::Enabled();
     const u64 start = profile ? VideoCommon::Nx2Profile::Now() : 0;
@@ -567,6 +568,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // Recycle the chunk back to the reserve.
             chunk_reserve.emplace_back(std::move(work));
         }
+        VideoCommon::Nx2Profile::Report("Vulkan worker");
     }
 }
 

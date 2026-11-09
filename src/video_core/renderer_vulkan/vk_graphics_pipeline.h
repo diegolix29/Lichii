@@ -69,6 +69,7 @@ struct hash<Vulkan::GraphicsPipelineCacheKey> {
 namespace Vulkan {
 
 class Device;
+class PipelineBinaries;
 class PipelineStatistics;
 class RenderPassCache;
 class RescalingPushConstant;
@@ -104,10 +105,11 @@ class GraphicsPipeline {
 public:
     explicit GraphicsPipeline(
         Scheduler& scheduler, BufferCache& buffer_cache, TextureCache& texture_cache,
-        vk::PipelineCache& pipeline_cache, VideoCore::ShaderNotify* shader_notify,
+        vk::PipelineCache& pipeline_cache, PipelineBinaries* binaries,
+        VideoCore::ShaderNotify* shader_notify,
         const Device& device, DescriptorPool& descriptor_pool,
         GuestDescriptorQueue& guest_descriptor_queue,
-        DescriptorBufferRing& descriptor_buffer_ring, Common::ThreadWorker* worker_thread,
+        DescriptorBufferRing& descriptor_buffer_ring, const PipelineBuildQueue& build_queue,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
@@ -268,6 +270,11 @@ public:
         return build->IsBuilt();
     }
 
+    /// Builds it on this thread, for a pipeline made with PipelineBuildQueue::owner_builds
+    void Build() {
+        build->Build();
+    }
+
     /// Waits up to `timeout` for the build; true when built.
     [[nodiscard]] bool WaitBuilt(std::chrono::microseconds timeout) const {
         return build->WaitFor(timeout);
@@ -368,6 +375,7 @@ private:
     TextureCache& texture_cache;
     BufferCache& buffer_cache;
     vk::PipelineCache& pipeline_cache;
+    PipelineBinaries* const binaries; ///< Shader cache v2's driver layer, else null
     Scheduler& scheduler;
     GuestDescriptorQueue& guest_descriptor_queue;
     DescriptorBufferRing& descriptor_buffer_ring;

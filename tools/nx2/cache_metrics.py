@@ -294,6 +294,7 @@ def analyze(lines, start_s=None, end_s=None):
         builds = {"gfx": 0.0, "compute": 0.0}
         categories = {}
         lookups = {}
+        driver_builds = {}
         for summary in window_summaries:
             for key, value in pairs(summary.get("builds")).items():
                 builds[key] = builds.get(key, 0.0) + value
@@ -301,6 +302,8 @@ def analyze(lines, start_s=None, end_s=None):
                 categories[key] = categories.get(key, 0.0) + value
             for key, value in pairs(summary.get("lookups")).items():
                 lookups[key] = lookups.get(key, 0) + int(value)
+            for key, value in pairs(summary.get("driver_builds")).items():
+                driver_builds[key] = driver_builds.get(key, 0) + int(value)
         result["runtime_builds"] = {"graphics": int(builds["gfx"]), "compute": int(builds["compute"]),
                                     "total": int(builds["gfx"] + builds["compute"])}
         result["runtime_build_gpu_thread_ms"] = round(
@@ -321,6 +324,9 @@ def analyze(lines, start_s=None, end_s=None):
             "graphics_hit_rate": rate(graphics_hits, graphics_misses),
             "compute_hit_rate": rate(compute_hits, compute_misses),
             "hit_rate": rate(graphics_hits + compute_hits, graphics_misses + compute_misses),
+            # Shader cache v2's driver layer: pipelines built from stored binaries, compiled, or
+            # whose stored binaries were rejected (none without it)
+            "driver_builds": driver_builds,
         })
         sources["cache.hit_rate"] = ("Nx2StutterSummary lookups: first use of each pipeline in the "
                                      "session, hits = built from the disk cache before use")

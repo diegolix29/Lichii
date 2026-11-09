@@ -168,3 +168,66 @@ TEST_CASE("StutterTrace: a frame counts the zones still open", "[video_core]") {
     REQUIRE(seen.idle_final == 500);
     REQUIRE(seen.builds == 1);
 }
+
+TEST_CASE("StutterTrace: zones keep their own time and sites count on every thread", "[video_core]") {
+    const bool was_enabled = StutterTrace::g_enabled;
+    const bool zones_were_enabled = Nx2Profile::g_zones_enabled;
+    StutterTrace::g_enabled = true;
+    Nx2Profile::g_zones_enabled = true;
+    auto& totals = StutterTrace::g_totals;
+    const auto back = Index(Thread::Back);
+    const auto update = static_cast<size_t>(Nx2Profile::Zone::UpdateBuffers);
+    const auto bind = static_cast<size_t>(Nx2Profile::Zone::BindStageBuffers);
+    const u64 update_before = totals.zone_ticks[back][update].load();
+    const u64 bind_before = totals.zone_ticks[back][bind].load();
+    const auto create = static_cast<size_t>(StutterTrace::Site::BufferCreate);
+    const u64 creates_before = totals.site_counts[create].load();
+    const u64 create_ticks_before = totals.site_ticks[create].load();
+    u64 update_elapsed{};
+    size_t open_zone{};
+    size_t closed_zone{};
+    std::thread{[&update_elapsed, &open_zone, &closed_zone] {
+        const StutterTrace::ThreadScope named{Thread::Back};
+        const u64 start = Nx2Profile::Ticks();
+        {
+            const Nx2Profile::Scope outer{Nx2Profile::Zone::UpdateBuffers};
+            // Frames read the open zone to count its time before it closes.
+            open_zone = StutterTrace::g_totals.open_zone[Index(Thread::Back)].load();
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+            const Nx2Profile::Scope inner{Nx2Profile::Zone::BindStageBuffers};
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+        update_elapsed = Nx2Profile::Ticks() - start;
+        closed_zone = StutterTrace::g_totals.open_zone[Index(Thread::Back)].load();
+    }}.join();
+    // Unnamed (guest) threads count sites too.
+    std::thread{[] {
+        const StutterTrace::SiteScope site{StutterTrace::Site::BufferCreate};
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }}.join();
+    const u64 update_ticks = totals.zone_ticks[back][update].load() - update_before;
+    const u64 bind_ticks = totals.zone_ticks[back][bind].load() - bind_before;
+    REQUIRE(open_zone == update);
+    // Time outside every zone is charged to none.
+    REQUIRE(closed_zone == StutterTrace::ZoneSlots);
+    REQUIRE(update_ticks > 0);
+    REQUIRE(bind_ticks > 0);
+    // Exclusive: the nested zone's time is not in the outer one's.
+    REQUIRE(update_ticks + bind_ticks <= update_elapsed);
+    REQUIRE(totals.site_counts[create].load() - creates_before == 1);
+    REQUIRE(totals.site_ticks[create].load() > create_ticks_before);
+    StutterTrace::g_enabled = was_enabled;
+    Nx2Profile::g_zones_enabled = zones_were_enabled;
+}
+
+TEST_CASE("StutterTrace: sites cost nothing while the trace is off", "[video_core]") {
+    const bool was_enabled = StutterTrace::g_enabled;
+    StutterTrace::g_enabled = false;
+    const auto finish = static_cast<size_t>(StutterTrace::Site::SchedulerFinish);
+    const u64 before = StutterTrace::g_totals.site_counts[finish].load();
+    {
+        const StutterTrace::SiteScope site{StutterTrace::Site::SchedulerFinish};
+    }
+    REQUIRE(StutterTrace::g_totals.site_counts[finish].load() == before);
+    StutterTrace::g_enabled = was_enabled;
+}

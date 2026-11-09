@@ -105,6 +105,10 @@ public:
     void FlushAll() override;
     void FlushRegion(DAddr addr, u64 size,
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
+    void FlushRegionForRead(DAddr addr, u64 size) override;
+    void FinishRead(DAddr addr, u64 size) override;
+    bool NoteReportPending(DAddr addr, u64 size) override;
+    void FinishReport(DAddr addr, u64 size) override;
     GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out, bool past_sync,
                                              u64* pending_tick = nullptr) override;
     bool IsGpuTickDone(u64 tick) override;
@@ -114,6 +118,7 @@ public:
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
     bool HasPendingQueries(DAddr addr, u64 size) override;
+    bool HoldsQueries(DAddr addr, u64 size) override;
     void InvalidateRegion(DAddr addr, u64 size,
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
