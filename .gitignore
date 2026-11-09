@@ -29,7 +29,7 @@ dist/english_plurals/generated_en.ts
 .cache/
 profile.json.gz
 CMakeLists.txt.user*
-
+docs/nx2/precompile-port.md
 # kdevelop
 .kdev4/
 *.kdev4
@@ -67,3 +67,4 @@ vulkansdk*.exe
 
 # Build-time generated external sources
 externals/generated
+/docs/nx2/precompile-port.md
