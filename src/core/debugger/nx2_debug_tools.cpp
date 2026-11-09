@@ -211,9 +211,23 @@ json Status(ToolState& state, const json& params) {
 json FrameTimes(ToolState& state, const json& params) {
     const double seconds = params.value("seconds", 5.0);
     const double refresh_hz = params.value("refresh_hz", 60.0);
-    if (!std::isfinite(seconds) || seconds <= 0.0 || seconds > 60.0 ||
+    // Up to 120 s: the present history holds 4096 frames, "truncated" says when it ran out.
+    if (!std::isfinite(seconds) || seconds <= 0.0 || seconds > 120.0 ||
         !std::isfinite(refresh_hz) || refresh_hz <= 0.0) {
-        throw std::runtime_error{"seconds must be > 0 and <= 60; refresh_hz must be > 0"};
+        throw std::runtime_error{"seconds must be > 0 and <= 120; refresh_hz must be > 0"};
+    }
+    // past_seconds: the frames already presented in that many seconds before now, from the
+    // present history, without waiting (a run's frames read after it, other calls not held up).
+    if (const double past = params.value("past_seconds", 0.0); past > 0.0) {
+        const u64 after = g_nx2_present_count.load(std::memory_order_relaxed);
+        const auto now = std::chrono::steady_clock::now();
+        const auto since = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                     std::chrono::duration<double>(past));
+        return ReadFrameTimes(
+            0, after,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(since.time_since_epoch()).count(),
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count(),
+            refresh_hz);
     }
     const u64 before = g_nx2_present_count.load(std::memory_order_relaxed);
     const auto begin = std::chrono::steady_clock::now();
@@ -278,7 +292,15 @@ json ReadFrameTimes(u64 before, u64 after, u64 begin_ns, u64 end_ns, double refr
     const double median = percentile(0.5);
     std::array<size_t, 4> buckets{};
     size_t stutters = 0;
+    // Hitches by absolute length, for stutter work: frames over 50/100/250 ms and the time
+    // spent in frames over 50 ms.
+    size_t over_50 = 0, over_100 = 0, over_250 = 0;
+    double hitch_ms = 0.0;
     for (const double interval : intervals) {
+        over_50 += interval > 50.0;
+        over_100 += interval > 100.0;
+        over_250 += interval > 250.0;
+        hitch_ms += interval > 50.0 ? interval : 0.0;
         const double periods = interval * refresh_hz / 1000.0;
         ++buckets[periods < 1.5 ? 0 : periods < 2.5 ? 1 : periods < 3.5 ? 2 : 3];
         stutters += interval > 2.0 * median;
@@ -296,6 +318,10 @@ json ReadFrameTimes(u64 before, u64 after, u64 begin_ns, u64 end_ns, double refr
             {"min_ms", frames == 0 ? 0.0 : intervals.front()},
             {"vsync_buckets", {{"1", share(0)}, {"2", share(1)}, {"3", share(2)}, {"4+", share(3)}}},
             {"stutters", stutters},
+            {"over_50ms", over_50},
+            {"over_100ms", over_100},
+            {"over_250ms", over_250},
+            {"hitch_ms", hitch_ms},
             {"intervals_ms", std::move(recent)},
             {"truncated", truncated}};
 }

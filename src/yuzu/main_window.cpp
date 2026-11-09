@@ -9,6 +9,9 @@
 #endif
 
 #include <QSysInfo>
+#include <atomic>
+#include <future>
+#include <stop_token>
 #include <boost/algorithm/string/split.hpp>
 #include "common/fs/path_util.h"
 #include "common/game_presets.h"
@@ -135,6 +138,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #endif
 
 // Common //
+#include "common/fs/file.h"
 #include "common/fs/fs.h"
 #include "common/logging.h"
 #include "common/memory_detect.h"
@@ -158,7 +162,10 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/common_funcs.h"
+#include "core/file_sys/nup_container.h"
+#include "core/loader/loader.h"
 #include "core/file_sys/nup_writer.h"
+#include "core/file_sys/nx2_shader_extract.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/savedata_factory.h"
 
@@ -175,6 +182,8 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 
 // Video Core //
 #include "video_core/gpu.h"
+#include "video_core/nx2_recipe.h"
+#include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 
@@ -1502,6 +1511,8 @@ void MainWindow::ConnectWidgetEvents() {
             &MainWindow::OnGameListRemovePlayTimeData);
     connect(game_list, &GameList::SetPlayTimeRequested, this, &MainWindow::OnGameListSetPlayTime);
     connect(game_list, &GameList::DumpRomFSRequested, this, &MainWindow::OnGameListDumpRomFS);
+    connect(game_list, &GameList::PrepareShadersFromRecipeRequested, this,
+            &MainWindow::OnGameListPrepareShadersFromRecipe);
     connect(game_list, &GameList::VerifyIntegrityRequested, this,
             &MainWindow::OnGameListVerifyIntegrity);
     connect(game_list, &GameList::ConvertToNupRequested, this,
@@ -2967,6 +2978,183 @@ void MainWindow::OnGameListDumpRomFS(u64 program_id, const std::string& game_pat
         failed();
         QtCommon::vfs->DeleteDirectory(path);
     }
+}
+
+// A precompile recipe (video_core/nx2_recipe.h) and the game's own shader programs give this
+// build's precompiled pipeline file, prepared at the game's next boot.
+void MainWindow::OnGameListPrepareShadersFromRecipe(u64 program_id, const std::string& game_path) {
+    const QString title = tr("Prepare Precompiled Shaders");
+    const QString recipe_path = QFileDialog::getOpenFileName(
+        this, tr("Select Precompile Recipe"), {},
+        tr("Precompile recipe (*.nx2recipe);;All files (*.*)"));
+    if (recipe_path.isEmpty()) {
+        return;
+    }
+    std::vector<u8> recipe;
+    {
+        Common::FS::IOFile file{recipe_path.toStdString(), Common::FS::FileAccessMode::Read,
+                                Common::FS::FileType::BinaryFile};
+        recipe.resize(file.IsOpen() ? file.GetSize() : 0);
+        if (recipe.empty() || file.ReadSpan(std::span<u8>{recipe}) != recipe.size()) {
+            QMessageBox::warning(this, title, tr("The recipe could not be read."));
+            return;
+        }
+    }
+    const auto header = VideoCommon::Nx2Recipe::ReadHeader(recipe);
+    if (!header) {
+        QMessageBox::warning(this, title, tr("This file is not a precompile recipe."));
+        return;
+    }
+    if (header->title_id != program_id) {
+        QMessageBox::warning(this, title,
+                             tr("This recipe is for another game (%1).")
+                                 .arg(QString::fromStdString(
+                                     fmt::format("{:016X}", header->title_id))));
+        return;
+    }
+
+    // The game's RomFS as it loads it: a NUP's update laid over its base (loader/nup.cpp), or what
+    // the game's loader reads.
+    const auto game_file = QtCommon::vfs->OpenFile(game_path, FileSys::OpenMode::Read);
+    std::unique_ptr<FileSys::NupContainer> nup;
+    std::vector<FileSys::VirtualDir> roots;
+    u32 game_version = 0;
+    if (game_file && FileSys::NupContainer::IsNupFile(game_file)) {
+        nup = std::make_unique<FileSys::NupContainer>(game_file);
+        if (nup->GetStatus() == Loader::ResultStatus::Success) {
+            const auto base = nup->FindBasePackage();
+            const auto update = nup->FindBestUpdatePackage();
+            const auto merged = FileSys::NupContainer::MergeShadowDirs(
+                base ? nup->GetRomFSDir(*base) : FileSys::VirtualDir{},
+                update ? nup->GetRomFSDir(*update) : FileSys::VirtualDir{});
+            if (merged) {
+                roots.push_back(merged);
+            }
+            for (const auto& package : nup->GetPackages()) {
+                if (package.kind != FileSys::NupContainer::PackageKind::Addon) {
+                    game_version = std::max(game_version, package.version);
+                }
+            }
+        }
+    } else if (game_file) {
+        if (const auto loader = Loader::GetLoader(*QtCommon::system, game_file)) {
+            FileSys::VirtualFile romfs;
+            if (loader->ReadRomFS(romfs) == Loader::ResultStatus::Success && romfs) {
+                if (auto dir = FileSys::ExtractRomFS(romfs)) {
+                    roots.push_back(std::move(dir));
+                }
+            }
+        }
+    }
+    if (roots.empty()) {
+        QMessageBox::warning(this, title, tr("The game's files could not be read."));
+        return;
+    }
+
+    QProgressDialog progress(tr("Finding the game's shaders..."), tr("Cancel"), 0, 1000, this);
+    progress.setWindowTitle(title);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(0);
+    progress.setAutoClose(false);
+    progress.setAutoReset(false);
+
+    struct Outcome {
+        std::vector<u8> file;
+        VideoCommon::Nx2Recipe::Report report;
+        std::string error;
+    };
+    std::stop_source stop;
+    FileSys::Nx2ShaderExtract::Progress extract_progress;
+    std::atomic<bool> assembling{false};
+    auto job = std::async(std::launch::async, [&]() -> Outcome {
+        Outcome outcome;
+        try {
+            const auto programs =
+                FileSys::Nx2ShaderExtract::Extract(roots, 0, &extract_progress, stop.get_token());
+            if (stop.stop_requested()) {
+                return outcome;
+            }
+            assembling = true;
+            outcome.file = VideoCommon::Nx2Recipe::Assemble(
+                recipe, programs, VideoCommon::VulkanPipelineCacheVersion, outcome.report);
+        } catch (const std::exception& e) {
+            outcome.error = e.what();
+        }
+        return outcome;
+    });
+    while (job.wait_for(std::chrono::milliseconds(50)) != std::future_status::ready) {
+        if (assembling) {
+            progress.setLabelText(tr("Building the precompiled pipelines..."));
+            progress.setValue(999);
+        } else if (const u64 total = extract_progress.files_total) {
+            progress.setValue(
+                static_cast<int>(extract_progress.files_done.load() * 990 / total));
+        }
+        if (progress.wasCanceled()) {
+            stop.request_stop();
+        }
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    }
+    const Outcome outcome = job.get();
+    progress.close();
+    if (stop.stop_requested()) {
+        return;
+    }
+    if (!outcome.error.empty() || outcome.file.empty()) {
+        QMessageBox::warning(this, title,
+                             tr("The precompiled pipelines could not be built: %1")
+                                 .arg(QString::fromStdString(outcome.error)));
+        return;
+    }
+
+    const auto dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
+                     fmt::format("{:016x}", program_id);
+    const auto path = dir / fmt::format("precompiled.fork-v{}.nx2prep",
+                                        VideoCommon::VulkanPipelineCacheVersion);
+    auto temporary = path;
+    temporary += ".tmp";
+    bool written = Common::FS::CreateDirs(dir);
+    if (written) {
+        Common::FS::IOFile file{temporary, Common::FS::FileAccessMode::Write,
+                                Common::FS::FileType::BinaryFile};
+        written = file.IsOpen() &&
+                  file.WriteSpan(std::span<const u8>{outcome.file}) == outcome.file.size();
+    }
+    std::error_code error;
+    if (written) {
+        std::filesystem::rename(temporary, path, error);
+        written = !error;
+    }
+    if (!written) {
+        std::filesystem::remove(temporary, error);
+        QMessageBox::warning(this, title,
+                             tr("The precompiled pipelines could not be saved to %1.")
+                                 .arg(QString::fromStdString(Common::FS::PathToUTF8String(path))));
+        return;
+    }
+
+    const auto& report = outcome.report;
+    QString text = tr("%n pipeline(s) are ready to prepare. They are compiled the next time the "
+                      "game starts; that boot takes longer.",
+                      "", static_cast<int>(report.records));
+    if (report.programs_missing || report.records_dropped) {
+        text += QStringLiteral("\n\n") +
+                tr("%1 of the recipe's %2 shaders are not in this copy of the game, so %3 "
+                   "pipelines were left out.")
+                    .arg(report.programs_missing)
+                    .arg(report.programs)
+                    .arg(report.records_dropped);
+    }
+    if (header->game_version != game_version) {
+        text += QStringLiteral("\n\n") +
+                tr("The recipe was made for version %1 of the game; this copy is version %2.")
+                    .arg(header->game_version)
+                    .arg(game_version);
+    }
+    text += QStringLiteral("\n\n") +
+            tr("NVIDIA: set Shader Cache Size to Unlimited in the NVIDIA Control Panel, or the "
+               "driver keeps only part of them.");
+    QMessageBox::information(this, title, text);
 }
 
 // END
