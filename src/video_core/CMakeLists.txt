@@ -118,6 +118,8 @@ add_library(video_core STATIC
     nx2_debug_control.cpp
     nx2_recipe.cpp
     nx2_recipe.h
+    nx2_precompile.cpp
+    nx2_precompile.h
     nx2_debug_control.h
     nx2_fast_draw.cpp
     nx2_fast_draw.h

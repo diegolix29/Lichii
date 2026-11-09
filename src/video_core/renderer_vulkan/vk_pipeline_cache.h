@@ -219,11 +219,18 @@ private:
                          const VideoCore::DiskResourceLoadCallback& callback);
 
     /// Builds and drops every pipeline of the game's precompiled file (written offline by
-    /// tools/nx2-precompile), so the driver's own cache holds them before they are first drawn.
-    /// Draws never use these pipelines: they build their own from the guest's shaders and find the
-    /// driver's compiled code. Runs once per precompiled file, driver and emulator build.
-    void PreparePrecompiled(const std::filesystem::path& base_dir, std::stop_token stop_loading,
+    /// tools/nx2-precompile, or assembled from a recipe by VideoCommon::Nx2Precompile), so the
+    /// driver's own cache holds them before they are first drawn. Runs once per precompiled file
+    /// and driver; a new emulator build keeps the result when CheckKeptSample finds its
+    /// translation unchanged. The loading screen's Skip button stops it (it resumes next boot).
+    void PreparePrecompiled(u64 title_id, const std::filesystem::path& base_dir,
+                            std::stop_token stop_loading,
                             const VideoCore::DiskResourceLoadCallback& callback);
+
+    /// A sample of the kept pipelines (64 graphics, 16 compute, spread over the index) translated
+    /// again by this build from the precompiled file's records, and compared with the kept infos
+    /// and SPIR-V. True when all are equal: the kept file is valid for this build.
+    bool CheckKeptSample(const std::filesystem::path& precompiled, std::stop_token stop_loading);
 
     /// The shader infos and SPIR-V the preparation step kept for the precompiled pipelines
     /// (precompiled_infos.fork-v<N>.bin, written for the file, driver and build of `stamp`), and

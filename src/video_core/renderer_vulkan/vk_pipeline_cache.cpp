@@ -10,12 +10,14 @@
 #include <condition_variable>
 #include <mutex>
 #include <cstddef>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <thread>
 #include <unordered_set>
@@ -41,6 +43,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_precompile.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "shader_recompiler/info_serialize.h"
@@ -577,6 +580,121 @@ bool DriverCachesPipelines(const Device& device) {
     default:
         return false;
     }
+}
+
+/// A record of a precompiled file (precompiled.fork-v<N>.nx2prep).
+struct PrecompiledFileRecord {
+    bool compute{};
+    std::vector<u32> envs;
+    GraphicsPipelineCacheKey graphics_key{};
+    ComputePipelineCacheKey compute_key{};
+};
+
+/// Layout (tools/nx2-precompile/README.md): "NX2PREP1", u32 cache version, u32 environment
+/// count, u32 record count, u32 reserved; per environment u64 offset and u64 size of a
+/// GenericEnvironment::Serialize blob; per record u8 kind (0 graphics, 1 compute), u8
+/// environment count, u16 reserved, u32 environment indices in stage order, then the key.
+bool ReadPrecompiledFile(const std::filesystem::path& path, u32 cache_version,
+                         std::vector<std::pair<u64, u64>>& env_index,
+                         std::vector<PrecompiledFileRecord>& records) {
+    try {
+        std::ifstream file(path, std::ios::binary);
+        file.exceptions(std::ifstream::failbit);
+        std::array<char, 8> magic{};
+        u32 version{}, env_count{}, record_count{}, reserved{};
+        file.read(magic.data(), magic.size())
+            .read(reinterpret_cast<char*>(&version), sizeof(version))
+            .read(reinterpret_cast<char*>(&env_count), sizeof(env_count))
+            .read(reinterpret_cast<char*>(&record_count), sizeof(record_count))
+            .read(reinterpret_cast<char*>(&reserved), sizeof(reserved));
+        if (std::string_view{magic.data(), magic.size()} != "NX2PREP1" || version != cache_version) {
+            LOG_WARNING(Render_Vulkan, "Precompiled pipeline file {} has another format or version",
+                        Common::FS::PathToUTF8String(path));
+            return false;
+        }
+        env_index.resize(env_count);
+        file.read(reinterpret_cast<char*>(env_index.data()), env_count * sizeof(env_index[0]));
+        records.reserve(record_count);
+        for (u32 i = 0; i < record_count; ++i) {
+            u8 kind{}, count{};
+            u16 pad{};
+            file.read(reinterpret_cast<char*>(&kind), 1)
+                .read(reinterpret_cast<char*>(&count), 1)
+                .read(reinterpret_cast<char*>(&pad), 2);
+            PrecompiledFileRecord record;
+            record.compute = kind == 1;
+            record.envs.resize(count);
+            file.read(reinterpret_cast<char*>(record.envs.data()), count * sizeof(u32));
+            if (record.compute) {
+                file.read(reinterpret_cast<char*>(&record.compute_key), sizeof(record.compute_key));
+            } else {
+                file.read(reinterpret_cast<char*>(&record.graphics_key), sizeof(record.graphics_key));
+            }
+            if (count == 0 || (record.compute && count != 1) ||
+                std::ranges::any_of(record.envs, [&](u32 env) { return env >= env_count; })) {
+                LOG_ERROR(Render_Vulkan, "Precompiled pipeline file {} is damaged",
+                          Common::FS::PathToUTF8String(path));
+                return false;
+            }
+            records.push_back(std::move(record));
+        }
+    } catch (const std::ios_base::failure& e) {
+        LOG_ERROR(Render_Vulkan, "Cannot read precompiled pipelines: {}", e.what());
+        return false;
+    }
+    return true;
+}
+
+/// Rewrites a recorded graphics key's driver fields for this device, as draws key it. The driver
+/// fields only tell cache generations apart; the pipeline does not use them, so records made
+/// before a driver update are built for this driver. True when the record was made for a device
+/// with other dynamic state (it is skipped).
+bool RecordedKeyForThisDevice(GraphicsPipelineCacheKey& key, const Device& device,
+                              const DynamicFeatures& features) {
+    key.state.driver_id = static_cast<u32>(device.GetDriverID());
+    key.state.driver_version = device.GetDriverVersion();
+    return (key.state.extended_dynamic_state != 0) != features.has_extended_dynamic_state ||
+           (key.state.extended_dynamic_state_2 != 0) != features.has_extended_dynamic_state_2 ||
+           (key.state.extended_dynamic_state_2_logic_op != 0) !=
+               features.has_extended_dynamic_state_2_logic_op ||
+           (key.state.extended_dynamic_state_3_blend != 0) !=
+               features.has_extended_dynamic_state_3_blend ||
+           (key.state.extended_dynamic_state_3_enables != 0) !=
+               features.has_extended_dynamic_state_3_enables ||
+           (key.state.color_write_enable_dynamic != 0) != features.has_color_write_enable ||
+           (key.state.dynamic_vertex_input != 0) != features.has_dynamic_vertex_input ||
+           (key.state.provoking_vertex_last != 0 && !features.has_provoking_vertex_last_mode);
+}
+
+/// precompiled_prepared.txt's line: the precompiled file (size and time), the driver, the
+/// emulator build that prepared it and the GPU.
+std::string PreparedStamp(u64 file_size, s64 modified, const Device& device, std::string_view rev) {
+    return fmt::format("{} {} {:#x} {} {}\n", file_size, modified, device.GetDriverVersion(), rev,
+                       device.GetModelName());
+}
+
+/// The build named by a stamp PreparedStamp wrote, when it was written for the same file,
+/// driver and GPU as `stamp` by another build.
+std::optional<std::string> StampOfOtherBuild(const std::string& previous, u64 file_size,
+                                             s64 modified, const Device& device) {
+    // The build is the fourth field (the GPU's name, last, may hold spaces).
+    size_t at = 0;
+    for (int field = 0; field < 3; ++field) {
+        at = previous.find(' ', at);
+        if (at == std::string::npos) {
+            return std::nullopt;
+        }
+        ++at;
+    }
+    const size_t end = previous.find(' ', at);
+    if (end == std::string::npos) {
+        return std::nullopt;
+    }
+    std::string rev = previous.substr(at, end - at);
+    if (rev == Common::g_scm_rev || PreparedStamp(file_size, modified, device, rev) != previous) {
+        return std::nullopt;
+    }
+    return rev;
 }
 } // Anonymous namespace
 
@@ -1427,7 +1545,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         });
     }
 
-    PreparePrecompiled(base_dir, stop_loading, callback);
+    PreparePrecompiled(title_id, base_dir, stop_loading, callback);
 
     if (use_vulkan_pipeline_cache) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -1621,7 +1739,7 @@ void PipelineCache::CanonicalizeNativeKey(
     key.state.CanonicalizeNative(mask);
 }
 
-void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
+void PipelineCache::PreparePrecompiled(u64 title_id, const std::filesystem::path& base_dir,
                                        std::stop_token stop_loading,
                                        const VideoCore::DiskResourceLoadCallback& callback) {
     const char* enabled = std::getenv("EDEN_NX2_PRECOMPILED");
@@ -1635,14 +1753,14 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                                 "of its own (EDEN_NX2_PRECOMPILED=1 prepares them anyway)");
         return;
     }
-    // Layout (tools/nx2-precompile/README.md): "NX2PREP1", u32 cache version, u32 environment
-    // count, u32 record count, u32 reserved; per environment u64 offset and u64 size of a
-    // GenericEnvironment::Serialize blob; per record u8 kind (0 graphics, 1 compute), u8
-    // environment count, u16 reserved, u32 environment indices in stage order, then the key.
-    const auto path = base_dir / fmt::format("precompiled.fork-v{}.nx2prep", CACHE_VERSION);
+    // The title's precompiled file, assembled first from a recipe (in recipes/ beside the exe or
+    // the title's shader folder) when it is missing or was made from another recipe.
+    callback(VideoCore::LoadCallbackStage::Prepare, 0, 0);
+    const auto path = VideoCommon::Nx2Precompile::EnsurePrecompiledFile(title_id, base_dir,
+                                                                        CACHE_VERSION, stop_loading);
     std::error_code error;
-    const auto file_size = std::filesystem::file_size(path, error);
-    if (error) {
+    const auto file_size = path.empty() ? 0 : std::filesystem::file_size(path, error);
+    if (path.empty() || error) {
         // A file built for an older cache version is not read: it has to be built again.
         for (u32 version = CACHE_VERSION; version-- > 50;) {
             const auto older = base_dir / fmt::format("precompiled.fork-v{}.nx2prep", version);
@@ -1657,18 +1775,18 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         return;
     }
     const auto modified = std::filesystem::last_write_time(path, error).time_since_epoch().count();
-    // The driver keeps what it compiled; the step runs again for another file, driver or build.
+    // The driver keeps what it compiled; the step runs again for another file or driver. A new
+    // build keeps it when a sample of the kept pipelines translates the same (CheckKeptSample).
     const auto stamp_path =
         base_dir / fmt::format("precompiled_prepared.fork-v{}.txt", CACHE_VERSION);
     const auto infos_path =
         base_dir / fmt::format("precompiled_infos.fork-v{}.bin", CACHE_VERSION);
-    const std::string stamp = fmt::format("{} {} {:#x} {} {}\n", file_size, modified,
-                                          device.GetDriverVersion(), Common::g_scm_rev,
-                                          device.GetModelName());
+    const std::string stamp = PreparedStamp(file_size, modified, device, Common::g_scm_rev);
     const char* force = std::getenv("EDEN_NX2_PRECOMPILED_FORCE");
     if (!(force && force[0] == '1')) {
         std::ifstream stamp_file(stamp_path, std::ios::binary);
         const std::string previous{std::istreambuf_iterator<char>(stamp_file), {}};
+        stamp_file.close();
         if (previous == stamp) {
             if (LoadPrecompiledInfos(path, infos_path, stamp)) {
                 LOG_INFO(Render_Vulkan, "Precompiled pipelines already prepared for this driver");
@@ -1676,60 +1794,46 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
             }
             LOG_INFO(Render_Vulkan, "Precompiled pipelines were prepared without keeping their "
                                     "shader infos: preparing them again");
+        } else if (const auto other_build =
+                       StampOfOtherBuild(previous, file_size, modified, device);
+                   other_build && previous.size() == stamp.size() &&
+                   LoadPrecompiledInfos(path, infos_path, previous)) {
+            if (CheckKeptSample(path, stop_loading)) {
+                // The kept file is this build's too: its stamp (the same size) is rewritten in
+                // place, then the prepared stamp.
+                bool rewritten = false;
+                {
+                    std::fstream kept(infos_path, std::ios::binary | std::ios::in | std::ios::out);
+                    kept.seekp(static_cast<std::streamoff>(PrecompiledInfosMagic.size() +
+                                                           sizeof(u32)));
+                    kept.write(stamp.data(), static_cast<std::streamsize>(stamp.size()));
+                    rewritten = static_cast<bool>(kept);
+                }
+                if (rewritten) {
+                    std::ofstream updated(stamp_path, std::ios::binary | std::ios::trunc);
+                    updated << stamp;
+                }
+                if (rewritten && LoadPrecompiledInfos(path, infos_path, stamp)) {
+                    LOG_INFO(Render_Vulkan,
+                             "Precompiled pipelines prepared by build {} kept for this build",
+                             *other_build);
+                    return;
+                }
+            }
+            if (stop_loading.stop_requested()) {
+                return;
+            }
+            precompiled_records.clear();
+            precompiled_compute_records.clear();
+            LOG_INFO(Render_Vulkan, "Precompiled pipelines prepared by build {} translate "
+                                    "differently in this build: preparing them again",
+                     *other_build);
         }
     }
 
-    struct Record {
-        bool compute{};
-        std::vector<u32> envs;
-        GraphicsPipelineCacheKey graphics_key{};
-        ComputePipelineCacheKey compute_key{};
-    };
     std::vector<std::pair<u64, u64>> env_index;
-    std::vector<Record> records;
-    try {
-        std::ifstream file(path, std::ios::binary);
-        file.exceptions(std::ifstream::failbit);
-        std::array<char, 8> magic{};
-        u32 version{}, env_count{}, record_count{}, reserved{};
-        file.read(magic.data(), magic.size())
-            .read(reinterpret_cast<char*>(&version), sizeof(version))
-            .read(reinterpret_cast<char*>(&env_count), sizeof(env_count))
-            .read(reinterpret_cast<char*>(&record_count), sizeof(record_count))
-            .read(reinterpret_cast<char*>(&reserved), sizeof(reserved));
-        if (std::string_view{magic.data(), magic.size()} != "NX2PREP1" || version != CACHE_VERSION) {
-            LOG_WARNING(Render_Vulkan, "Precompiled pipeline file {} has another format or version",
-                        Common::FS::PathToUTF8String(path));
-            return;
-        }
-        env_index.resize(env_count);
-        file.read(reinterpret_cast<char*>(env_index.data()), env_count * sizeof(env_index[0]));
-        records.reserve(record_count);
-        for (u32 i = 0; i < record_count; ++i) {
-            u8 kind{}, count{};
-            u16 pad{};
-            file.read(reinterpret_cast<char*>(&kind), 1)
-                .read(reinterpret_cast<char*>(&count), 1)
-                .read(reinterpret_cast<char*>(&pad), 2);
-            Record record;
-            record.compute = kind == 1;
-            record.envs.resize(count);
-            file.read(reinterpret_cast<char*>(record.envs.data()), count * sizeof(u32));
-            if (record.compute) {
-                file.read(reinterpret_cast<char*>(&record.compute_key), sizeof(record.compute_key));
-            } else {
-                file.read(reinterpret_cast<char*>(&record.graphics_key), sizeof(record.graphics_key));
-            }
-            if (count == 0 || (record.compute && count != 1) ||
-                std::ranges::any_of(record.envs, [&](u32 env) { return env >= env_count; })) {
-                LOG_ERROR(Render_Vulkan, "Precompiled pipeline file {} is damaged",
-                          Common::FS::PathToUTF8String(path));
-                return;
-            }
-            records.push_back(std::move(record));
-        }
-    } catch (const std::ios_base::failure& e) {
-        LOG_ERROR(Render_Vulkan, "Cannot read precompiled pipelines: {}", e.what());
+    std::vector<PrecompiledFileRecord> records;
+    if (!ReadPrecompiledFile(path, CACHE_VERSION, env_index, records)) {
         return;
     }
 
@@ -1886,7 +1990,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         }
         const size_t done = start_index + state.built + state.failed + state.skipped;
         if (done % 64 == 0 || done == total) {
-            callback(VideoCore::LoadCallbackStage::Build, done, total);
+            callback(VideoCore::LoadCallbackStage::Precompile, done, total);
         }
     };
     const auto finish = [&](size_t index, bool ok) {
@@ -1915,42 +2019,28 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     };
     LOG_INFO(Render_Vulkan, "Preparing {} precompiled pipelines from {}, from record {}", total,
              Common::FS::PathToUTF8String(path), start_index);
-    callback(VideoCore::LoadCallbackStage::Build, start_index, total);
+    callback(VideoCore::LoadCallbackStage::Precompile, start_index, total);
+    // The loading screen's Skip button starts the game; the rest is prepared at a later boot,
+    // from the checkpoint.
+    VideoCommon::ShaderWarm::TakeSkipWarm();
+    bool skipped_by_player = false;
     for (size_t index = start_index; index < total; ++index) {
         if (stop_loading.stop_requested()) {
+            break;
+        }
+        if (VideoCommon::ShaderWarm::TakeSkipWarm()) {
+            skipped_by_player = true;
             break;
         }
         auto& record = records[index];
         // A compute record is built even when the disk cache built its key: a key has a record for
         // each storage pointer state the program can be translated in, and the boot built one.
-        if (!record.compute) {
-            auto& key = record.graphics_key;
-            // The driver fields only tell cache generations apart; the pipeline does not use them.
-            // Records made before a driver update are built for this driver, as draws will key them.
-            key.state.driver_id = static_cast<u32>(device.GetDriverID());
-            key.state.driver_version = device.GetDriverVersion();
-            const bool other_device =
-                (key.state.extended_dynamic_state != 0) !=
-                    dynamic_features.has_extended_dynamic_state ||
-                (key.state.extended_dynamic_state_2 != 0) !=
-                    dynamic_features.has_extended_dynamic_state_2 ||
-                (key.state.extended_dynamic_state_2_logic_op != 0) !=
-                    dynamic_features.has_extended_dynamic_state_2_logic_op ||
-                (key.state.extended_dynamic_state_3_blend != 0) !=
-                    dynamic_features.has_extended_dynamic_state_3_blend ||
-                (key.state.extended_dynamic_state_3_enables != 0) !=
-                    dynamic_features.has_extended_dynamic_state_3_enables ||
-                (key.state.color_write_enable_dynamic != 0) !=
-                    dynamic_features.has_color_write_enable ||
-                (key.state.dynamic_vertex_input != 0) != dynamic_features.has_dynamic_vertex_input ||
-                (key.state.provoking_vertex_last != 0 &&
-                 !dynamic_features.has_provoking_vertex_last_mode);
-            // Made for a device with other dynamic state. (Pipelines also in the disk cache are
-            // built too: their shader infos are kept like the others'.)
-            if (other_device) {
-                skip(index);
-                continue;
-            }
+        // A graphics record made for a device with other dynamic state is skipped. (Pipelines
+        // also in the disk cache are built too: their shader infos are kept like the others'.)
+        if (!record.compute &&
+            RecordedKeyForThisDevice(record.graphics_key, device, dynamic_features)) {
+            skip(index);
+            continue;
         }
         {
             std::unique_lock lock{state.mutex};
@@ -2000,7 +2090,12 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
     LOG_INFO(Render_Vulkan, "Precompiled pipelines: {} prepared, {} failed, {} skipped, in {:.1f} s",
              state.built, state.failed, state.skipped, seconds);
-    if (stop_loading.stop_requested()) {
+    if (skipped_by_player) {
+        LOG_INFO(Render_Vulkan, "Precompiled pipelines: skipped from the loading screen at record "
+                                "{} of {}, the rest is prepared at a later boot",
+                 state.low_water, total);
+    }
+    if (stop_loading.stop_requested() || skipped_by_player) {
         kept.file.close();
         std::filesystem::remove(kept_temporary, error);
         return;
@@ -2122,6 +2217,188 @@ bool PipelineCache::LoadPrecompiledInfos(const std::filesystem::path& precompile
     LOG_INFO(Render_Vulkan, "Precompiled shader infos for {} graphics and {} compute pipelines",
              precompiled_records.size(), precompiled_compute_records.size());
     return true;
+}
+
+bool PipelineCache::CheckKeptSample(const std::filesystem::path& precompiled,
+                                    std::stop_token stop_loading) {
+    constexpr size_t GraphicsSample = 64;
+    constexpr size_t ComputeSample = 16;
+    const auto begin = std::chrono::steady_clock::now();
+    std::vector<std::pair<u64, u64>> env_index;
+    std::vector<PrecompiledFileRecord> records;
+    if (!ReadPrecompiledFile(precompiled, CACHE_VERSION, env_index, records)) {
+        return false;
+    }
+    // One kept pipeline in each equal stretch of the kept keys (sorted by hash, so spread over
+    // the programs too), offset by this build: each new build checks others.
+    const u64 seed = Common::CityHash64(Common::g_scm_rev, std::strlen(Common::g_scm_rev));
+    const auto sample = [seed]<typename T>(std::vector<T> all, size_t count) {
+        std::ranges::sort(all);
+        if (all.size() <= count) {
+            return all;
+        }
+        std::vector<T> picked;
+        const size_t stride = all.size() / count;
+        for (size_t i = 0; i < count; ++i) {
+            picked.push_back(all[i * stride + seed % stride]);
+        }
+        return picked;
+    };
+    std::vector<u64> graphics_hashes;
+    for (const auto& entry : precompiled_records) {
+        graphics_hashes.push_back(entry.first);
+    }
+    std::vector<std::pair<u64, u32>> compute_states; // Key hash, environment
+    for (const auto& [hash, record] : precompiled_compute_records) {
+        compute_states.emplace_back(hash, record.envs[0]);
+    }
+    const auto graphics_sample = sample(std::move(graphics_hashes), GraphicsSample);
+    const auto compute_sample = sample(std::move(compute_states), ComputeSample);
+    const std::unordered_set<u64> wanted_graphics(graphics_sample.begin(), graphics_sample.end());
+    const std::set<std::pair<u64, u32>> wanted_compute(compute_sample.begin(),
+                                                       compute_sample.end());
+
+    struct Item {
+        PrecompiledFileRecord record;
+        const PrecompiledRecord* kept;
+    };
+    std::vector<Item> items;
+    for (auto& record : records) {
+        if (record.compute) {
+            const u64 hash = record.compute_key.Hash();
+            if (!wanted_compute.contains({hash, record.envs[0]})) {
+                continue;
+            }
+            const auto [first, last] = precompiled_compute_records.equal_range(hash);
+            for (auto it = first; it != last; ++it) {
+                if (it->second.envs[0] == record.envs[0]) {
+                    items.push_back({std::move(record), &it->second});
+                    break;
+                }
+            }
+            continue;
+        }
+        if (RecordedKeyForThisDevice(record.graphics_key, device, dynamic_features)) {
+            continue;
+        }
+        const u64 hash = record.graphics_key.Hash();
+        if (!wanted_graphics.contains(hash)) {
+            continue;
+        }
+        const auto it = precompiled_records.find(hash);
+        if (it != precompiled_records.end() && it->second.env_count == record.envs.size() &&
+            std::equal(record.envs.begin(), record.envs.end(), it->second.envs.begin())) {
+            items.push_back({std::move(record), &it->second});
+        }
+    }
+    if (items.empty()) {
+        return false;
+    }
+
+    // What differs in one sampled pipeline, empty when it is equal. Translated from the
+    // precompiled file's key and environments as the preparation did.
+    const auto check = [&](const Item& item) -> std::string {
+        std::ifstream file(precompiled, std::ios::binary);
+        file.exceptions(std::ifstream::failbit);
+        std::vector<FileEnvironment> envs(item.record.envs.size());
+        for (size_t i = 0; i < envs.size(); ++i) {
+            const auto [offset, size] = env_index[item.record.envs[i]];
+            file.clear();
+            file.seekg(static_cast<std::streamoff>(offset));
+            envs[i].Deserialize(file, static_cast<std::streamoff>(offset + size));
+        }
+        ShaderPools pools;
+        std::array<std::vector<u32>, Maxwell::MaxShaderStage> spirv;
+        std::array<std::vector<u8>, 5> infos;
+        if (item.record.compute) {
+            const auto entry{CreateComputePipeline(pools, item.record.compute_key, envs.front(),
+                                                   nullptr, false, &spirv[0])};
+            if (!entry.pipeline) {
+                return "its translation failed";
+            }
+            Shader::SerializeInfo(entry.pipeline->StageInfo(), infos[0]);
+        } else {
+            boost::container::static_vector<Shader::Environment*, Maxwell::MaxShaderProgram>
+                env_ptrs;
+            for (auto& env : envs) {
+                env_ptrs.push_back(&env);
+            }
+            const auto pipeline{CreateGraphicsPipeline(pools, item.record.graphics_key,
+                                                       MakeSpan(env_ptrs), nullptr, false, nullptr,
+                                                       nullptr, &spirv)};
+            if (!pipeline || pipeline->Failed()) {
+                return "its translation failed";
+            }
+            for (size_t stage = 0; stage < infos.size(); ++stage) {
+                if (const Shader::Info* const info = pipeline->StageInfo(stage)) {
+                    Shader::SerializeInfo(*info, infos[stage]);
+                }
+            }
+        }
+        std::ifstream kept(precompiled_infos_path, std::ios::binary);
+        kept.exceptions(std::ifstream::failbit);
+        for (size_t stage = 0; stage < infos.size(); ++stage) {
+            const u32 info_id = item.kept->infos[stage];
+            if ((info_id == NoInfo) != infos[stage].empty()) {
+                return fmt::format("stage {}: the stages", stage);
+            }
+            if (info_id != NoInfo) {
+                const auto [offset, size] = precompiled_info_blobs.at(info_id);
+                std::vector<u8> bytes(size);
+                kept.clear();
+                kept.seekg(static_cast<std::streamoff>(offset));
+                kept.read(reinterpret_cast<char*>(bytes.data()), size);
+                if (bytes != infos[stage]) {
+                    return fmt::format("stage {}: the shader info", stage);
+                }
+            }
+            const u32 spirv_id = item.kept->spirv[stage];
+            if ((spirv_id == NoInfo) != spirv[stage].empty()) {
+                return fmt::format("stage {}: whether SPIR-V is kept", stage);
+            }
+            if (spirv_id != NoInfo &&
+                ReadKeptSpirv(kept, precompiled_info_blobs.at(spirv_id)) != spirv[stage]) {
+                return fmt::format("stage {}: the SPIR-V", stage);
+            }
+        }
+        return {};
+    };
+    std::mutex mutex;
+    size_t equal = 0;
+    std::vector<std::string> differences;
+    for (const Item& item : items) {
+        workers.QueueWork([&, item_ptr = &item] {
+            std::string what;
+            try {
+                what = check(*item_ptr);
+            } catch (const std::exception& e) {
+                what = fmt::format("unreadable or untranslatable ({})", e.what());
+            }
+            const auto& record = item_ptr->record;
+            const u64 hash = record.compute ? record.compute_key.Hash() : record.graphics_key.Hash();
+            std::scoped_lock lock{mutex};
+            if (what.empty()) {
+                ++equal;
+            } else {
+                differences.push_back(fmt::format(
+                    "{} pipeline {:016x}: {}", record.compute ? "compute" : "graphics", hash, what));
+            }
+        });
+    }
+    workers.WaitForRequests(stop_loading);
+    if (stop_loading.stop_requested()) {
+        return false;
+    }
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+    for (size_t i = 0; i < std::min<size_t>(differences.size(), 4); ++i) {
+        LOG_WARNING(Render_Vulkan, "Kept precompiled {} differs from this build's translation",
+                    differences[i]);
+    }
+    LOG_INFO(Render_Vulkan,
+             "Kept precompiled pipelines checked against this build: {} of {} equal ({:.0f} ms)",
+             equal, items.size(), ms);
+    return differences.empty();
 }
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeline(

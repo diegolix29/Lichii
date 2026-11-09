@@ -97,11 +97,11 @@ LoadingScreen::LoadingScreen(QWidget* parent)
     connect(this, &LoadingScreen::LoadProgress, this, &LoadingScreen::OnLoadProgress,
             Qt::QueuedConnection);
 
-    // Shown while shaders are precached: starts the game without waiting for the rest.
+    // Shown while shaders are precached or prepared: starts the game without waiting for the rest.
     skip_button = new QPushButton(tr("Skip"), this);
     skip_button->setStyleSheet(QString::fromUtf8(SKIP_BUTTON_STYLE));
-    skip_button->setToolTip(tr("Start the game now. The shaders not precached yet are precached "
-                               "on a later launch."));
+    skip_button->setToolTip(tr("Start the game now. The shaders not ready yet are prepared on a "
+                               "later launch."));
     skip_button->hide();
     ui->verticalLayout->insertWidget(2, skip_button, 0, Qt::AlignHCenter | Qt::AlignTop);
     connect(skip_button, &QPushButton::clicked, this, [this] {
@@ -115,12 +115,14 @@ LoadingScreen::LoadingScreen(QWidget* parent)
         {VideoCore::LoadCallbackStage::Build, tr("Loading Shaders %1 / %2")},
         {VideoCore::LoadCallbackStage::Complete, tr("Launching...")},
         {VideoCore::LoadCallbackStage::Warm, tr("Precaching shaders %1 / %2")},
+        {VideoCore::LoadCallbackStage::Precompile, tr("Preparing shaders %1 / %2")},
     };
     progressbar_style = {
         {VideoCore::LoadCallbackStage::Prepare, PROGRESSBAR_STYLE_PREPARE},
         {VideoCore::LoadCallbackStage::Build, PROGRESSBAR_STYLE_BUILD},
         {VideoCore::LoadCallbackStage::Complete, PROGRESSBAR_STYLE_COMPLETE},
         {VideoCore::LoadCallbackStage::Warm, PROGRESSBAR_STYLE_BUILD},
+        {VideoCore::LoadCallbackStage::Precompile, PROGRESSBAR_STYLE_BUILD},
     };
 }
 
@@ -171,7 +173,8 @@ void LoadingScreen::OnLoadProgress(VideoCore::LoadCallbackStage stage, std::size
         } else {
             ui->progress_bar->show();
         }
-        skip_button->setVisible(stage == VideoCore::LoadCallbackStage::Warm);
+        skip_button->setVisible(stage == VideoCore::LoadCallbackStage::Warm ||
+                                stage == VideoCore::LoadCallbackStage::Precompile);
         skip_button->setEnabled(true);
         previous_stage = stage;
         // reset back to fast shader compiling since the stage changed
@@ -211,7 +214,8 @@ void LoadingScreen::OnLoadProgress(VideoCore::LoadCallbackStage stage, std::size
 
     // update labels and progress bar
     if (stage == VideoCore::LoadCallbackStage::Build ||
-        stage == VideoCore::LoadCallbackStage::Warm) {
+        stage == VideoCore::LoadCallbackStage::Warm ||
+        stage == VideoCore::LoadCallbackStage::Precompile) {
         ui->stage->setText(stage_translations[stage].arg(value).arg(total));
     } else {
         ui->stage->setText(stage_translations[stage]);

@@ -482,8 +482,9 @@ Common::Android::SoftwareKeyboard::AndroidKeyboard* EmulationSession::SoftwareKe
 
 void EmulationSession::LoadDiskCacheProgress(VideoCore::LoadCallbackStage stage, int progress,
                                              int max) {
-    // The app has no precache stage: it shows as shader building.
-    if (stage == VideoCore::LoadCallbackStage::Warm) {
+    // The app has no precache or preparation stage: they show as shader building.
+    if (stage == VideoCore::LoadCallbackStage::Warm ||
+        stage == VideoCore::LoadCallbackStage::Precompile) {
         stage = VideoCore::LoadCallbackStage::Build;
     }
     JNIEnv* env = Common::Android::GetEnvForThread();
