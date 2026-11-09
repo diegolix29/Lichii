@@ -299,6 +299,42 @@ bool TextureMemoVerify() {
     return verify;
 }
 
+// EDEN_NX2_DELTA_DESCRIPTORS_VERIFY=1: delta draws resolve their image descriptors as before and
+// compare them with the kept ones.
+const bool delta_descriptors_verify = [] {
+    const char* const value = std::getenv("EDEN_NX2_DELTA_DESCRIPTORS_VERIFY");
+    return value != nullptr && value[0] == '1';
+}();
+
+// Delta draws on the drawing thread, logged every 10 s with EDEN_NX2_GPU_PROFILE or the verify
+// env.
+struct DeltaDescriptorStats {
+    u64 replayed{};
+    u64 pushed{};
+    u64 verified{};
+    u64 mismatches{};
+    std::chrono::steady_clock::time_point next_report{};
+} delta_descriptor_stats;
+
+void ReportDeltaDescriptors() {
+    DeltaDescriptorStats& stats = delta_descriptor_stats;
+    if (((stats.replayed + stats.pushed) & 1023) != 0 ||
+        (!VideoCommon::Nx2Profile::Enabled() && !delta_descriptors_verify)) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < stats.next_report) {
+        return;
+    }
+    if (stats.next_report != std::chrono::steady_clock::time_point{}) {
+        LOG_INFO(Render_Vulkan,
+                 "Delta descriptors in 10 s: {} replayed, {} pushed, {} verified, {} verify "
+                 "mismatches",
+                 stats.replayed, stats.pushed, stats.verified, stats.mismatches);
+    }
+    stats = {.next_report = now + std::chrono::seconds{10}};
+}
+
 // Texture memo counts, logged every 10 s with EDEN_NX2_GPU_PROFILE or the verify env.
 std::atomic<u64> g_memo_hits{};
 std::atomic<u64> g_memo_misses{};
@@ -851,7 +887,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
     }
-    if (std::exchange(capture_delta, false) && delta_blocker == DeltaBlocker::None) {
+    const bool captured_delta =
+        std::exchange(capture_delta, false) && delta_blocker == DeltaBlocker::None;
+    if (captured_delta) {
         const auto same_view = [](const VideoCommon::ImageViewInOut& lhs,
                                   const VideoCommon::ImageViewInOut& rhs) {
             return lhs.index == rhs.index && lhs.id == rhs.id;
@@ -865,6 +903,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         delta_samplers.assign(samplers.begin(), samplers.end());
         configured_stages = Spec::enabled_stages;
         delta_views_valid = true;
+        kept_images_valid = false;
+    }
+    if (captured_delta) {
+        kept_image_entries.clear();
     }
 
     if constexpr (Spec::has_texture_buffers || Spec::has_image_buffers) {
@@ -970,8 +1012,12 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
+            const size_t first_entry = guest_descriptor_queue.UpdateCount();
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
                                  rescaling, samplers_it, views_it);
+            if (captured_delta) {
+                KeepImageDescriptors(stage, first_entry);
+            }
         }
         const auto& info{stage_infos[stage]};
         if (info.uses_render_area) {
@@ -997,6 +1043,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     if constexpr (Spec::enabled_stages[4]) {
         prepare_stage(4);
+    }
+    if (captured_delta) {
+        kept_rescaling = rescaling.Data();
+        kept_scale_epoch = texture_cache.ScaleEpoch();
+        kept_images_valid = true;
     }
     if (mesh_emulation) {
         if (!mesh_output_buffer) {
@@ -1075,6 +1126,22 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     RenderAreaPushConstant render_area;
     const VideoCommon::SamplerId* samplers_it{delta_samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{delta_views.data()};
+    // Push the entries kept for delta_views instead of resolving every view and sampler again;
+    // with EDEN_NX2_DELTA_DESCRIPTORS_VERIFY resolve them and compare.
+    const bool kept_usable = kept_images_valid && kept_scale_epoch == texture_cache.ScaleEpoch();
+    const bool replay_images = kept_usable && !delta_descriptors_verify;
+    struct Kept {
+        std::vector<DescriptorUpdateEntry> entries;
+        std::array<std::pair<u32, u32>, NUM_STAGES> ranges;
+        std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> rescaling;
+    };
+    std::optional<Kept> verify_kept;
+    if (!replay_images) {
+        if (kept_usable) {
+            verify_kept.emplace(std::move(kept_image_entries), kept_image_ranges, kept_rescaling);
+        }
+        kept_image_entries.clear();
+    }
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         if (!configured_stages[stage]) {
             continue;
@@ -1083,10 +1150,16 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
             buffer_cache.BindHostStageBuffers(stage);
         }
-        {
+        if (replay_images) {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
+            const auto [first, count] = kept_image_ranges[stage];
+            guest_descriptor_queue.AddEntries({kept_image_entries.data() + first, count});
+        } else {
+            Profile::Scope scope{Profile::Zone::PushDescriptors};
+            const size_t first_entry = guest_descriptor_queue.UpdateCount();
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
                                  rescaling, samplers_it, views_it);
+            KeepImageDescriptors(stage, first_entry);
         }
         if (stage_infos[stage].uses_render_area) {
             render_area.uses_render_area = true;
@@ -1096,6 +1169,34 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
                                  static_cast<float>(clip_set ? clip_height : u32{regs.rt[0].height})};
         }
     }
+    if (replay_images) {
+        rescaling.Assign(kept_rescaling);
+        ++delta_descriptor_stats.replayed;
+    } else {
+        kept_rescaling = rescaling.Data();
+        kept_scale_epoch = texture_cache.ScaleEpoch();
+        kept_images_valid = true;
+        ++delta_descriptor_stats.pushed;
+        if (verify_kept) {
+            ++delta_descriptor_stats.verified;
+            const auto same_image = [](const DescriptorUpdateEntry& lhs,
+                                       const DescriptorUpdateEntry& rhs) {
+                return lhs.image.sampler == rhs.image.sampler &&
+                       lhs.image.imageView == rhs.image.imageView &&
+                       lhs.image.imageLayout == rhs.image.imageLayout;
+            };
+            if ((verify_kept->ranges != kept_image_ranges ||
+                 verify_kept->rescaling != kept_rescaling ||
+                 !std::ranges::equal(verify_kept->entries, kept_image_entries, same_image)) &&
+                delta_descriptor_stats.mismatches++ < 16) {
+                LOG_ERROR(Render_Vulkan,
+                          "Delta descriptors verify: pipeline {:016x} resolved other image "
+                          "descriptors or rescaling words than the previous draw",
+                          key.Hash());
+            }
+        }
+    }
+    ReportDeltaDescriptors();
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
@@ -1115,6 +1216,15 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
     return ConfigureDraw(rescaling, render_area);
+}
+
+void GraphicsPipeline::KeepImageDescriptors(size_t stage, size_t first_entry) {
+    const DescriptorUpdateEntry* const entries = guest_descriptor_queue.UpdateData();
+    const size_t end_entry = guest_descriptor_queue.UpdateCount();
+    kept_image_ranges[stage] = {static_cast<u32>(kept_image_entries.size()),
+                                static_cast<u32>(end_entry - first_entry)};
+    kept_image_entries.insert(kept_image_entries.end(), entries + first_entry,
+                              entries + end_entry);
 }
 
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
@@ -1293,6 +1403,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (!IsBuilt()) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
+            const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PipelineWait};
             const auto begin = std::chrono::steady_clock::now();
             build->Wait(!worker_only_build);
             hold_time_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(

@@ -75,6 +75,7 @@
 #include "hid_core/hid_core.h"
 #include "network/network.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/nx2_precompile.h"
 #include "video_core/renderer_base.h"
 #include "video_core/video_core.h"
@@ -384,6 +385,7 @@ struct System::Impl {
     }
 
     SystemResultStatus Load(System& system, Frontend::EmuWindow& emu_window, const std::string& filepath, Service::AM::FrontendAppletParameters& params) {
+        VideoCommon::StutterTrace::BootMarker("boot_start");
         if (params.launch_type == Service::AM::LaunchType::FrontendInitiated) {
             fs_controller.InitTempStorage();
         }

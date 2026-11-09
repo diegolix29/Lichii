@@ -20,6 +20,7 @@
 #include "common/logging.h"
 #include "common/cpu_features.h"
 #include "common/thread_cpu_clock.h"
+#include "video_core/nx2_stutter_trace.h"
 
 // EDEN_NX2_GPU_PROFILE: time where the GPU thread spends its time. Each zone counts its own
 // (exclusive) time, nested zones excluded; every 10 s the thread logs each zone's share.
@@ -62,6 +63,14 @@ enum class Zone : u32 {
     WriterWait,
     ListSubmitWait,
     ListGpuWait,
+    GraphicsPipelineMiss, ///< A graphics pipeline built on the GPU thread
+    ComputePipelineMiss,  ///< A compute pipeline built on the GPU thread
+    PipelineWait,         ///< VulkanWorker: a draw or dispatch waits for its pipeline's build
+    ShaderCapture,        ///< A program the shader cache sees first: captured, lowered, hashed
+    TextureCache,         ///< Texture cache downloads, joins, blits and async flushes and decodes
+    GpuWait,              ///< Waiting for a GPU tick
+    Present,              ///< Swapchain frame acquire and present
+    WorkerIdle,           ///< VulkanWorker waiting for work
     Count,
 };
 
@@ -73,16 +82,56 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
     "fence skipped", "method", "split drain", "split wait",
-    "writer wait", "list submit wait", "list GPU wait",
+    "writer wait", "list submit wait", "list GPU wait", "graphics pipeline miss",
+    "compute pipeline miss", "pipeline wait", "shader capture", "texture cache", "GPU wait",
+    "present", "worker idle",
 };
+
+/// The EDEN_NX2_STUTTER_TRACE category of each zone's exclusive time (None: counted as other).
+inline constexpr auto stutter_categories = [] {
+    using StutterTrace::Category;
+    std::array<Category, static_cast<size_t>(Zone::Count)> categories;
+    categories.fill(Category::None);
+    const auto set = [&categories](Zone zone, Category category) {
+        categories[static_cast<size_t>(zone)] = category;
+    };
+    set(Zone::Idle, Category::Idle);
+    set(Zone::PendingSleep, Category::Idle);
+    set(Zone::SplitDrain, Category::Idle);
+    set(Zone::SplitWait, Category::Idle);
+    set(Zone::WriterWait, Category::Idle);
+    set(Zone::WorkerIdle, Category::Idle);
+    set(Zone::GraphicsPipelineMiss, Category::GraphicsMiss);
+    set(Zone::ComputePipelineMiss, Category::ComputeMiss);
+    set(Zone::PipelineWait, Category::PipelineWait);
+    set(Zone::ShaderCapture, Category::ShaderCapture);
+    set(Zone::SyncDescriptors, Category::TextureCache);
+    set(Zone::FillImageViews, Category::TextureCache);
+    set(Zone::RenderTargets, Category::TextureCache);
+    set(Zone::TextureUpload, Category::TextureCache);
+    set(Zone::TextureCache, Category::TextureCache);
+    set(Zone::TextureBuffers, Category::BufferCache);
+    set(Zone::UpdateBuffers, Category::BufferCache);
+    set(Zone::BindStageBuffers, Category::BufferCache);
+    set(Zone::Fence, Category::QueryFence);
+    set(Zone::ListSubmitWait, Category::QueryFence);
+    set(Zone::ListGpuWait, Category::QueryFence);
+    set(Zone::GpuWait, Category::QueryFence);
+    set(Zone::Present, Category::Present);
+    return categories;
+}();
 
 // A plain flag: Enabled() runs several times per method write (no guard to check).
 inline bool g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
+/// Whether zones measure: for the profile or for EDEN_NX2_STUTTER_TRACE.
+inline bool g_zones_enabled = g_enabled || StutterTrace::ReadEnv();
 
 /// Called by VideoCore::CreateGPU: static initialization runs before the frontend loads
 /// nx2_switches.txt, so a switch set only there takes effect from that point on.
 inline void ReadSwitch() {
     g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
+    StutterTrace::ReadSwitch();
+    g_zones_enabled = g_enabled || StutterTrace::Enabled();
 }
 
 inline bool Enabled() {
@@ -122,25 +171,34 @@ inline thread_local ThreadData t_data;
 
 class Scope {
 public:
-    explicit Scope(Zone zone_) : zone{zone_}, enabled{Enabled()} {
+    explicit Scope(Zone zone_) : zone{zone_}, enabled{g_zones_enabled} {
         if (!enabled) {
             return;
         }
         parent_child_ns = t_data.child_ns;
         t_data.child_ns = 0;
         start = Ticks();
+        traced = StutterTrace::Enabled();
+        if (traced) {
+            outer = StutterTrace::Open(stutter_categories[static_cast<size_t>(zone)], start);
+        }
     }
 
     ~Scope() {
         if (!enabled) {
             return;
         }
-        const u64 elapsed = Ticks() - start;
+        const u64 end = Ticks();
+        const u64 elapsed = end - start;
         auto& data = t_data;
         const auto index = static_cast<size_t>(zone);
-        data.exclusive_ns[index] += elapsed - data.child_ns;
+        const u64 exclusive = elapsed - data.child_ns;
+        data.exclusive_ns[index] += exclusive;
         ++data.count[index];
         data.child_ns = parent_child_ns + elapsed;
+        if (traced) {
+            StutterTrace::Close(outer, end);
+        }
     }
 
     Scope(const Scope&) = delete;
@@ -149,6 +207,8 @@ public:
 private:
     Zone zone;
     bool enabled;
+    bool traced{};
+    StutterTrace::Category outer{StutterTrace::Category::None};
     u64 start{};
     u64 parent_child_ns{};
 };

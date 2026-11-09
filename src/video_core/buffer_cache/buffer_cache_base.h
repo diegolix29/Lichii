@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -45,6 +46,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_download_trace.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
 
@@ -482,6 +484,11 @@ public:
         } while (channel_state->has_deleted_buffers);
     }
 
+    /// Called before each graphics draw binds its buffers (uniform keeps). `delta`: the constant
+    /// buffer binds and data since the previous draw when it is a fast draw delta draw, else
+    /// nullptr.
+    void BeginGraphicsUniforms(const Nx2FastDraw::Delta* delta);
+
     Common::SpinRecursiveMutex mutex;
     Runtime& runtime;
     bool any_buffer_uploaded = false;
@@ -692,6 +699,43 @@ private:
         u64 syncs_skipped{};
         u64 verify_mismatches{};
     } geometry_stats;
+
+    /// Uniform keeps: a delta draw binds a small uniform buffer from the stream
+    /// allocation the previous draw made for it, without reading guest memory, when nothing ordered
+    /// between the two draws wrote its range: no inline constant data, no rebind, no CPU write the
+    /// caches were told about, no GPU write and no buffer deletion. Anything else in between ends
+    /// the delta chain.
+    [[nodiscard]] bool UniformRangeKept(size_t stage, u32 index, DAddr device_addr,
+                                        u32 size) const noexcept;
+    void NoteUniformWrite(DAddr device_addr, u64 size) {
+        UniformKeep& keep = uniform_keep;
+        if (keep.memory_writes.size() == keep.memory_writes.capacity()) {
+            keep.memory_writes_lost = true;
+            return;
+        }
+        keep.memory_writes.emplace_back(device_addr, device_addr + size);
+    }
+    /// EDEN_NX2_UBO_KEEP_VERIFY=1: binds what a keep would skip the original way and logs where
+    /// guest memory changed.
+    const bool ubo_keep_verify = [] {
+        const char* const value = std::getenv("EDEN_NX2_UBO_KEEP_VERIFY");
+        return value != nullptr && value[0] == '1';
+    }();
+    struct UniformKeep {
+        std::array<u32, NUM_STAGES> candidates{}; ///< Streamed by the previous draw, not rebound
+        std::array<u32, NUM_STAGES> streamed{};   ///< Streamed by this draw
+        /// Device ranges written since the previous draw began: inline constant data, then the
+        /// CPU writes and GPU-modified marks.
+        boost::container::static_vector<std::pair<DAddr, DAddr>, Nx2FastDraw::Delta::MaxWrites + 8>
+            writes;
+        boost::container::static_vector<std::pair<DAddr, DAddr>, 8> memory_writes;
+        bool memory_writes_lost{}; ///< More writes than memory_writes holds
+        u64 draw_deletions{}; ///< buffer_deletions when the previous draw began
+        u64 kept{};
+        u64 streamed_binds{};
+        u64 verified{};
+        u64 mismatches{};
+    } uniform_keep;
 
     boost::container::small_vector<BufferCopy, 4> upload_copies;
 

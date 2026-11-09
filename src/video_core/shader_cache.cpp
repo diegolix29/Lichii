@@ -32,6 +32,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/util.h"
@@ -166,6 +167,7 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                 // Native programs are lowered while the environment is built (once: the
                 // ShaderInfo keeps the result for the pipeline's environments).
                 RethrowIfRejected(*cpu_shader_addr);
+                const Nx2Profile::Scope profile_scope{Nx2Profile::Zone::ShaderCapture};
                 GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address};
                 shader_info = MakeShaderInfo(env, *cpu_shader_addr);
             } catch (const Shader::Exception&) {
@@ -279,6 +281,7 @@ const ShaderInfo* ShaderCache::ComputeShader() {
     } else {
         try {
             RethrowIfRejected(*cpu_shader_addr);
+            const Nx2Profile::Scope profile_scope{Nx2Profile::Zone::ShaderCapture};
             ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
             shader = MakeShaderInfo(env, *cpu_shader_addr);
         } catch (const Shader::Ampere::TrapGuardError&) {

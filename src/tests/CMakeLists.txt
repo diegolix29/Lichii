@@ -11,8 +11,10 @@ add_executable(tests
     video_core/unswizzle_workers.cpp
     video_core/aftermath_dump.cpp
     video_core/frame_dump_schedule.cpp
+    video_core/nx2_stutter_trace.cpp
     video_core/host_mip_limits.cpp
     video_core/gpu_timestamp.cpp
+    video_core/semaphore_waiters.cpp
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
     core/nx2_debug_server.cpp
@@ -48,6 +50,8 @@ add_executable(tests
     video_core/storage_write_extent.cpp
     video_core/storage_buffer_control_flow.cpp
     core/nup_validation.cpp
+    core/vfs_vector.cpp
+    core/file_sys_parsers.cpp
     input_common/calibration_lifetime.cpp
     video_core/ampere_logged_numeric.cpp
     video_core/ampere_logged_textures.cpp
@@ -83,6 +87,7 @@ add_executable(tests
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
     video_core/gpu_written_pages.cpp
+    video_core/nx2_semaphore_mirror.cpp
     video_core/command_writer.cpp
     video_core/split_fence_wait.cpp
     video_core/command_snapshot_suspensions.cpp
@@ -135,6 +140,7 @@ add_executable(tests
     common/host_memory_failure.cpp
     common/host_memory_test_access.h
     core/host_memory_failure.cpp
+    common/multi_level_page_table.cpp
     common/page_table.cpp
     common/param_package.cpp
     common/range_map.cpp

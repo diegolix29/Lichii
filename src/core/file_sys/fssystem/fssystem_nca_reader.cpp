@@ -50,6 +50,9 @@ Result NcaReader::Initialize(VirtualFile base_storage, const NcaCryptoConfigurat
     // We need to be able to generate keys.
     R_UNLESS(crypto_cfg.generate_key != nullptr, ResultInvalidArgument);
 
+    // The header must be there to read.
+    R_UNLESS(base_storage->GetSize() >= sizeof(NcaHeader), ResultInvalidNcaHeader);
+
     // Generate keys for header.
     using AesXtsStorageForNcaHeader = AesXtsStorage;
 
@@ -360,7 +363,8 @@ Result NcaReader::ReadHeader(NcaFsHeader* dst, s32 index) const {
     ASSERT(0 <= index && index < NcaHeader::FsCountMax);
 
     const s64 offset = sizeof(NcaHeader) + sizeof(NcaFsHeader) * index;
-    m_header_storage->ReadObject(dst, offset);
+    R_UNLESS(m_header_storage->ReadObject(dst, offset) == sizeof(NcaFsHeader),
+             ResultInvalidNcaFsHeader);
 
     R_SUCCEED();
 }

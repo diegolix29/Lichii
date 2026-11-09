@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <limits>
 #include <map>
@@ -182,8 +183,11 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 astc_alpha_images{};
     Common::ScratchBuffer<u8> astc_scan_buffer;
     u64 images_deleted{};
+    u64 scale_epoch{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
     bool debug_stats{}; ///< Collect what only the debug statistics lines use
+    /// EDEN_NX2_MEM_TRACE: when the last memory trace lines were logged.
+    std::chrono::steady_clock::time_point mem_trace_time{};
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
@@ -411,6 +415,11 @@ public:
 
     [[nodiscard]] bool IsRescaling(const ImageViewBase& image_view) const noexcept;
 
+    /// Counts InvalidateScale calls: an image changed its scale and lost its views.
+    [[nodiscard]] u64 ScaleEpoch() const noexcept {
+        return scale_epoch;
+    }
+
     /// Create channel state.
     void CreateChannel(Tegra::Control::ChannelState& channel) final override;
 
@@ -627,6 +636,7 @@ private:
 
     /// Applies EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB and logs the thresholds.
     void ApplyThresholdOverrides(bool log = true);
+    void LogThresholds() const;
 
     /// A GPU-written image dropped without being written back leaves its
     /// guest memory stale (the GPU's data is gone). Its whole pages are marked here and kept

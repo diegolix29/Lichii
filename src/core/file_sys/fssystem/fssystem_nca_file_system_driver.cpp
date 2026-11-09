@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
+
 #include "core/file_sys/fssystem/fssystem_aes_ctr_counter_extended_storage.h"
 #include "core/file_sys/fssystem/fssystem_aes_ctr_storage.h"
 #include "core/file_sys/fssystem/fssystem_aes_xts_storage.h"
@@ -30,6 +32,18 @@ constexpr inline s32 IntegrityHashCacheCount = 8;
 
 constexpr inline s32 IntegrityDataCacheCountForMeta = 16;
 constexpr inline s32 IntegrityHashCacheCountForMeta = 2;
+
+// Offsets and sizes in NCA headers are untrusted s64 values, so ranges are checked without
+// letting the sum overflow.
+constexpr bool IsRangeWithin(s64 offset, s64 size, s64 end) {
+    return offset >= 0 && size >= 0 && offset <= end && size <= end - offset;
+}
+
+// Sparse and indirect layers give a section a virtual size taken from header fields. Tables that
+// are read into memory whole are also checked against the bytes the NCAs actually store.
+s64 GetBodySize(const std::shared_ptr<NcaReader>& reader) {
+    return reader != nullptr ? static_cast<s64>(reader->GetSharedBodyStorage()->GetSize()) : 0;
+}
 
 class SharedNcaBodyStorage : public IReadOnlyStorage {
     YUZU_NON_COPYABLE(SharedNcaBodyStorage);
@@ -160,10 +174,12 @@ Result NcaFileSystemDriver::OpenStorageImpl(VirtualFile* out, NcaFsHeaderReader*
 
     if (patch_info.HasAesCtrExTable()) {
         // Check the encryption type.
-        ASSERT(out_header_reader->GetEncryptionType() == NcaFsHeader::EncryptionType::None ||
-               out_header_reader->GetEncryptionType() == NcaFsHeader::EncryptionType::AesCtrEx ||
-               out_header_reader->GetEncryptionType() ==
-                   NcaFsHeader::EncryptionType::AesCtrExSkipLayerHash);
+        R_UNLESS(out_header_reader->GetEncryptionType() == NcaFsHeader::EncryptionType::None ||
+                     out_header_reader->GetEncryptionType() ==
+                         NcaFsHeader::EncryptionType::AesCtrEx ||
+                     out_header_reader->GetEncryptionType() ==
+                         NcaFsHeader::EncryptionType::AesCtrExSkipLayerHash,
+                 ResultInvalidNcaFsHeaderEncryptionType);
 
         // Create the ex meta storage.
         VirtualFile aes_ctr_ex_storage_meta_storage = patch_meta_aes_ctr_ex_meta_storage;
@@ -414,7 +430,7 @@ Result NcaFileSystemDriver::CreateBodySubStorage(VirtualFile* out, s64 offset, s
     s64 body_size = body_storage->GetSize();
 
     // Check that we're within range.
-    R_UNLESS(offset + size <= body_size, ResultNcaBaseStorageOutOfRangeB);
+    R_UNLESS(IsRangeWithin(offset, size, body_size), ResultNcaBaseStorageOutOfRangeB);
 
     // Create substorage.
     auto body_substorage = std::make_shared<OffsetVfsFile>(std::move(body_storage), size, offset);
@@ -487,7 +503,7 @@ Result NcaFileSystemDriver::CreateAesXtsStorage(VirtualFile* out, VirtualFile ba
     R_UNLESS(aligned_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
 
     // Set the out storage.
-    *out = std::move(xts_storage);
+    *out = std::move(aligned_storage);
     R_SUCCEED();
 }
 
@@ -505,7 +521,9 @@ Result NcaFileSystemDriver::CreateSparseStorageMetaStorage(VirtualFile* out,
     // Get the meta extents.
     const auto meta_offset = sparse_info.bucket.offset;
     const auto meta_size = sparse_info.bucket.size;
-    R_UNLESS(meta_offset + meta_size - offset <= base_size, ResultNcaBaseStorageOutOfRangeB);
+    R_UNLESS(offset >= 0 && meta_offset >= 0 && meta_size >= 0 && meta_size <= base_size &&
+                 meta_offset - offset <= base_size - meta_size,
+             ResultNcaBaseStorageOutOfRangeB);
 
     // Create the encrypted storage.
     auto enc_storage =
@@ -656,13 +674,15 @@ Result NcaFileSystemDriver::CreateSparseStorageMetaStorageWithVerification(
     // Get the meta extents.
     const auto meta_offset = sparse_info.bucket.offset;
     const auto meta_size = sparse_info.bucket.size;
-    R_UNLESS(meta_offset + meta_size - offset <= base_size, ResultNcaBaseStorageOutOfRangeB);
+    R_UNLESS(offset >= 0 && meta_offset >= 0 && meta_size >= 0 && meta_size <= base_size &&
+                 meta_offset - offset <= base_size - meta_size,
+             ResultNcaBaseStorageOutOfRangeB);
 
     // Get the meta data hash data extents.
     const s64 meta_data_hash_data_offset = meta_data_hash_data_info.offset;
     const s64 meta_data_hash_data_size =
         Common::AlignUp<s64>(meta_data_hash_data_info.size, NcaHeader::CtrBlockSize);
-    R_UNLESS(meta_data_hash_data_offset + meta_data_hash_data_size <= base_size,
+    R_UNLESS(IsRangeWithin(meta_data_hash_data_offset, meta_data_hash_data_size, base_size),
              ResultNcaBaseStorageOutOfRangeB);
 
     // Check that the meta is before the hash data.
@@ -817,7 +837,8 @@ Result NcaFileSystemDriver::CreateAesCtrExStorageMetaStorage(
     // Validate patch info extents.
     R_UNLESS(patch_info.indirect_size > 0, ResultInvalidNcaPatchInfoIndirectSize);
     R_UNLESS(patch_info.aes_ctr_ex_size > 0, ResultInvalidNcaPatchInfoAesCtrExSize);
-    R_UNLESS(patch_info.indirect_size + patch_info.indirect_offset <= patch_info.aes_ctr_ex_offset,
+    R_UNLESS(IsRangeWithin(patch_info.indirect_offset, patch_info.indirect_size,
+                           patch_info.aes_ctr_ex_offset),
              ResultInvalidNcaPatchInfoAesCtrExOffset);
 
     // Get the base storage size.
@@ -827,7 +848,9 @@ Result NcaFileSystemDriver::CreateAesCtrExStorageMetaStorage(
     const s64 meta_offset = patch_info.aes_ctr_ex_offset;
     const s64 meta_size =
         Common::AlignUp(static_cast<s64>(patch_info.aes_ctr_ex_size), NcaHeader::XtsBlockSize);
-    R_UNLESS(meta_offset + meta_size <= base_size, ResultNcaBaseStorageOutOfRangeB);
+    R_UNLESS(IsRangeWithin(meta_offset, meta_size, base_size), ResultNcaBaseStorageOutOfRangeB);
+
+    R_UNLESS(meta_size <= GetBodySize(m_reader), ResultNcaBaseStorageOutOfRangeB);
 
     // Create the encrypted storage.
     auto enc_storage =
@@ -963,8 +986,10 @@ Result NcaFileSystemDriver::CreateIndirectStorageMetaStorage(VirtualFile* out,
     s64 base_size = base_storage->GetSize();
 
     // Check that we're within range.
-    R_UNLESS(patch_info.indirect_offset + patch_info.indirect_size <= base_size,
+    R_UNLESS(IsRangeWithin(patch_info.indirect_offset, patch_info.indirect_size, base_size),
              ResultNcaBaseStorageOutOfRangeE);
+
+    R_UNLESS(patch_info.indirect_size <= GetBodySize(m_reader), ResultNcaBaseStorageOutOfRangeE);
 
     // Create the meta storage.
     auto meta_storage = std::make_shared<OffsetVfsFile>(base_storage, patch_info.indirect_size,
@@ -1005,7 +1030,8 @@ Result NcaFileSystemDriver::CreateIndirectStorage(
 
     // Get the indirect data size.
     const s64 indirect_data_size = patch_info.indirect_offset;
-    ASSERT(Common::IsAligned(indirect_data_size, NcaHeader::XtsBlockSize));
+    R_UNLESS(Common::IsAligned(indirect_data_size, NcaHeader::XtsBlockSize),
+             ResultInvalidNcaIndirectStorageOutOfRange);
 
     // Create the indirect data storage.
     auto indirect_data_storage =
@@ -1049,31 +1075,33 @@ Result NcaFileSystemDriver::CreatePatchMetaStorage(
     ASSERT(out_aes_ctr_ex_meta != nullptr);
     ASSERT(out_indirect_meta != nullptr);
     ASSERT(base_storage != nullptr);
-    ASSERT(Common::IsAligned<s64>(patch_info.aes_ctr_ex_size, NcaHeader::XtsBlockSize));
 
     // Validate patch info extents.
-    R_UNLESS(patch_info.aes_ctr_ex_size >= 0 && patch_info.HasAesCtrExTable(), ResultInvalidNcaPatchInfoAesCtrExSize);
+    R_UNLESS(patch_info.aes_ctr_ex_size >= 0 && patch_info.HasAesCtrExTable() &&
+                 Common::IsAligned<s64>(patch_info.aes_ctr_ex_size, NcaHeader::XtsBlockSize),
+             ResultInvalidNcaPatchInfoAesCtrExSize);
     R_UNLESS(patch_info.indirect_size > 0 && patch_info.HasIndirectTable(), ResultInvalidNcaPatchInfoIndirectSize);
-    R_UNLESS(patch_info.indirect_size + patch_info.indirect_offset <= patch_info.aes_ctr_ex_offset,
+    R_UNLESS(IsRangeWithin(patch_info.indirect_offset, patch_info.indirect_size,
+                           patch_info.aes_ctr_ex_offset),
              ResultInvalidNcaPatchInfoAesCtrExOffset);
-    R_UNLESS(patch_info.aes_ctr_ex_offset + patch_info.aes_ctr_ex_size <=
-                 meta_data_hash_data_info.offset,
+    R_UNLESS(IsRangeWithin(patch_info.aes_ctr_ex_offset, patch_info.aes_ctr_ex_size,
+                           meta_data_hash_data_info.offset),
              ResultRomNcaInvalidPatchMetaDataHashDataOffset);
 
     // Get the base storage size.
     s64 base_size = base_storage->GetSize();
 
     // Check that extents remain within range.
-    R_UNLESS(patch_info.indirect_offset + patch_info.indirect_size <= base_size,
+    R_UNLESS(IsRangeWithin(patch_info.indirect_offset, patch_info.indirect_size, base_size),
              ResultNcaBaseStorageOutOfRangeE);
-    R_UNLESS(patch_info.aes_ctr_ex_offset + patch_info.aes_ctr_ex_size <= base_size,
+    R_UNLESS(IsRangeWithin(patch_info.aes_ctr_ex_offset, patch_info.aes_ctr_ex_size, base_size),
              ResultNcaBaseStorageOutOfRangeB);
 
     // Check that metadata hash data extents remain within range.
     const s64 meta_data_hash_data_offset = meta_data_hash_data_info.offset;
     const s64 meta_data_hash_data_size =
         Common::AlignUp<s64>(meta_data_hash_data_info.size, NcaHeader::CtrBlockSize);
-    R_UNLESS(meta_data_hash_data_offset + meta_data_hash_data_size <= base_size,
+    R_UNLESS(IsRangeWithin(meta_data_hash_data_offset, meta_data_hash_data_size, base_size),
              ResultNcaBaseStorageOutOfRangeB);
 
     // Create the encrypted storage.
@@ -1128,7 +1156,8 @@ Result NcaFileSystemDriver::CreateSha3Storage(
 
     using VerificationStorage = HierarchicalSha3Storage;
 
-    R_UNLESS(Common::IsPowerOfTwo(hash_data.hash_block_size),
+    R_UNLESS(Common::IsPowerOfTwo(hash_data.hash_block_size) &&
+                 static_cast<size_t>(hash_data.hash_block_size) >= VerificationStorage::HashSize,
              ResultInvalidHierarchicalSha256BlockSize);
     R_UNLESS(hash_data.hash_layer_count == VerificationStorage::LayerCount - 1,
              ResultInvalidHierarchicalSha256LayerCount);
@@ -1136,19 +1165,24 @@ Result NcaFileSystemDriver::CreateSha3Storage(
     const auto& hash_region = hash_data.hash_layer_region[0];
     const auto& data_region = hash_data.hash_layer_region[1];
 
-    constexpr s32 CacheBlockCount = 2;
+    const s64 base_size = base_storage->GetSize();
+    R_UNLESS(IsRangeWithin(hash_region.offset, hash_region.size, base_size),
+             ResultNcaBaseStorageOutOfRangeC);
+    R_UNLESS(IsRangeWithin(data_region.offset, data_region.size, base_size),
+             ResultNcaBaseStorageOutOfRangeC);
+    const s64 stored_size = GetBodySize(m_reader) + GetBodySize(m_original_reader);
+    R_UNLESS(hash_region.size <= stored_size, ResultNcaBaseStorageOutOfRangeC);
+
+    R_UNLESS(Common::IsAligned<s64>(hash_region.size, VerificationStorage::HashSize) &&
+                 hash_region.size <= hash_data.hash_block_size,
+             ResultInvalidHierarchicalSha256BlockSize);
+
     const auto hash_buffer_size = static_cast<size_t>(hash_region.size);
-    const auto cache_buffer_size = CacheBlockCount * hash_data.hash_block_size;
-    const auto total_buffer_size = hash_buffer_size + cache_buffer_size;
 
     auto buffer_hold_storage = std::make_shared<MemoryResourceBufferHoldStorage>(
-        std::move(base_storage), total_buffer_size);
+        std::move(base_storage), hash_buffer_size);
     R_UNLESS(buffer_hold_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
     R_UNLESS(buffer_hold_storage->IsValid(), ResultAllocationMemoryFailedInNcaFileSystemDriverI);
-
-    s64 base_size = buffer_hold_storage->GetSize();
-    R_UNLESS(hash_region.offset + hash_region.size <= base_size, ResultNcaBaseStorageOutOfRangeC);
-    R_UNLESS(data_region.offset + data_region.size <= base_size, ResultNcaBaseStorageOutOfRangeC);
 
     auto master_hash_storage =
         std::make_shared<ArrayVfsFile<sizeof(Hash)>>(hash_data.fs_data_master_hash.value);
@@ -1181,7 +1215,8 @@ Result NcaFileSystemDriver::CreateSha256Storage(
     using VerificationStorage = HierarchicalSha256Storage;
 
     // Validate the hash data.
-    R_UNLESS(Common::IsPowerOfTwo(hash_data.hash_block_size),
+    R_UNLESS(Common::IsPowerOfTwo(hash_data.hash_block_size) &&
+                 static_cast<size_t>(hash_data.hash_block_size) >= VerificationStorage::HashSize,
              ResultInvalidHierarchicalSha256BlockSize);
     R_UNLESS(hash_data.hash_layer_count == VerificationStorage::LayerCount - 1,
              ResultInvalidHierarchicalSha256LayerCount);
@@ -1190,24 +1225,26 @@ Result NcaFileSystemDriver::CreateSha256Storage(
     const auto& hash_region = hash_data.hash_layer_region[0];
     const auto& data_region = hash_data.hash_layer_region[1];
 
-    // Determine buffer sizes.
-    constexpr s32 CacheBlockCount = 2;
+    // Check that we're within range.
+    const s64 base_size = base_storage->GetSize();
+    R_UNLESS(IsRangeWithin(hash_region.offset, hash_region.size, base_size),
+             ResultNcaBaseStorageOutOfRangeC);
+    R_UNLESS(IsRangeWithin(data_region.offset, data_region.size, base_size),
+             ResultNcaBaseStorageOutOfRangeC);
+    const s64 stored_size = GetBodySize(m_reader) + GetBodySize(m_original_reader);
+    R_UNLESS(hash_region.size <= stored_size, ResultNcaBaseStorageOutOfRangeC);
+
+    R_UNLESS(Common::IsAligned<s64>(hash_region.size, VerificationStorage::HashSize) &&
+                 hash_region.size <= hash_data.hash_block_size,
+             ResultInvalidHierarchicalSha256BlockSize);
+
     const auto hash_buffer_size = static_cast<size_t>(hash_region.size);
-    const auto cache_buffer_size = CacheBlockCount * hash_data.hash_block_size;
-    const auto total_buffer_size = hash_buffer_size + cache_buffer_size;
 
     // Make a buffer holder storage.
     auto buffer_hold_storage = std::make_shared<MemoryResourceBufferHoldStorage>(
-        std::move(base_storage), total_buffer_size);
+        std::move(base_storage), hash_buffer_size);
     R_UNLESS(buffer_hold_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
     R_UNLESS(buffer_hold_storage->IsValid(), ResultAllocationMemoryFailedInNcaFileSystemDriverI);
-
-    // Get storage size.
-    s64 base_size = buffer_hold_storage->GetSize();
-
-    // Check that we're within range.
-    R_UNLESS(hash_region.offset + hash_region.size <= base_size, ResultNcaBaseStorageOutOfRangeC);
-    R_UNLESS(data_region.offset + data_region.size <= base_size, ResultNcaBaseStorageOutOfRangeC);
 
     // Create the master hash storage.
     auto master_hash_storage =
@@ -1255,9 +1292,16 @@ Result NcaFileSystemDriver::CreateIntegrityVerificationStorageForMeta(
              ResultInvalidNcaMetaDataHashDataSize);
 
     // Read the meta data hash data.
+    R_UNLESS(meta_data_hash_data_info.offset >= offset, ResultNcaBaseStorageOutOfRangeB);
+    const s64 meta_data_hash_data_offset = meta_data_hash_data_info.offset - offset;
+    R_UNLESS(IsRangeWithin(meta_data_hash_data_offset, sizeof(NcaMetaDataHashData),
+                           base_storage->GetSize()),
+             ResultNcaBaseStorageOutOfRangeB);
     NcaMetaDataHashData meta_data_hash_data;
-    base_storage->ReadObject(std::addressof(meta_data_hash_data),
-                             meta_data_hash_data_info.offset - offset);
+    base_storage->ReadObject(std::addressof(meta_data_hash_data), meta_data_hash_data_offset);
+    R_UNLESS(meta_data_hash_data.layer_info_offset >= offset &&
+                 meta_data_hash_data.layer_info_offset - offset <= meta_data_hash_data_offset,
+             ResultRomNcaInvalidIntegrityLayerInfoOffset);
 
     // Set the out layer info storage, if necessary.
     if (out_layer_info_storage != nullptr) {
@@ -1307,14 +1351,24 @@ Result NcaFileSystemDriver::CreateIntegrityVerificationStorageImpl(
     R_UNLESS(level_hash_info.max_layers <= IntegrityMaxLayerCount,
              ResultInvalidNcaHierarchicalIntegrityVerificationLayerCount);
 
+    for (u32 i = 0; i < level_hash_info.max_layers - 1; ++i) {
+        const s32 block_order = level_hash_info.info[i].block_order;
+        R_UNLESS(block_order >= std::countr_zero(static_cast<u64>(IntegrityVerificationStorage::HashSize)) &&
+                     block_order < 32,
+                 ResultInvalidNcaHierarchicalIntegrityVerificationLayerCount);
+    }
+
     // Get the base storage size.
     s64 base_storage_size = base_storage->GetSize();
+    R_UNLESS(layer_info_offset >= 0 && layer_info_offset <= base_storage_size,
+             ResultNcaBaseStorageOutOfRangeD);
 
     // Create storage info.
     StorageInfo storage_info;
     for (s32 i = 0; i < static_cast<s32>(level_hash_info.max_layers - 2); ++i) {
         const auto& layer_info = level_hash_info.info[i];
-        R_UNLESS(layer_info_offset + layer_info.offset + layer_info.size <= base_storage_size,
+        R_UNLESS(IsRangeWithin(layer_info.offset, layer_info.size,
+                               base_storage_size - layer_info_offset),
                  ResultNcaBaseStorageOutOfRangeD);
 
         storage_info[i + 1] = std::make_shared<OffsetVfsFile>(base_storage,
@@ -1325,10 +1379,10 @@ Result NcaFileSystemDriver::CreateIntegrityVerificationStorageImpl(
     // Set the last layer info.
     const auto& layer_info = level_hash_info.info[level_hash_info.max_layers - 2];
     const s64 last_layer_info_offset = layer_info_offset > 0 ? 0LL : layer_info.offset.Get();
-    R_UNLESS(last_layer_info_offset + layer_info.size <= base_storage_size,
+    R_UNLESS(IsRangeWithin(last_layer_info_offset, layer_info.size, base_storage_size),
              ResultNcaBaseStorageOutOfRangeD);
     if (layer_info_offset > 0) {
-        R_UNLESS(last_layer_info_offset + layer_info.size <= layer_info_offset,
+        R_UNLESS(IsRangeWithin(last_layer_info_offset, layer_info.size, layer_info_offset),
                  ResultRomNcaInvalidIntegrityLayerInfoOffset);
     }
 
@@ -1354,6 +1408,8 @@ Result NcaFileSystemDriver::CreateIntegrityVerificationStorageImpl(
         case FileSys::HierarchicalIntegrityVerificationStorage::HierarchicalStorageInformation::DataStorage:
             storage_info.SetDataStorage(std::make_shared<OffsetVfsFile>(std::move(base_storage), layer_info.size, last_layer_info_offset));
             break;
+        default:
+            R_THROW(ResultInvalidNcaHierarchicalIntegrityVerificationLayerCount);
     }
 
     // Make the integrity romfs storage.

@@ -352,6 +352,8 @@ private:
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
 
+    void KeepImageDescriptors(size_t stage, size_t first_entry);
+
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
 
@@ -406,6 +408,14 @@ private:
     std::array<u32, NUM_STAGES> handle_constant_buffers{};
     std::vector<VideoCommon::ImageViewInOut> delta_views;
     std::vector<VideoCommon::SamplerId> delta_samplers;
+    /// Delta draws: the image descriptor entries (first entry and count per
+    /// stage) and rescaling words pushed for delta_views, which delta draws push again while no
+    /// image changed its scale (TextureCache::ScaleEpoch).
+    std::vector<DescriptorUpdateEntry> kept_image_entries;
+    std::array<std::pair<u32, u32>, NUM_STAGES> kept_image_ranges{};
+    std::array<u32, Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> kept_rescaling{};
+    u64 kept_scale_epoch{};
+    bool kept_images_valid{};
 
     vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;

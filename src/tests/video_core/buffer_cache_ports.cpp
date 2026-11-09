@@ -74,6 +74,9 @@ struct Runtime {
         return true;
     }
     void WaitSubmittedTick(u64) {}
+    void ClearBuffer(Buffer& buffer, u32 offset, size_t size, u32 value) {
+        std::memset(buffer.bytes.data() + offset, static_cast<int>(value), size);
+    }
     bool CanReorderUpload(const Buffer&, std::span<VideoCommon::BufferCopy>) const {
         return false;
     }
@@ -96,6 +99,10 @@ struct Runtime {
             });
             ++downloads;
         }
+    }
+    void CopyBuffer(Buffer& dst, Buffer& src, std::span<const VideoCommon::BufferCopy> copies,
+                    bool) {
+        CopyBuffer(dst, &src, copies, true, true);
     }
     void CopyBuffer(Buffer& dst, Buffer* src, std::span<const VideoCommon::BufferCopy> copies, bool,
                     bool) {
@@ -171,6 +178,37 @@ struct Policy {
 
 using Cache = VideoCommon::BufferCache<Policy>;
 
+/// Streams small uniform buffers as the Vulkan runtime does (StreamUniformReusable).
+struct KeepRuntime : Runtime {
+    struct StreamUniformRef {
+        size_t allocation;
+    };
+    std::span<u8> BindMappedUniformBuffer(size_t, u32, u32 size) {
+        allocations.emplace_back(size);
+        last = bound = StreamUniformRef{allocations.size() - 1};
+        return allocations.back();
+    }
+    StreamUniformRef LastStreamUniformRef() const noexcept {
+        return last;
+    }
+    void RebindStreamUniform(StreamUniformRef ref, u32 size) {
+        REQUIRE(allocations.at(ref.allocation).size() == size);
+        bound = ref;
+    }
+    u64 CurrentTick() const noexcept {
+        return tick;
+    }
+    std::vector<std::vector<u8>> allocations;
+    StreamUniformRef last{}, bound{};
+    u64 tick{1};
+};
+
+struct KeepPolicy : Policy {
+    using Runtime = ::KeepRuntime;
+};
+
+using KeepCache = VideoCommon::BufferCache<KeepPolicy>;
+
 } // namespace
 
 namespace VideoCommon {
@@ -181,7 +219,8 @@ struct BufferCacheTestAccess {
         cache.gpu_memory = &memory;
         return cache.StorageBufferBinding(descriptor, 0, written, native, table);
     }
-    static BufferId Add(Cache& cache, DAddr address, u32 size, bool mapped = false) {
+    template <class C>
+    static BufferId Add(C& cache, DAddr address, u32 size, bool mapped = false) {
         const auto id = cache.slot_buffers.insert(cache.runtime, address, size, mapped);
         cache.Register(id);
         cache.memory_tracker.ForEachUploadRange(address, size, [](auto, auto) {});
@@ -235,6 +274,26 @@ struct BufferCacheTestAccess {
     static u32 CpuMarks(Cache& cache) {
         return cache.memory_tracker.cpu_marks;
     }
+    static void KeepDraw(KeepCache& cache, BufferCacheChannelInfo& channel,
+                         const Nx2FastDraw::Delta* delta, BufferId id, DAddr address,
+                         u32 size) {
+        cache.channel_state = &channel;
+        cache.maxwell3d = &channel.maxwell3d;
+        cache.gpu_memory = &channel.gpu_memory;
+        cache.BeginGraphicsUniforms(delta);
+        channel.uniform_buffers[0][0] = {.device_addr = address, .size = size, .buffer_id = id};
+        cache.BindHostGraphicsUniformBuffer(0, 0, 0, true);
+    }
+    struct KeepCounts {
+        u64 kept, streamed, verified, mismatches;
+    };
+    static KeepCounts Counts(const KeepCache& cache) {
+        const auto& keep = cache.uniform_keep;
+        return {keep.kept, keep.streamed_binds, keep.verified, keep.mismatches};
+    }
+    static void GpuWrite(KeepCache& cache, BufferId id, DAddr address, u32 size) {
+        cache.MarkWrittenBuffer(id, address, size);
+    }
 };
 
 } // namespace VideoCommon
@@ -243,7 +302,8 @@ namespace {
 
 using Access = VideoCommon::BufferCacheTestAccess;
 
-struct Fixture {
+template <class R, class C>
+struct BasicFixture {
     ScopedSystemTestContext context;
     Core::System system;
     Core::DeviceMemory physical;
@@ -251,13 +311,13 @@ struct Fixture {
     Tegra::GPU gpu{system, false, false};
     Null::RasterizerNull rasterizer{gpu};
     std::optional<Tegra::MemoryManager> memory;
-    Runtime runtime;
-    std::unique_ptr<Cache> cache;
+    R runtime;
+    std::unique_ptr<C> cache;
     std::unique_ptr<Kernel::KProcess> process;
     Core::Asid asid{};
     u8* bytes{};
 
-    Fixture() {
+    BasicFixture() {
         system.Initialize();
         process = std::make_unique<Kernel::KProcess>(system.Kernel());
         auto& table = process->GetPageTable().GetImpl();
@@ -274,9 +334,9 @@ struct Fixture {
         device.BindInterface(&rasterizer);
         device.Map(0x10000, 0x10000, 0x40000, asid);
         ResetMemory();
-        cache = std::make_unique<Cache>(device, runtime);
+        cache = std::make_unique<C>(device, runtime);
     }
-    ~Fixture() {
+    ~BasicFixture() {
         cache.reset();
         memory.reset();
         device.Unmap(0x10000, 0x40000);
@@ -297,6 +357,81 @@ struct Fixture {
         return Access::Bind(*cache, *memory, 0x100000, written, native, table);
     }
 };
+
+using Fixture = BasicFixture<Runtime, Cache>;
+
+void SetEnv(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
+struct EnvGate {
+    explicit EnvGate(const char* name_) : name{name_} {
+        if (name != nullptr) {
+            SetEnv(name, "1");
+        }
+    }
+    ~EnvGate() {
+        if (name != nullptr) {
+            SetEnv(name, nullptr);
+        }
+    }
+    const char* name;
+};
+
+/// A buffer cache built with the switch `gate` set (none if null), drawing with one 0x100-byte
+/// uniform buffer at stage 0 slot 0, device 0x10800 (GPU 0x100800).
+struct KeepFixture : EnvGate, BasicFixture<KeepRuntime, KeepCache> {
+    static constexpr DAddr Ubo = 0x10800;
+    static constexpr GPUVAddr UboGpu = 0x100800;
+    static constexpr u32 UboSize = 0x100;
+
+    explicit KeepFixture(const char* gate) : EnvGate{gate} {
+        state.memory_manager = &*memory;
+        state.payload.emplace(system, *memory, state);
+        channel.emplace(state);
+        sizes[0][0] = UboSize;
+        channel->uniform_buffer_sizes = &sizes;
+        id = Access::Add(*cache, 0x10000, 0x10000);
+    }
+    u8* UboBytes() {
+        return bytes + (Ubo - 0x10000);
+    }
+    /// Draws and checks that the bound uniform data is what guest memory holds.
+    void Draw(const VideoCommon::Nx2FastDraw::Delta* delta) {
+        Access::KeepDraw(*cache, *channel, delta, id, Ubo, UboSize);
+        const auto& data = runtime.allocations.at(runtime.bound.allocation);
+        REQUIRE(data.size() == UboSize);
+        REQUIRE(std::memcmp(data.data(), UboBytes(), UboSize) == 0);
+    }
+    Access::KeepCounts Counts() const {
+        return Access::Counts(*cache);
+    }
+
+    Tegra::Control::ChannelState state{0};
+    std::optional<VideoCommon::BufferCacheChannelInfo> channel;
+    VideoCommon::UniformBufferSizes sizes{};
+    VideoCommon::BufferId id;
+};
+
+/// Inline constant data over device [begin, end), through GPU address begin + UboGpu - Ubo.
+VideoCommon::Nx2FastDraw::Delta Written(DAddr begin, DAddr end) {
+    VideoCommon::Nx2FastDraw::Delta delta{};
+    delta.write_begin[0] = begin + (KeepFixture::UboGpu - KeepFixture::Ubo);
+    delta.write_end[0] = end + (KeepFixture::UboGpu - KeepFixture::Ubo);
+    delta.num_writes = 1;
+    delta.device_begin[0] = begin;
+    delta.device_end[0] = end;
+    delta.num_device_writes = 1;
+    return delta;
+}
 
 } // namespace
 
@@ -626,4 +761,88 @@ TEST_CASE("Downloads keep CPU writes collected and not yet applied", "[buffer_po
     REQUIRE(f.bytes[0x20ff7] == 0x34);
     REQUIRE(std::all_of(f.bytes + 0x20ff8, f.bytes + 0x21008, [](u8 b) { return b == 0xee; }));
     REQUIRE(f.bytes[0x21008] == 0x34);
+}
+
+TEST_CASE("Uniform keep binds unwritten uniform buffers of delta draws without reading them",
+          "[buffer_ports]") {
+    KeepFixture f{nullptr};
+    using Delta = VideoCommon::Nx2FastDraw::Delta;
+    const Delta unchanged{};
+    std::memset(f.UboBytes(), 1, KeepFixture::UboSize);
+    f.Draw(nullptr);
+    f.Draw(&unchanged);
+    REQUIRE(f.Counts().kept == 1);
+    REQUIRE(f.runtime.allocations.size() == 1);
+
+    // Inline constant data over the range, then a rebind of the slot.
+    f.UboBytes()[0x10] = 2;
+    const Delta written = Written(KeepFixture::Ubo + 0x10, KeepFixture::Ubo + 0x14);
+    f.Draw(&written);
+    REQUIRE(f.Counts().kept == 1);
+    REQUIRE(f.runtime.allocations.size() == 2);
+    Delta rebound{};
+    rebound.binds[0] = 1;
+    f.Draw(&rebound);
+    REQUIRE(f.Counts().kept == 1);
+    f.Draw(&unchanged);
+    REQUIRE(f.Counts().kept == 2);
+
+    // Data written next to the range, and GPU writes elsewhere, leave it kept.
+    const Delta beside = Written(KeepFixture::Ubo + 0x100, KeepFixture::Ubo + 0x140);
+    f.Draw(&beside);
+    REQUIRE(f.Counts().kept == 3);
+    Access::GpuWrite(*f.cache, f.id, 0x18000, 0x100);
+    f.Draw(&unchanged);
+    REQUIRE(f.Counts().kept == 4);
+
+    // A GPU write over the range: the original path binds it from the buffer from now on.
+    Access::GpuWrite(*f.cache, f.id, KeepFixture::Ubo + 0x80, 4);
+    const size_t allocations = f.runtime.allocations.size();
+    Access::KeepDraw(*f.cache, *f.channel, &unchanged, f.id, KeepFixture::Ubo, KeepFixture::UboSize);
+    Access::KeepDraw(*f.cache, *f.channel, &unchanged, f.id, KeepFixture::Ubo, KeepFixture::UboSize);
+    REQUIRE(f.Counts().kept == 4);
+    REQUIRE(f.runtime.allocations.size() == allocations);
+}
+
+TEST_CASE("Uniform keep ends at CPU writes the caches are told about", "[buffer_ports]") {
+    KeepFixture f{nullptr};
+    const VideoCommon::Nx2FastDraw::Delta unchanged{};
+    f.Draw(nullptr);
+    f.Draw(&unchanged);
+    REQUIRE(f.Counts().kept == 1);
+    f.UboBytes()[0x20] = 7;
+    f.cache->WriteMemory(KeepFixture::Ubo + 0x20, 1);
+    f.Draw(&unchanged);
+    REQUIRE(f.Counts().kept == 1);
+    f.cache->WriteMemory(0x18000, 0x10);
+    f.Draw(&unchanged);
+    REQUIRE(f.Counts().kept == 2);
+}
+
+TEST_CASE("Uniform keep never keeps across command buffers", "[buffer_ports]") {
+    KeepFixture f{nullptr};
+    const VideoCommon::Nx2FastDraw::Delta unchanged{};
+    f.Draw(nullptr);
+    ++f.runtime.tick;
+    f.Draw(&unchanged);
+    REQUIRE(f.Counts().kept == 0);
+    REQUIRE(f.runtime.allocations.size() == 2);
+    f.Draw(nullptr);
+    f.Draw(&unchanged);
+    REQUIRE(f.Counts().kept == 1);
+}
+
+TEST_CASE("Uniform keep verify counts guest writes the delta did not report",
+          "[buffer_ports]") {
+    KeepFixture f{"EDEN_NX2_UBO_KEEP_VERIFY"};
+    const VideoCommon::Nx2FastDraw::Delta unchanged{};
+    f.Draw(nullptr);
+    f.Draw(&unchanged);
+    REQUIRE(f.Counts().verified == 1);
+    REQUIRE(f.Counts().mismatches == 0);
+    f.UboBytes()[3] = 9;
+    f.Draw(&unchanged);
+    REQUIRE(f.Counts().verified == 2);
+    REQUIRE(f.Counts().mismatches == 1);
+    REQUIRE(f.Counts().kept == 0);
 }

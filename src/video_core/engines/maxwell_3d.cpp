@@ -1334,6 +1334,31 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         split.Method(this, method, argument, is_last_call, nullptr);
         fs.sink_pending = !execution_mask[method];
     }
+    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
+        FrontNoteReport(split, fs);
+    }
+}
+
+void Maxwell3D::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& fs) {
+    // What ProcessQueryGet will write on the back: a payload report writes the payload, a counter
+    // what the GPU counted.
+    Regs::ReportSemaphore report;
+    std::memcpy(&report, &fs.regs[MAXWELL3D_REG_INDEX(report_semaphore)], sizeof(report));
+    const auto operation = report.query.operation.Value();
+    if (operation != Regs::ReportSemaphore::Operation::Release &&
+        operation != Regs::ReportSemaphore::Operation::ReportOnly) {
+        return;
+    }
+    const auto device = memory_manager.GpuToCpuAddress(report.Address());
+    if (!device) {
+        return;
+    }
+    const bool payload = report.query.report == Regs::ReportSemaphore::Report::Payload;
+    split.NoteSemaphoreWrite(*device, report.payload, payload);
+    if (report.query.short_query == 0) {
+        // 64 bits (a timestamp follows).
+        split.NoteSemaphoreWrite(*device + 4, 0, payload);
+    }
 }
 
 void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
@@ -1442,6 +1467,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
     fs.sink_pending = false; // The back consumes the sink before a run.
+    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query) && amount != 0) {
+        FrontNoteReport(split, fs);
+    }
 }
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,

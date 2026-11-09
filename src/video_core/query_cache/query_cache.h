@@ -236,6 +236,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                                            QueryPropertiesFlags flags, u32 payload, u32 subreport) {
     const bool has_timestamp = True(flags & QueryPropertiesFlags::HasTimeout);
     const bool is_fence = True(flags & QueryPropertiesFlags::IsAFence);
+    const bool mirrored = True(flags & QueryPropertiesFlags::Nx2Mirror);
     const auto requested_type = counter_type;
     static const GPUVAddr watch = [] {
         const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
@@ -284,7 +285,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
     std::function<void()> operation([this, streamer, query_base = query, query_location,
                                      pointer, pointer_timestamp, cpu_addr, addr,
-                                     asid = gpu_memory->GetID(), counter_type] {
+                                     asid = gpu_memory->GetID(), counter_type, mirrored] {
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
             if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Discard)) {
                 LOG_INFO(HW_GPU,
@@ -311,13 +312,21 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         }
         query_base->value += streamer->GetAmendValue();
         streamer->SetAccumulationValue(query_base->value);
-        if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
+        auto& shadow = Tegra::Nx2MirrorShadow::Get();
+        if (mirrored && shadow.Diverts(cpu_addr)) {
+            u32 guest;
+            std::memcpy(&guest, pointer, sizeof(guest));
+            shadow.Set(cpu_addr, static_cast<u32>(query_base->value), guest);
+        } else if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
             u64 timestamp = impl->gpu.GetTicks();
             std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
             std::memcpy(pointer, &query_base->value, sizeof(query_base->value));
         } else {
             u32 value = static_cast<u32>(query_base->value);
             std::memcpy(pointer, &value, sizeof(value));
+        }
+        if (!mirrored && counter_type == QueryType::Payload) {
+            shadow.NoteDirectRelease(cpu_addr, addr);
         }
         Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, static_cast<u32>(query_base->value));
         if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
@@ -337,13 +346,21 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         VideoCore::g_signaling_query_report_fence = false;
     } else {
         if (!Settings::IsGPULevelHigh() && counter_type == QueryType::Payload) {
-            if (has_timestamp) {
+            auto& shadow = Tegra::Nx2MirrorShadow::Get();
+            if (mirrored && shadow.Diverts(cpu_addr)) {
+                u32 guest;
+                std::memcpy(&guest, pointer, sizeof(guest));
+                shadow.Set(cpu_addr, payload, guest);
+            } else if (has_timestamp) {
                 u64 timestamp = impl->gpu.GetTicks();
                 u64 value = static_cast<u64>(payload);
                 std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
                 std::memcpy(pointer, &value, sizeof(value));
             } else {
                 std::memcpy(pointer, &payload, sizeof(payload));
+            }
+            if (!mirrored) {
+                shadow.NoteDirectRelease(cpu_addr, addr);
             }
             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, payload);
             if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
