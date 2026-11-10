@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <unordered_map>
 #include "video_core/page_filter.h"
 #include "common/container/unordered_map.h"
 #include <utility>
@@ -126,7 +127,17 @@ protected:
     /// The v2 cache that records the native programs lowered here, while one is open
     ShaderCacheV2::Cache* shader_cache_v2{};
 
+    /// Set while a precompiled file covers the game's pipelines: a program's v2 record is held
+    /// until a pipeline that uses it gets a v2 record of its own (RecordPendingProgram).
+    bool defer_program_records{};
+
+    /// Writes the held v2 record of the program with this hash, if there is one.
+    void RecordPendingProgram(u64 unique_hash);
+
 private:
+    std::mutex pending_programs_mutex;
+    std::unordered_map<u64, std::shared_ptr<const ShaderCacheV2::ProgramRecord>> pending_programs;
+
     friend struct ShaderCacheTestAccess;
 
     /// @brief Tries to obtain a cached shader starting in a given address

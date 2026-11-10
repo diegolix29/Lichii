@@ -308,6 +308,11 @@ private:
     std::unique_ptr<GraphicsPipeline> CreatePrecompiledGraphicsPipeline(
         GraphicsEnvironments& environments);
 
+    /// The used list's pipelines that were drawn from the precompiled file, built at boot from
+    /// the kept SPIR-V like the v2 records of the list (no game state to check them against yet).
+    void BuildUsedPrecompiled(std::stop_token stop_loading,
+                              const VideoCore::DiskResourceLoadCallback& callback);
+
     /// EDEN_NX2_PRECOMPILED_AUDIT=1: a precompiled pipeline just created is also translated from
     /// the game's state, on the GPU thread, and its SPIR-V and infos compared with the kept ones
     /// (counted in the 10 s report, the first differences logged). Slow: a check of the
@@ -336,6 +341,17 @@ private:
     std::ifstream precompiled_file;       ///< GPU thread only
     std::ifstream precompiled_infos_file; ///< GPU thread only
     std::unordered_set<u64> precompiled_rejected; ///< Keys whose precompiled build failed
+
+    /// A precompiled record's kept shader infos, read from `file`; false when one is unreadable
+    /// or needs layer emulation.
+    bool ReadKeptInfos(std::ifstream& file, const PrecompiledRecord& record,
+                       std::array<Shader::Info, 5>& infos,
+                       std::array<const Shader::Info*, 5>& info_ptrs) const;
+
+    /// A pipeline for `key` built by a worker from the record's kept SPIR-V; null without it.
+    std::unique_ptr<GraphicsPipeline> MakeKeptGraphicsPipeline(
+        const GraphicsPipelineCacheKey& key, const PrecompiledRecord& record,
+        const std::array<const Shader::Info*, 5>& info_ptrs);
 
     /// Native pipelines: the key without state that cannot change the pipeline (see
     /// FixedPipelineState::CanonicalizeNative).

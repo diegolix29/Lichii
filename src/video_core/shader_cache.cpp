@@ -504,6 +504,22 @@ u32 GenericReadMask(const Shader::ProgramHeader& sph) noexcept {
     return mask;
 }
 
+void ShaderCache::RecordPendingProgram(u64 unique_hash) {
+    std::shared_ptr<const ShaderCacheV2::ProgramRecord> record;
+    {
+        std::scoped_lock lock{pending_programs_mutex};
+        const auto it = pending_programs.find(unique_hash);
+        if (it == pending_programs.end()) {
+            return;
+        }
+        record = std::move(it->second);
+        pending_programs.erase(it);
+    }
+    if (shader_cache_v2) {
+        shader_cache_v2->RecordProgram(*record);
+    }
+}
+
 const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr) {
     auto info = std::make_unique<ShaderInfo>();
     if (const std::optional<u64> cached_hash{env.Analyze()}) {
@@ -521,8 +537,13 @@ const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu
     if (env.IsNativeProgram() && env.ShaderStage() == Shader::Stage::VertexB) {
         info->generic_read_mask = GenericReadMask(env.SPH());
     }
-    if (const auto record = env.TakeProgramRecord(); record && shader_cache_v2) {
-        shader_cache_v2->RecordProgram(*record);
+    if (auto record = env.TakeProgramRecord(); record && shader_cache_v2) {
+        if (defer_program_records) {
+            std::scoped_lock lock{pending_programs_mutex};
+            pending_programs.insert_or_assign(info->unique_hash, std::move(record));
+        } else {
+            shader_cache_v2->RecordProgram(*record);
+        }
     }
     const size_t size_bytes{env.SourceSizeBytes() ? env.SourceSizeBytes() : info->size_bytes};
     const ShaderInfo* const result{info.get()};
