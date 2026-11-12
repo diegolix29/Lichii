@@ -7,9 +7,10 @@ on:
         description: Publish the binaries as a GitHub release
         type: boolean
         default: true
+  # Every branch builds and keeps its binaries as run artifacts; only nightly publishes a release.
   push:
     branches:
-      - nx2-experimental
+      - "**"
     # A binary only changes when build inputs change; docs-only pushes skip the build.
     paths:
       - "src/**"
@@ -35,11 +36,11 @@ permissions:
 env:
   PGO_LLVM_VERSION: "23"
 
-# A running build is never cancelled: it finishes and publishes. A push meanwhile queues one build;
-# a later push replaces it, so the newest commit builds as soon as the running one is done.
+# A running nightly build is never cancelled: it finishes and publishes. A push meanwhile queues one
+# build; a later push replaces it. On other branches a newer push cancels the running build.
 concurrency:
   group: release-binaries-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref != 'refs/heads/nightly' }}
 
 jobs:
   prepare-release:
@@ -49,7 +50,7 @@ jobs:
       contents: write
     steps:
       - name: Prepare release tag
-        if: github.event_name == 'push' || inputs.publish_release
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/nightly') || inputs.publish_release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -570,12 +571,11 @@ jobs:
           retention-days: 7
 
   # Publishes every binary as a GitHub pre-release once every platform built: on pushes to
-  # nx2-experimental, and on manual runs unless "Publish the binaries as a GitHub release" is
-  # unticked.
+  # nightly, and on manual runs unless "Publish the binaries as a GitHub release" is unticked.
   release:
     name: Publish release
     needs: build
-    if: github.event_name == 'push' || inputs.publish_release
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/nightly') || inputs.publish_release
     runs-on: ubuntu-24.04
     permissions:
       contents: write
