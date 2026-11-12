@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <filesystem>
@@ -12,6 +13,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -38,6 +40,8 @@
 #include <QNetworkRequest>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QScrollArea>
+#include <QScrollBar>
 #include <QStandardPaths>
 #include <QString>
 #include <QTimer>
@@ -385,21 +389,38 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
         [](Settings::AspectRatio, Settings::ResolutionSetup) {}, tab_group, *builder, this);
     input_tab = std::make_unique<ConfigureInputPerGame>(system_, game_config.get(), this);
     system_tab = std::make_unique<ConfigureSystem>(system_, tab_group, *builder, this);
-    network_tab = std::make_unique<ConfigureNetwork>(system_, this);
+    network_tab = std::make_unique<ConfigureNetwork>(system_, this, true);
     applets_tab = std::make_unique<ConfigureApplets>(system_, tab_group, *builder, this);
 
     ui->setupUi(this);
 
-    ui->tabWidget->addTab(addons_tab.get(), tr("Add-Ons"));
-    ui->tabWidget->addTab(system_tab.get(), tr("System"));
-    ui->tabWidget->addTab(cpu_tab.get(), tr("CPU"));
-    ui->tabWidget->addTab(graphics_tab.get(), tr("Graphics"));
-    ui->tabWidget->addTab(graphics_advanced_tab.get(), tr("Adv. Graphics"));
-    ui->tabWidget->addTab(graphics_extensions_tab.get(), tr("Ext. Graphics"));
-    ui->tabWidget->addTab(audio_tab.get(), tr("Audio"));
-    ui->tabWidget->addTab(input_tab.get(), tr("Input Profiles"));
-    ui->tabWidget->addTab(network_tab.get(), tr("Network"));
-    ui->tabWidget->addTab(applets_tab.get(), tr("Applets"));
+    auto* const info_area = new QScrollArea(this);
+    ui->horizontalLayout->replaceWidget(ui->gameInfo, info_area);
+    info_area->setFrameShape(QFrame::NoFrame);
+    info_area->setWidgetResizable(true);
+    info_area->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    info_area->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Preferred);
+    info_area->setWidget(ui->gameInfo);
+
+    const std::array<std::tuple<QWidget*, const char*, QString>, 10> tabs{{
+        {addons_tab.get(), "puzzle", tr("Add-Ons")},
+        {system_tab.get(), "system", tr("System")},
+        {cpu_tab.get(), "cpu", tr("CPU")},
+        {graphics_tab.get(), "monitor", tr("Graphics")},
+        {graphics_advanced_tab.get(), "layers", tr("Adv. Graphics")},
+        {graphics_extensions_tab.get(), "wand", tr("Ext. Graphics")},
+        {audio_tab.get(), "audio", tr("Audio")},
+        {input_tab.get(), "gamepad", tr("Input Profiles")},
+        {network_tab.get(), "globe", tr("Network")},
+        {applets_tab.get(), "apps", tr("Applets")},
+    }};
+    for (const auto& [tab, icon, name] : tabs) {
+        if (tab != addons_tab.get() && tab != input_tab.get()) {
+            ConfigurationShared::UseToggles(tab);
+        }
+        ui->tabWidget->addTab(ConfigurationShared::ScrollTab(tab),
+                              ConfigurationShared::PageIcon(QString::fromLatin1(icon)), name);
+    }
 
     setFocusPolicy(Qt::ClickFocus);
     setWindowTitle(tr("Properties"));
@@ -453,6 +474,9 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
     }
 
     LoadConfiguration();
+    info_area->setMinimumWidth(ui->gameInfo->sizeHint().width() +
+                               info_area->verticalScrollBar()->sizeHint().width());
+    ConfigurationShared::FitToScreen(this, QSize(1040, 760));
 }
 
 ConfigurePerGame::~ConfigurePerGame() {

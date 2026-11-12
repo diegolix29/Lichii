@@ -7,11 +7,16 @@
 #pragma once
 
 #include <QFont>
+#include <QIcon>
 #include <QString>
 #include "common/uuid.h"
 
 /// Returns a QFont object appropriate to use as a monospace font for debugging widgets, etc.
 [[nodiscard]] QFont GetMonospaceFont();
+
+/// A menu icon from the Lichii icon set, white on the highlighted row. Other themes keep menus
+/// without icons, so this returns a null icon unless Lichii Dark is active.
+[[nodiscard]] QIcon MenuIcon(const char* name);
 
 /**
  * Prompt the user for a profile ID. If there is only one valid profile, returns that profile.

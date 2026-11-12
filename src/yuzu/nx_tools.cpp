@@ -13,6 +13,7 @@
 #include <QApplication>
 #include <QBuffer>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -25,11 +26,15 @@
 #include <QFuture>
 #include <QHBoxLayout>
 #include <QImage>
+#include <QImageReader>
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMessageBox>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QPainterPath>
 #include <QPixmap>
 #include <QProgressDialog>
 #include <QPushButton>
@@ -37,11 +42,11 @@
 #include <QTemporaryFile>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QSlider>
 #include <QtConcurrentRun>
 
 #include <nxformat.h>
 
-#include "common/error.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -57,11 +62,8 @@
 #include "core/loader/nx.h"
 #include "frontend_common/nx_archive.h"
 #include "qt_common/qt_common.h"
+#include "yuzu/nup_dialogs.h"
 #include "yuzu/nx_tools.h"
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
 
 namespace {
 
@@ -270,6 +272,125 @@ struct Snapshot {
     QString name;
 };
 
+// Shows a picture with a square selection: click or drag to move it.
+class CropArea final : public QWidget {
+public:
+    CropArea(const QImage& image_, QWidget* parent) : QWidget(parent), image{image_} {
+        const QSize fit = image.size().scaled(360, 360, Qt::KeepAspectRatio);
+        setFixedSize(fit);
+        scale = static_cast<double>(fit.width()) / image.width();
+        side = std::min(image.width(), image.height());
+        center = QPointF(image.width() / 2.0, image.height() / 2.0);
+        setCursor(Qt::SizeAllCursor);
+    }
+
+    // 100: the whole short side; 400: a quarter of it.
+    void SetZoom(int percent) {
+        side = std::min(image.width(), image.height()) * 100.0 / percent;
+        Clamp();
+    }
+
+    QRect Selection() const {
+        const int s = static_cast<int>(side);
+        const int x = std::clamp(static_cast<int>(center.x() - side / 2.0), 0, image.width() - s);
+        const int y = std::clamp(static_cast<int>(center.y() - side / 2.0), 0, image.height() - s);
+        return QRect(x, y, s, s);
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::SmoothPixmapTransform);
+        painter.drawImage(rect(), image);
+        const QRect s = Selection();
+        const QRectF shown(s.x() * scale, s.y() * scale, s.width() * scale, s.height() * scale);
+        QPainterPath outside;
+        outside.addRect(QRectF(rect()));
+        outside.addRect(shown);
+        painter.fillPath(outside, QColor(0, 0, 0, 140));
+        painter.setPen(QPen(Qt::white, 2));
+        painter.drawRect(shown);
+    }
+    void mousePressEvent(QMouseEvent* event) override {
+        last = event->position();
+        pressed = event->position();
+    }
+    void mouseMoveEvent(QMouseEvent* event) override {
+        if ((event->buttons() & Qt::LeftButton) == 0) {
+            return;
+        }
+        center += (event->position() - last) / scale;
+        last = event->position();
+        Clamp();
+    }
+    void mouseReleaseEvent(QMouseEvent* event) override {
+        // A simple click centers the square on the point.
+        if (event->position() == pressed) {
+            center = event->position() / scale;
+            Clamp();
+        }
+    }
+
+private:
+    void Clamp() {
+        center.setX(std::clamp(center.x(), side / 2.0, image.width() - side / 2.0));
+        center.setY(std::clamp(center.y(), side / 2.0, image.height() - side / 2.0));
+        update();
+    }
+
+    QImage image;
+    double scale = 1.0;
+    double side = 0.0;
+    QPointF center;
+    QPointF last;
+    QPointF pressed;
+};
+
+// The square part of the picture to keep.
+std::optional<QRect> ChooseCrop(const QImage& image, QWidget* parent) {
+    QDialog dialog(parent);
+    dialog.setWindowTitle(QObject::tr("Crop Icon"));
+    auto* layout = new QVBoxLayout(&dialog);
+    layout->addWidget(new QLabel(
+        QObject::tr("Click or drag to move the square. Zoom to keep a smaller part."), &dialog));
+    auto* area = new CropArea(image, &dialog);
+    layout->addWidget(area, 0, Qt::AlignCenter);
+    auto* zoom_row = new QHBoxLayout;
+    zoom_row->addWidget(new QLabel(QObject::tr("Zoom:"), &dialog));
+    auto* zoom = new QSlider(Qt::Horizontal, &dialog);
+    zoom->setRange(100, 400);
+    QObject::connect(zoom, &QSlider::valueChanged, area,
+                     [area](int value) { area->SetZoom(value); });
+    zoom_row->addWidget(zoom, 1);
+    layout->addLayout(zoom_row);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+    if (dialog.exec() != QDialog::Accepted) {
+        return std::nullopt;
+    }
+    return area->Selection();
+}
+
+// The selected square as a size x size JPEG, like a console icon.
+QByteArray EncodeIcon(const QImage& source, const QRect& crop, int size) {
+    const QImage scaled =
+        source.copy(crop).scaled(size, size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    QImage flat(size, size, QImage::Format_RGB32);
+    flat.fill(Qt::black);
+    QPainter painter(&flat);
+    painter.drawImage(0, 0, scaled);
+    painter.end();
+    QByteArray bytes;
+    QBuffer buffer(&bytes);
+    buffer.open(QIODevice::WriteOnly);
+    if (!flat.save(&buffer, "JPEG", 92)) {
+        return {};
+    }
+    return bytes;
+}
+
 } // namespace
 
 struct NxTools::Job {
@@ -341,13 +462,26 @@ struct NxTools::Job {
                        const std::filesystem::path& path) {
         const auto file = filesystem->OpenFile(ToUtf8(path), FileSys::OpenMode::Read);
         std::string error = "file not found";
-        auto decrypted = file != nullptr ? FileSys::OpenDecryptedPackage(file, error) : nullptr;
+        // An XCI goes in as a whole decrypted gamecard image, so nxformat keeps the firmware of
+        // its update partition. Other packages go in as a decrypted NSP.
+        std::string gamecard_error;
+        auto decrypted =
+            file != nullptr ? FileSys::OpenDecryptedGamecard(file, gamecard_error) : nullptr;
+        const bool gamecard = decrypted != nullptr;
+        if (!gamecard && file != nullptr) {
+            if (gamecard_error != "not a gamecard image") {
+                LOG_WARNING(Frontend,
+                            "{}: converted without its gamecard update partition (firmware): {}",
+                            ToUtf8(path.filename()), gamecard_error);
+            }
+            decrypted = FileSys::OpenDecryptedPackage(file, error);
+        }
         if (decrypted == nullptr) {
             return QString::fromStdString(error);
         }
         auto& held =
             files.emplace_back(std::make_unique<FileSys::VirtualFile>(std::move(decrypted)));
-        const auto name = ToUtf8(path.stem()) + ".nsp";
+        const auto name = ToUtf8(path.stem()) + (gamecard ? ".xci" : ".nsp");
         auto* source =
             nxformat_source_new(name.c_str(), (*held)->GetSize(), &ReadSource, held.get());
         if (source == nullptr) {
@@ -402,35 +536,6 @@ NxTools::~NxTools() {
     }
 }
 
-bool NxTools::LoadNxformat() {
-#ifdef _WIN32
-    // lichii.exe delay-loads nxformat.dll, so Lichii starts even when Windows refuses to load it
-    // (Smart App Control and code integrity policies block unsigned DLLs). The tools load it here
-    // before their first nxformat call, which would otherwise end the process.
-    static const DWORD error =
-        LoadLibraryExW(L"nxformat.dll", nullptr, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) ? 0
-                                                                                    : GetLastError();
-    if (error == 0) {
-        return true;
-    }
-    const auto reason = Common::NativeErrorToString(static_cast<int>(error));
-    LOG_ERROR(Frontend, "Could not load nxformat.dll: error {}: {}", error, reason);
-    // 4550-4599 are the ERROR_SYSTEM_INTEGRITY_* codes of a code integrity block.
-    const bool blocked = error == ERROR_INVALID_IMAGE_HASH || (error >= 4550 && error <= 4599);
-    QMessageBox::warning(
-        parent_widget, tr("NX Archive"),
-        blocked ? tr("NX converter unavailable: Windows blocked nxformat.dll (Smart App Control or "
-                     "a code integrity policy). Error %1.")
-                      .arg(error)
-                : tr("NX converter unavailable: could not load nxformat.dll. Error %1: %2")
-                      .arg(error)
-                      .arg(QString::fromStdString(reason)));
-    return false;
-#else
-    return true;
-#endif
-}
-
 bool NxTools::CanConvert(const std::string& game_path) {
     return KindOf(game_path) != Kind::None;
 }
@@ -440,7 +545,7 @@ bool NxTools::IsNxArchive(const std::string& game_path) {
 }
 
 void NxTools::ConvertToNx(const std::string& game_path) {
-    if (running || !LoadNxformat()) {
+    if (running) {
         return;
     }
     const QString title = tr("Convert to NX");
@@ -550,7 +655,7 @@ void NxTools::ConvertToNx(const std::string& game_path) {
 }
 
 void NxTools::AddToNx(const std::string& archive_path) {
-    if (running || !LoadNxformat()) {
+    if (running) {
         return;
     }
     const QString title = tr("Add to NX");
@@ -629,7 +734,7 @@ void NxTools::AddToNx(const std::string& archive_path) {
 }
 
 void NxTools::RemoveFromNx(const std::string& archive_path) {
-    if (running || !LoadNxformat()) {
+    if (running) {
         return;
     }
     const QString title = tr("Remove from NX");
@@ -696,8 +801,9 @@ void NxTools::RemoveFromNx(const std::string& archive_path) {
     Start(std::move(job));
 }
 
-void NxTools::EditNxMetadata(const std::string& archive_path) {
-    if (running || !LoadNxformat()) {
+void NxTools::EditNxMetadata(const std::string& archive_path,
+                             const std::function<bool()>& prepare_write) {
+    if (running) {
         return;
     }
     const QString title = tr("Edit NX Metadata");
@@ -720,14 +826,16 @@ void NxTools::EditNxMetadata(const std::string& archive_path) {
 
     // What the game list shows now.
     std::string current_title;
+    std::string current_publisher;
     std::vector<u8> current_icon;
-    FileSys::NACP control;
+    std::vector<u8> original_icon;
     if (const auto file = vfs->OpenFile(archive_path, FileSys::OpenMode::Read);
         file != nullptr && QtCommon::system != nullptr) {
         Loader::AppLoader_NX loader(*QtCommon::system, file);
         loader.ReadTitle(current_title);
         loader.ReadIcon(current_icon);
-        loader.ReadControlData(control);
+        loader.ReadPublisher(current_publisher);
+        loader.ReadOriginalIcon(application_id.toULongLong(nullptr, 16), original_icon);
     }
 
     QDialog dialog(parent_widget);
@@ -740,26 +848,92 @@ void NxTools::EditNxMetadata(const std::string& archive_path) {
             ? QFileInfo(QString::fromStdString(archive_path)).completeBaseName()
             : QString::fromStdString(current_title);
     auto* name_edit = new QLineEdit(shown_title, &dialog);
-    auto* publisher_edit =
-        new QLineEdit(QString::fromStdString(control.GetDeveloperName()), &dialog);
+    const auto shown_publisher = QString::fromStdString(current_publisher);
+    auto* publisher_edit = new QLineEdit(shown_publisher, &dialog);
     form->addRow(tr("Title:"), name_edit);
     form->addRow(tr("Publisher:"), publisher_edit);
 
-    auto* icon_label = new QLabel(&dialog);
-    icon_label->setFixedSize(128, 128);
-    icon_label->setAlignment(Qt::AlignCenter);
-    icon_label->setFrameShape(QFrame::StyledPanel);
+    // Drop an image on the icon or click it, as when converting to NUP.
+    auto* icon_preview = new IconDropZone(128, &dialog);
     QPixmap shown;
     if (shown.loadFromData(current_icon.data(), static_cast<uint>(current_icon.size()))) {
-        icon_label->setPixmap(
-            shown.scaled(128, 128, Qt::KeepAspectRatio, Qt::SmoothTransformation));
-    } else {
-        icon_label->setText(tr("No icon"));
+        icon_preview->SetIcon(shown);
     }
     auto* choose = new QPushButton(tr("Choose Image..."), &dialog);
+    auto* size_box = new QComboBox(&dialog);
+    size_box->addItem(tr("256 x 256 (default)"), 256);
+    size_box->addItem(tr("512 x 512"), 512);
+    size_box->addItem(tr("1024 x 1024"), 1024);
+    size_box->setToolTip(tr("Size of the icon stored in the archive"));
+    size_box->setEnabled(false);
+    auto* icon_buttons = new QVBoxLayout;
+    icon_buttons->addWidget(choose);
+    icon_buttons->addWidget(size_box);
     auto* icon_row = new QHBoxLayout;
-    icon_row->addWidget(icon_label);
-    icon_row->addWidget(choose, 0, Qt::AlignBottom);
+    icon_row->addWidget(icon_preview, 0, Qt::AlignTop);
+    icon_row->addLayout(icon_buttons);
+    QByteArray new_icon;
+    // The chosen picture and the square kept from it, encoded at the chosen size.
+    QImage source;
+    QRect crop;
+    const auto encode = [&] {
+        if (source.isNull()) {
+            return;
+        }
+        new_icon = EncodeIcon(source, crop, size_box->currentData().toInt());
+        if (new_icon.isEmpty()) {
+            QMessageBox::warning(&dialog, title, tr("This image cannot be converted."));
+            return;
+        }
+        icon_preview->SetIcon(QPixmap::fromImage(source.copy(crop)));
+    };
+    const auto use_image = [&](const QString& path) {
+        QImageReader reader(path);
+        reader.setAutoTransform(true);
+        const QImage image = reader.read();
+        if (image.isNull()) {
+            QMessageBox::warning(&dialog, title, tr("This image cannot be read."));
+            return;
+        }
+        const auto selection = ChooseCrop(image, &dialog);
+        if (!selection) {
+            return;
+        }
+        source = image;
+        crop = *selection;
+        size_box->setEnabled(true);
+        encode();
+    };
+    const auto browse = [&] {
+        const QString path = QFileDialog::getOpenFileName(
+            &dialog, tr("Choose Image"), {}, tr("Images (*.png *.jpg *.jpeg *.bmp *.webp *.gif)"));
+        if (!path.isEmpty()) {
+            use_image(path);
+        }
+    };
+    connect(choose, &QPushButton::clicked, &dialog, browse);
+    connect(icon_preview, &IconDropZone::Clicked, &dialog, browse);
+    connect(icon_preview, &IconDropZone::FileDropped, &dialog, use_image);
+    connect(size_box, &QComboBox::currentIndexChanged, &dialog, encode);
+    QPixmap original;
+    if (!original_icon.empty() &&
+        (original.loadFromData(original_icon.data(), static_cast<uint>(original_icon.size()),
+                               "JPEG") ||
+         original.loadFromData(original_icon.data(), static_cast<uint>(original_icon.size()),
+                               "PNG"))) {
+        auto* restore = new QPushButton(tr("Restore Original Image"), &dialog);
+        icon_buttons->addWidget(restore);
+        connect(restore, &QPushButton::clicked, &dialog, [&] {
+            source = {};
+            size_box->setEnabled(false);
+            new_icon = original_icon == current_icon
+                           ? QByteArray{}
+                           : QByteArray(reinterpret_cast<const char*>(original_icon.data()),
+                                        static_cast<qsizetype>(original_icon.size()));
+            icon_preview->SetIcon(original);
+        });
+    }
+    icon_buttons->addStretch();
     icon_row->addStretch();
     form->addRow(tr("Icon:"), icon_row);
     layout->addLayout(form);
@@ -767,35 +941,6 @@ void NxTools::EditNxMetadata(const std::string& archive_path) {
         tr("The new title and icon are shown in every language. The game itself is not "
            "changed."),
         &dialog));
-
-    // The chosen image as a 256x256 JPEG, like a console icon.
-    QByteArray new_icon;
-    connect(choose, &QPushButton::clicked, &dialog, [&] {
-        const QString path = QFileDialog::getOpenFileName(
-            &dialog, tr("Choose Image"), {},
-            tr("Images (*.png *.jpg *.jpeg *.bmp *.webp *.gif)"));
-        if (path.isEmpty()) {
-            return;
-        }
-        QImage image(path);
-        if (image.isNull()) {
-            QMessageBox::warning(&dialog, title, tr("This image cannot be read."));
-            return;
-        }
-        image = image.convertToFormat(QImage::Format_RGB888)
-                    .scaled(256, 256, Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
-        image = image.copy((image.width() - 256) / 2, (image.height() - 256) / 2, 256, 256);
-        QByteArray bytes;
-        QBuffer buffer(&bytes);
-        buffer.open(QIODevice::WriteOnly);
-        if (!image.save(&buffer, "JPEG", 92)) {
-            QMessageBox::warning(&dialog, title, tr("This image cannot be converted."));
-            return;
-        }
-        new_icon = bytes;
-        icon_label->setPixmap(QPixmap::fromImage(image).scaled(
-            128, 128, Qt::KeepAspectRatio, Qt::SmoothTransformation));
-    });
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, &dialog);
     connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
@@ -814,12 +959,12 @@ void NxTools::EditNxMetadata(const std::string& archive_path) {
         job->args.push_back("title=" + name.toStdString());
     }
     const auto publisher = publisher_edit->text().trimmed();
-    if (!publisher.isEmpty() && publisher.toStdString() != control.GetDeveloperName()) {
+    if (!publisher.isEmpty() && publisher != shown_publisher.trimmed()) {
         job->args.push_back("publisher=" + publisher.toStdString());
     }
     if (!new_icon.isEmpty()) {
         job->icon_file = std::make_unique<QTemporaryFile>(
-            QDir::tempPath() + QStringLiteral("/lichii-icon-XXXXXX.jpg"));
+            QDir::tempPath() + QStringLiteral("/lichii-icon-XXXXXX"));
         if (!job->icon_file->open() || job->icon_file->write(new_icon) != new_icon.size() ||
             !job->icon_file->flush()) {
             QMessageBox::warning(parent_widget, title, tr("The icon cannot be saved."));
@@ -828,7 +973,7 @@ void NxTools::EditNxMetadata(const std::string& archive_path) {
         job->icon_file->close();
         job->args.push_back("icon=" + ToUtf8(job->icon_file->fileName()));
     }
-    if (job->args.size() == 3) {
+    if (job->args.size() == 3 || running || !prepare_write()) {
         return;
     }
     job->done_message = tr("The NX archive metadata was updated.");
@@ -1020,6 +1165,10 @@ void NxTools::Finished(std::shared_ptr<Job> job, int code, QString error) {
     }
     running.reset();
     emit RunningChanged(false);
+    const bool metadata_write = job->args.front() == "set-metadata";
+    if (metadata_write) {
+        emit MetadataWriteFinished();
+    }
 
     // add keeps the content it committed before a failure or a cancel, also across a retry:
     // report it and refresh.
@@ -1043,7 +1192,9 @@ void NxTools::Finished(std::shared_ptr<Job> job, int code, QString error) {
                     tr("Already in the archive: %1").arg(job->skipped.join(QStringLiteral(", ")));
         }
         QMessageBox::information(parent_widget, job->title, text);
-        emit ArchivesChanged();
+        if (!metadata_write) {
+            emit ArchivesChanged();
+        }
         break;
     }
     case NXFORMAT_CANCELLED:

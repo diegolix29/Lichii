@@ -250,15 +250,15 @@ jobs:
           cmake --build build --parallel
           ccache --show-stats -v
 
-      # Windows may refuse to load the unsigned nxformat.dll (Smart App Control, code integrity
-      # policies), so lichii.exe must not import it at startup: only a delay import is allowed.
-      - name: Check nxformat.dll is delay-loaded
+      # nxformat is linked statically: lichii.exe must not need an nxformat.dll, which Windows
+      # may refuse to load (Smart App Control, code integrity policies) or that may be missing.
+      - name: Check lichii.exe does not import nxformat.dll
         run: |
           imports=$("$LLVM_ROOT/bin/llvm-readobj" --coff-imports build/bin/lichii.exe |
             awk '/^(Import|DelayImport) {/ { kind = $1 } /^  Name:/ { print kind, $2 }')
           echo "$imports"
-          if grep -qix 'Import nxformat.dll' <<< "$imports"; then
-            echo "::error::lichii.exe imports nxformat.dll at startup; it must be delay-loaded"
+          if grep -qi ' nxformat.dll$' <<< "$imports"; then
+            echo "::error::lichii.exe imports nxformat.dll; nxformat must be linked statically"
             exit 1
           fi
 

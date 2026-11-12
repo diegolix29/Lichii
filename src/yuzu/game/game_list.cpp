@@ -4,6 +4,9 @@
 // SPDX-FileCopyrightText: 2015 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <utility>
+
 #include <QAbstractItemView>
 #include <QApplication>
 #include <QDir>
@@ -23,6 +26,7 @@
 #include <qlayoutitem.h>
 
 #include "common/common_types.h"
+#include "common/fs/fs_util.h"
 #include "core/core.h"
 #include "core/file_sys/nup_writer.h"
 #ifdef LICHII_NX_TOOLS
@@ -43,6 +47,7 @@
 #include "yuzu/main_window.h"
 #include "yuzu/shader_warm_dialog.h"
 #include "yuzu/util/controller_navigation.h"
+#include "yuzu/util/util.h"
 
 GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvider* provider_,
                    PlayTime::PlayTimeManager& play_time_manager_, Core::System& system_,
@@ -441,6 +446,7 @@ void GameList::PopupContextMenu(const QPoint& menu_location) {
 
         QMenu blank_menu;
         QAction* addGameDirAction = blank_menu.addAction(tr("&Add New Game Directory"));
+        addGameDirAction->setIcon(MenuIcon("plus"));
 
         connect(addGameDirAction, &QAction::triggered, this, &GameList::AddDirectory);
         blank_menu.exec(m_currentView->viewport()->mapToGlobal(menu_location));
@@ -512,8 +518,11 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     QMenu* play_time_menu = context_menu.addMenu(tr("Manage Play Time"));
     QAction* set_play_time = play_time_menu->addAction(tr("Edit Play Time Data"));
     QAction* remove_play_time_data = play_time_menu->addAction(tr("Remove Play Time Data"));
+    const bool is_loose_dump =
+        FileSys::Nup::DumpRootFromMain(std::filesystem::path{Common::FS::ToU8String(path)})
+            .has_value();
     const bool is_nup_archive =
-        !FileSys::Nup::DumpRootFromMain(path) &&
+        !is_loose_dump &&
         QString::fromStdString(path).endsWith(QStringLiteral(".nup"), Qt::CaseInsensitive);
     QAction* extract_nup = nullptr;
     if (is_nup_archive) {
@@ -526,7 +535,7 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     QAction* verify_integrity = context_menu.addAction(tr("Verify Integrity"));
     QAction* copy_tid = context_menu.addAction(tr("Copy Title ID to Clipboard"));
     QAction* convert_nup = nullptr;
-    if (FileSys::Nup::DumpRootFromMain(path)) {
+    if (is_loose_dump) {
         convert_nup = context_menu.addAction(tr("Convert to NUP..."));
         convert_nup->setEnabled(!nup_conversion_running);
     }
@@ -546,10 +555,12 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
         nx_menu->addSeparator();
         edit_nx_metadata = nx_menu->addAction(tr("Edit Title and Icon..."));
         nx_menu->setEnabled(!nx_tool_running);
+        nx_menu->menuAction()->setIcon(MenuIcon("archive"));
     }
 #endif
 #if !defined(__APPLE__)
     QMenu* shortcut_menu = context_menu.addMenu(tr("Create Shortcut"));
+    shortcut_menu->menuAction()->setIcon(MenuIcon("share"));
     QAction* create_desktop_shortcut = shortcut_menu->addAction(tr("Add to Desktop"));
     QAction* create_applications_menu_shortcut =
         shortcut_menu->addAction(tr("Add to Applications Menu"));
@@ -565,6 +576,34 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
         auto* report = context_menu.addAction(tr("Submit compatibility report…"));
         connect(report, &QAction::triggered, this,
                 [this, program_id] { emit ReportCompatibilityRequested(program_id); });
+    }
+
+    const std::array<std::pair<QAction*, const char*>, 20> icons{{
+        {favorite, "star"},
+        {start_game, "play"},
+        {start_game_global, "play"},
+        {open_save_location, "folder"},
+        {open_mod_location, "puzzle"},
+        {open_transferable_shader_cache, "layers"},
+        {prepare_shaders, "cpu"},
+        {delete_shader_warm, "trash"},
+        {ryujinx, "link"},
+        {remove_menu->menuAction(), "trash"},
+        {play_time_menu->menuAction(), "clock"},
+        {extract_nup, "archive"},
+        {dump_romfs_menu->menuAction(), "hdd"},
+        {verify_integrity, "check"},
+        {copy_tid, "copy"},
+        {convert_nup, "archive"},
+        {convert_nx, "archive"},
+        {edit_nx_metadata, "edit"},
+        {edit_nup, "edit"},
+        {properties, "sliders"},
+    }};
+    for (const auto& [action, name] : icons) {
+        if (action != nullptr) {
+            action->setIcon(MenuIcon(name));
+        }
     }
 
     favorite->setVisible(program_id != 0);
@@ -694,6 +733,7 @@ void GameList::AddCustomDirPopup(QMenu& context_menu, QModelIndex selected) {
 
     QAction* deep_scan = context_menu.addAction(tr("Scan Subfolders"));
     QAction* delete_dir = context_menu.addAction(tr("Remove Game Directory"));
+    delete_dir->setIcon(MenuIcon("x"));
 
     deep_scan->setCheckable(true);
     deep_scan->setChecked(game_dir.deep_scan);
@@ -716,6 +756,7 @@ void GameList::AddPermDirPopup(QMenu& context_menu, QModelIndex selected) {
     QAction* move_up = context_menu.addAction(tr("\u25B2 Move Up"));
     QAction* move_down = context_menu.addAction(tr("\u25bc Move Down"));
     QAction* open_directory_location = context_menu.addAction(tr("Open Directory Location"));
+    open_directory_location->setIcon(MenuIcon("folder"));
 
     const int row = selected.row();
 

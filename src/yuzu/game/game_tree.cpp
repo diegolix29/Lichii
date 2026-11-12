@@ -1,18 +1,142 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+
 #include <QApplication>
 #include <QHeaderView>
+#include <QPainter>
 #include <QScroller>
 #include <QScrollerProperties>
+#include <QStyledItemDelegate>
 
 #include "qt_common/config/uisettings.h"
 #include "qt_common/game_list/game_list_p.h"
 #include "qt_common/game_list/model.h"
 #include "yuzu/game/common.h"
 #include "yuzu/game/game_tree.h"
+#include "yuzu/util/util.h"
+
+namespace {
+
+// Draws the name column the way Lichii Dark lays it out: a game's title over a muted
+// monospace second line with a star for favourites, and a folder's game count after its path.
+class LichiiNameDelegate final : public QStyledItemDelegate {
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+
+    void paint(QPainter* painter, const QStyleOptionViewItem& option,
+               const QModelIndex& index) const override {
+        const auto type = index.data(GameListItem::TypeRole).value<GameListItemType>();
+        if (!IsLichiiTheme() || type == GameListItemType::AddDir) {
+            QStyledItemDelegate::paint(painter, option, index);
+            return;
+        }
+
+        QStyleOptionViewItem item = option;
+        initStyleOption(&item, index);
+        const QStringList lines =
+            item.text.replace(QChar::LineSeparator, QLatin1Char('\n')).split(QLatin1Char('\n'));
+        item.text.clear();
+        if (const QPixmap picture = index.data(Qt::DecorationRole).value<QPixmap>();
+            !picture.isNull()) {
+            QIcon icon(picture);
+            icon.addPixmap(picture, QIcon::Selected);
+            item.icon = icon;
+        }
+        const QWidget* widget = item.widget;
+        QStyle* style = widget != nullptr ? widget->style() : QApplication::style();
+        style->drawControl(QStyle::CE_ItemViewItem, &item, painter, widget);
+        const int text_left =
+            style->subElementRect(QStyle::SE_ItemViewItemText, &item, widget).left() + 4;
+        const QRect rect(text_left, item.rect.top(), item.rect.right() - text_left - 4,
+                         item.rect.height());
+
+        const bool selected = item.state & QStyle::State_Selected;
+        QFont title_font = item.font;
+        title_font.setWeight(QFont::DemiBold);
+
+        painter->save();
+        painter->setClipRect(item.rect);
+        painter->setFont(title_font);
+        const QFontMetrics title_metrics = painter->fontMetrics();
+        const QString title =
+            title_metrics.elidedText(lines.value(0), Qt::ElideRight, rect.width());
+        painter->setPen(selected ? QColor(Qt::white) : QColor(0xec, 0xec, 0xef));
+
+        if (type != GameListItemType::Game) {
+            painter->drawText(rect, Qt::AlignVCenter | Qt::AlignLeft, title);
+            const int games = index.model()->rowCount(index);
+            const int x = rect.left() + title_metrics.horizontalAdvance(title) + 10;
+            painter->setFont(item.font);
+            painter->setPen(QColor(0x6f, 0x71, 0x78));
+            painter->drawText(QRect(x, rect.top(), std::max(0, rect.right() - x), rect.height()),
+                              Qt::AlignVCenter | Qt::AlignLeft,
+                              games == 1
+                                  ? QCoreApplication::translate("GameList", "1 game")
+                                  : QCoreApplication::translate("GameList", "%1 games").arg(games));
+            painter->restore();
+            return;
+        }
+
+        QFont id_font = GetMonospaceFont();
+        if (item.font.pixelSize() > 0) {
+            id_font.setPixelSize(std::max(1, item.font.pixelSize() * 17 / 20));
+        } else {
+            id_font.setPointSizeF(item.font.pointSizeF() * 0.85);
+        }
+        const bool two_lines = lines.size() > 1;
+        const int middle = rect.top() + rect.height() / 2;
+        const int flags = Qt::AlignLeft | Qt::TextDontClip;
+
+        QRect title_rect;
+        painter->drawText(
+            two_lines ? QRect(rect.left(), rect.top(), rect.width(), middle - rect.top() - 1)
+                      : rect,
+            flags | (two_lines ? Qt::AlignBottom : Qt::AlignVCenter), title, &title_rect);
+
+        const u64 program_id = index.data(GameListItemPath::ProgramIdRole).toULongLong();
+        if (program_id != 0 && UISettings::values.favorited_ids.contains(program_id)) {
+            const int star_x = title_rect.right() + 8;
+            const int star_y = title_rect.center().y() - 7;
+            if (star_x + 14 <= rect.right()) {
+                painter->drawPixmap(QRect(star_x, star_y, 14, 14),
+                                    QPixmap(QStringLiteral(":/lichii/icons/star_accent@2x.png")));
+            }
+        }
+
+        if (two_lines) {
+            painter->setFont(id_font);
+            painter->setPen(selected ? QColor(0xc4, 0xc5, 0xca) : QColor(0x6f, 0x71, 0x78));
+            painter->drawText(
+                QRect(rect.left(), middle + 2, rect.width(), rect.bottom() - middle - 2),
+                flags | Qt::AlignTop,
+                painter->fontMetrics().elidedText(lines.at(1).trimmed(), Qt::ElideRight,
+                                                  rect.width()));
+        }
+        painter->restore();
+    }
+
+    QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex& index) const override {
+        QSize size = QStyledItemDelegate::sizeHint(option, index);
+        if (!IsLichiiTheme()) {
+            return size;
+        }
+        const auto type = index.data(GameListItem::TypeRole).value<GameListItemType>();
+        if (type == GameListItemType::Game) {
+            const int icon = static_cast<int>(UISettings::values.game_icon_size.GetValue());
+            size.setHeight(std::max(size.height(), icon + 16));
+        } else {
+            size.setHeight(std::max(size.height(), 34));
+        }
+        return size;
+    }
+};
+
+} // namespace
 
 GameTree::GameTree(QWidget* parent) : QTreeView{parent} {
+    setItemDelegateForColumn(GameListModel::COLUMN_NAME, new LichiiNameDelegate(this));
     setAlternatingRowColors(true);
     setSelectionMode(QHeaderView::SingleSelection);
     setSelectionBehavior(QHeaderView::SelectRows);

@@ -242,6 +242,20 @@ ResultStatus AppLoader_NSP::ReadIcon(std::vector<u8>& buffer) {
     return ResultStatus::Success;
 }
 
+ResultStatus AppLoader_NSP::ReadOriginalIcon(std::vector<u8>& buffer) const {
+    const auto control =
+        nsp->GetNCA(FileSys::GetBaseTitleID(nsp->GetProgramTitleID()), FileSys::ContentRecordType::Control);
+    if (control == nullptr || control->GetStatus() != ResultStatus::Success) {
+        return ResultStatus::ErrorNoControl;
+    }
+    const auto [nacp, icon] = FileSys::PatchManager::ParseControlRomFS(control->GetRomFS());
+    if (icon == nullptr) {
+        return ResultStatus::ErrorNoIcon;
+    }
+    buffer = icon->ReadAllBytes();
+    return ResultStatus::Success;
+}
+
 ResultStatus AppLoader_NSP::ReadTitle(std::string& title) {
     if (nacp_file == nullptr) {
         return ResultStatus::ErrorNoControl;

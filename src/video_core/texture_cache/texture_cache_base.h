@@ -15,6 +15,7 @@
 #include <optional>
 #include <span>
 #include <type_traits>
+#include <utility>
 // TODO: find out which don't require stable iters
 #include <unordered_map>
 #include "video_core/page_filter.h"
@@ -174,6 +175,12 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 native_critical_memory{};
     u64 native_expected_memory{};
     u64 budget_check_frames{};
+    /// Usage under which the collector keeps recently used images (EvictionAge): the driver's
+    /// budget less the out-of-memory and block slack margins, within the host's commit bound.
+    /// Not less the base margin too: a Mario Kart World race on a 7.6 GB budget then reached it
+    /// (6.48 GB) and the collector deleted ~40 recently used images a frame again; images that
+    /// do not fit add to the out-of-memory margin.
+    u64 retention_limit{};
     u64 logged_critical_memory{}; ///< The critical threshold of the last thresholds line logged
     u32 seen_pressure_events{};   ///< Allocator pressure events already answered
     u32 seen_failed_images{};     ///< Images the allocator could not make, already collected for
@@ -348,6 +355,19 @@ public:
         return render_targets;
     }
 
+    /// Images created, deleted and created from overlapping ones (joins), invalidations of every
+    /// channel's TIC tables, and TIC or TSC tables moved, since the last call.
+    struct Churn {
+        u64 created{};
+        u64 deleted{};
+        u64 joins{};
+        u64 invalidations{};
+        u64 refreshes{};
+    };
+    Churn TakeChurn() noexcept {
+        return std::exchange(churn, {});
+    }
+
     /// Mark images in a range as modified from the CPU
     void WriteMemory(DAddr cpu_addr, size_t size);
 
@@ -363,6 +383,10 @@ public:
     void UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size);
 
     /// Blit an image with the given parameters
+    bool CopyVolumeSlice(const Tegra::Engines::Fermi2D::Surface& dst,
+                         const Tegra::Engines::Fermi2D::Surface& src,
+                         const Tegra::Engines::Fermi2D::Config& copy);
+
     bool BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
                    const Tegra::Engines::Fermi2D::Surface& src,
                    const Tegra::Engines::Fermi2D::Config& copy);
@@ -373,7 +397,8 @@ public:
                          const Tegra::Engines::Fermi2D::Surface& src,
                          const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                          const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale, bool use_history);
+                         std::array<f32, 2> motion_scale, bool use_history,
+                         std::optional<std::array<u32, 2>> render_region = std::nullopt);
 
     /// Health check of a game's DLSS network output (dst) against its input (src); see the
     /// runtime's ProbeGameDlssOutput. Returns an earlier check's result when one is ready.
@@ -622,6 +647,7 @@ private:
     std::array<ImageId, 8> rt_image_id{};
     ImageId rt_depth_image_id{};
     u64 texture_bindings_serial = 0;
+    Churn churn;
     u64 last_feedback_loop_serial = 0;
     u64 last_feedback_texture_serial = 0;
     bool last_feedback_loop_result = false;

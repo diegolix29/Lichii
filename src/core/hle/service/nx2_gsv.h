@@ -11,6 +11,7 @@
 #include <cstring>
 #include <set>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <cstdlib>
 #include <cstdio>
@@ -26,9 +27,11 @@
 #include <vector>
 
 #include "common/alignment.h"
+#include "common/display_hdr.h"
 #include "common/div_ceil.h"
 #include "common/dkb_frame_trace.h"
 #include "common/game_presets.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -36,18 +39,23 @@
 #include "core/device_memory.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
+#include "core/frontend/emu_window.h"
 #include "core/frontend/framebuffer_layout.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/framebuffer_config.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_client_session.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/hle/kernel/k_system_resource.h"
 #include "core/hle/kernel/k_memory_manager.h"
+#include "core/hle/kernel/k_system_control.h"
 #include "core/hle/kernel/k_page_group.h"
 #include "core/hle/kernel/k_resource_limit.h"
+#include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/kernel/k_server_session.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/k_hardware_timer.h"
@@ -380,12 +388,18 @@ public:
                 [this](u64 gpu_address, u64 size, const u8* data) {
                     BackSparseWrite(gpu_address, size, data);
                 });
+            m_reserve_thread =
+                system.Kernel().RunOnHostCoreThread("nx2:GpuBacking", [this] { FillReserve(); });
         }
     }
 
     ~INx2GpuSession() override {
         // Waits for a backing the GPU thread may be doing.
         Tegra::Nx2SetSparseBacking({});
+        m_reserve_stop.request_stop();
+        if (m_reserve_thread.joinable()) {
+            m_reserve_thread.join();
+        }
         for (auto* event : m_events) {
             if (event != nullptr) {
                 m_context.CloseEvent(event);
@@ -635,6 +649,9 @@ private:
                                     m_destroy_leftovers);
                     }
                 }
+                // No GPU range reaches the memory any more: free its device range, so registering
+                // the address again gets a new one on the pages it has then.
+                registry.ReleaseBacking(address, size);
             }
             if (size == 0x2000) {
                 Tegra::Nx2RemoveSemaphoreRegion(address);
@@ -661,12 +678,24 @@ private:
                  w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12]);
         if (last > start && ((last + 1 - start) % Core::Memory::YUZU_PAGESIZE) == 0) {
             const u64 size = last + 1 - start;
+            const bool lazy_sparse = (w[7] & SparseRegionFlag) != 0 && LazySparseRegions();
+            const bool back_whole =
+                !lazy_sparse && (!LazyGpuOnlyRegions() || KeepsConstantsInGpuOnlyRegions());
+            // Kernel calls are made without m_region_mutex, which the GPU thread takes: mapping can
+            // wait on the guest page table lock. Released regions go back first, so their memory
+            // can back this one.
+            {
+                std::unique_lock lk{m_region_mutex};
+                auto freed = TakeReleasedRegions();
+                lk.unlock();
+                FreeBackings(std::move(freed));
+            }
+            auto backing = back_whole ? AllocateGpuOnlyBacking(size, true, false) : std::nullopt;
             std::scoped_lock lk{m_region_mutex};
-            FreeReleasedRegions();
             if ((w[7] & SparseRegionFlag) == 0) {
                 m_gpu_only_ranges[start] = size; // kept out of 216, however it is backed
             }
-            if ((w[7] & SparseRegionFlag) != 0 && LazySparseRegions()) {
+            if (lazy_sparse) {
                 // Title 1's terrain texture arrays and layer pools (170 MB-5.8 GB, mostly empty):
                 // backed whole, they ran the pool dry and the later ones got no memory at all.
                 // The region gets a device range of its own, unbacked pages read zero, and
@@ -678,27 +707,41 @@ private:
                 Nvidia::Devices::Nx2GpuMemoryRegistry::Get().CreateSparse(start, size);
                 Tegra::Nx2SparseRegionCreated(start, size, SparseBlockSize);
                 Tegra::Nx2AddSparseSpan(start, size);
+                WantReserve();
                 LOG_INFO(Service, "nx2:gpu 214 sparse region [{:#x}, {:#x}] backed as the GPU writes it",
                          start, last);
-            } else if (LazyGpuOnlyRegions()) {
-                // The rest is written by the host GPU, not through guest memory (title 1's and
-                // title 4's render targets, 285-300 MB regions): like a sparse region it gets a
-                // device range of its own and memory per block only when something writes guest
-                // memory there (downloads, copies). The texture cache sees ordinary memory.
-                m_sparse_regions[start] = {
-                    .gpu_only = true,
-                    .size = size,
-                    .blocks = std::vector<u8>(Common::DivCeil(size, SparseBlockSize)),
-                };
-                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().CreateSparse(start, size);
-                Tegra::Nx2AddSparseSpan(start, size);
-                LOG_INFO(Service, "nx2:gpu 214 GPU-only region [{:#x}, {:#x}] backed as it is written",
-                         start, last);
-            } else if (const auto address = BackGpuOnlyRegion(start, size)) {
-                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(start, *address, size);
-                LOG_INFO(Service, "nx2:gpu 214 GPU-only region [{:#x}, {:#x}] backed at {:#x} "
-                                  "({} MiB of GPU-only memory in use, peak {} MiB)",
-                         start, last, *address, m_gpu_only_bytes >> 20, m_gpu_only_peak >> 20);
+            } else {
+                // A region that cannot be backed whole is still usable block by block.
+                if (backing) {
+                    const u64 address = backing->address;
+                    RegisterGpuOnlyBacking(start, std::move(*backing));
+                    Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(start, address, size);
+                    LOG_INFO(Service, "nx2:gpu 214 GPU-only region [{:#x}, {:#x}] backed at {:#x} "
+                                      "({} MiB of GPU-only memory in use, peak {} MiB)",
+                             start, last, address, m_gpu_only_bytes >> 20, m_gpu_only_peak >> 20);
+                } else {
+                    if (back_whole && KeepsConstantsInGpuOnlyRegions()) {
+                        // This title writes constants into some of its GPU-only regions from the
+                        // CPU; if this is one of them, those writes read back as zero.
+                        LOG_WARNING(Service, "nx2:gpu 214 GPU-only region [{:#x}, {:#x}] could not be "
+                                             "backed whole; CPU writes before a GPU write read zero",
+                                    start, last);
+                    }
+                    // The rest is written by the host GPU, not through guest memory (title 1's and
+                    // title 4's render targets, 285-300 MB regions): like a sparse region it gets a
+                    // device range of its own and memory per block only when something writes guest
+                    // memory there (downloads, copies). The texture cache sees ordinary memory.
+                    m_sparse_regions[start] = {
+                        .gpu_only = true,
+                        .size = size,
+                        .blocks = std::vector<u8>(Common::DivCeil(size, SparseBlockSize)),
+                    };
+                    Nvidia::Devices::Nx2GpuMemoryRegistry::Get().CreateSparse(start, size);
+                    Tegra::Nx2AddSparseSpan(start, size);
+                    WantReserve();
+                    LOG_INFO(Service, "nx2:gpu 214 GPU-only region [{:#x}, {:#x}] backed as it is written",
+                             start, last);
+                }
             }
         } else {
             LOG_WARNING(Service, "nx2:gpu 214 unexpected region [{:#x}, {:#x}]", start, last);
@@ -734,8 +777,12 @@ private:
             rb.Push(ResultSuccess);
             return;
         }
+        std::vector<GpuOnlyRegion> freed;
+        SCOPE_EXIT {
+            FreeBackings(std::move(freed));
+        };
         std::scoped_lock lk{m_region_mutex};
-        FreeReleasedRegions();
+        freed = TakeReleasedRegions();
         if (m_gpu_only_ranges.erase(first) != 0 && last > first) {
             DropGpuOnlyTiles(first, last - first + 1, false);
             m_shared_regions.erase(first);
@@ -787,9 +834,10 @@ private:
         const auto data = ctx.BufferDescriptorA().empty() ? std::span<const u8>{} : ctx.ReadBufferA(0);
         const size_t count = data.size() / sizeof(SparseMapRequest);
         std::vector<u8> kinds(count);
+        std::vector<GpuOnlyRegion> freed;
         {
             std::scoped_lock lk{m_region_mutex};
-            FreeReleasedRegions();
+            freed = TakeReleasedRegions();
             ++m_tile_calls;
             for (size_t i = 0; i < count; ++i) {
                 SparseMapRequest request;
@@ -811,6 +859,7 @@ private:
                          m_sparse_released_bytes >> 20);
             }
         }
+        FreeBackings(std::move(freed));
         if (!ctx.BufferDescriptorB().empty() && count != 0) {
             ctx.WriteBufferB(kinds.data(), kinds.size(), 0);
         }
@@ -835,38 +884,19 @@ private:
         return true;
     }
 
-    // Returns the pages of destroyed regions the GPU thread is done with to the kernel.
-    void FreeReleasedRegions() {
-        auto* const process = system.ApplicationProcess();
-        std::erase_if(m_released_regions, [&](ReleasedRegion& released) {
-            if (!released.done->load(std::memory_order_acquire)) {
-                return false;
-            }
-            auto& region = released.region;
-            if (process != nullptr &&
-                R_FAILED(process->GetPageTable().UnmapPageGroup(
-                    region.cpu_address, *region.pages, Kernel::KMemoryState::IoMemory))) {
-                LOG_ERROR(Service, "nx2:gpu could not unmap GPU-only backing {:#x}+{:#x}",
-                          region.cpu_address, region.size);
-                return true; // still mapped: keep its pages
-            }
-            region.pages->Close(system.Kernel());
-            m_gpu_only_bytes -= region.size;
-            return true;
-        });
-    }
-
     struct MappedBacking {
         u64 address;
         u64 size;
         std::unique_ptr<Kernel::KPageGroup> pages;
+        u64 reserved; ///< Application memory reserved for pages taken from its pool
     };
 
-    // Allocates kernel memory and maps it in the alias code region. Touches no region state, so
-    // it needs no lock: the GPU back thread calls it without m_region_mutex, because mapping can
-    // wait on the guest page table lock and a guest thread holding that lock must not be stalled
-    // behind a host mutex the service thread is waiting for.
+    // Allocates kernel memory and maps it in the alias code region. This waits for the kernel's
+    // pool and page table locks, which a guest thread can hold while it needs a CPU core that is
+    // waiting on the GPU: never call it on a GPU thread, or with m_region_mutex held (the GPU thread
+    // takes it). The service thread and FillReserve call it.
     std::optional<MappedBacking> AllocateGpuOnlyBacking(u64 size, bool log_failure, bool clear) {
+        ASSERT(!VideoCommon::GpuSplit::OnGpuThread() && !VideoCommon::GpuSplit::OnBackThread());
         using Core::Memory::YUZU_PAGESIZE;
         auto& kernel_core = system.Kernel();
         auto* const process = system.ApplicationProcess();
@@ -879,14 +909,31 @@ private:
         // pool, title 4's six regions left it 1.8 GB less than the kernel reports to it. Not
         // cleared: the GPU writes these before reading them, and touching 300 MB would commit it
         // on the host.
-        if (R_FAILED(kernel_core.MemoryManager().AllocateAndOpen(
+        // A title that fills the system pool (The Duskbloods network test's six regions) falls
+        // back to the application pool, only when that pool was grown for the title.
+        const bool application_fallback = Kernel::KSystemControl::Init::GetApplicationPoolGrowth() != 0;
+        const auto allocate = [&](Kernel::KMemoryManager::Pool pool) {
+            return kernel_core.MemoryManager().AllocateAndOpen(
                 pg.get(), size / YUZU_PAGESIZE,
-                Kernel::KMemoryManager::EncodeOption(Kernel::KMemoryManager::Pool::SystemNonSecure,
-                                                     Kernel::KMemoryManager::Direction::FromBack)))) {
-            if (log_failure) {
-                LOG_ERROR(Service, "nx2:gpu 214 could not allocate {:#x} bytes", size);
+                Kernel::KMemoryManager::EncodeOption(pool,
+                                                     Kernel::KMemoryManager::Direction::FromBack));
+        };
+        // Pages from the application pool count against the application's memory limit, so the
+        // totals the game reads leave them out and its own allocations cannot overrun the pool.
+        u64 reserved = 0;
+        if (R_FAILED(allocate(Kernel::KMemoryManager::Pool::SystemNonSecure))) {
+            Kernel::KScopedResourceReservation reservation(
+                kernel_core, process, Kernel::LimitableResource::PhysicalMemoryMax,
+                static_cast<s64>(size));
+            if (!application_fallback || !reservation.Succeeded() ||
+                R_FAILED(allocate(Kernel::KMemoryManager::Pool::Application))) {
+                if (log_failure) {
+                    LOG_ERROR(Service, "nx2:gpu 214 could not allocate {:#x} bytes", size);
+                }
+                return std::nullopt;
             }
-            return std::nullopt;
+            reservation.Commit();
+            reserved = size;
         }
         if (clear) {
             // Cheap for memory that's still zero (most of it): only reused pages get cleared.
@@ -911,13 +958,24 @@ private:
                                                     Kernel::KMemoryPermission::UserReadWrite))) {
                 m_alias_hint.store((offset + Common::AlignUp(size, Alignment)) / Alignment,
                                    std::memory_order_relaxed);
-                return MappedBacking{GetInteger(address), size, std::move(pg)};
+                return MappedBacking{GetInteger(address), size, std::move(pg), reserved};
             }
         }
         LOG_ERROR(Service, "nx2:gpu 214 no room for {:#x} bytes in the alias code region "
                            "[{:#x}, +{:#x})", size, region_start, region_size);
         pg->Close(kernel_core);
+        ReleaseReservation(reserved);
         return std::nullopt;
+    }
+
+    // Gives back application memory reserved for a GPU-only backing from the application pool.
+    void ReleaseReservation(u64 reserved) {
+        auto* const process = system.ApplicationProcess();
+        if (reserved != 0 && process != nullptr && process->GetResourceLimit() != nullptr) {
+            process->GetResourceLimit()->Release(system.Kernel(),
+                                                 Kernel::LimitableResource::PhysicalMemoryMax,
+                                                 static_cast<s64>(reserved));
+        }
     }
 
     // Records a mapped backing for the region at gpu_address. Needs m_region_mutex.
@@ -934,86 +992,69 @@ private:
                                                                         it->second.size);
             auto done = std::make_shared<std::atomic<bool>>(false);
             system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
-            m_gpu_only_bytes -= it->second.size;
+            // Counted out by FreeBackings once its pages are freed.
             m_released_regions.push_back({std::move(it->second), done});
             m_gpu_only_regions.erase(it);
         }
-        m_gpu_only_regions[gpu_address] = {backing.address, backing.size, std::move(backing.pages)};
+        m_gpu_only_regions[gpu_address] = {backing.address, backing.size, std::move(backing.pages),
+                                           backing.reserved};
         m_gpu_only_bytes += backing.size;
         m_gpu_only_peak = (std::max)(m_gpu_only_peak, m_gpu_only_bytes);
-    }
-
-    // Needs m_region_mutex.
-    std::optional<u64> BackGpuOnlyRegion(u64 gpu_address, u64 size) {
-        auto backing = AllocateGpuOnlyBacking(size, true, false);
-        if (!backing) {
-            return std::nullopt;
-        }
-        const u64 address = backing->address;
-        RegisterGpuOnlyBacking(gpu_address, std::move(*backing));
-        return address;
     }
 
     // Runs before a GPU-side write that may land in a sparse region (Tegra::Nx2BackSparseWrite,
     // usually on the GPU thread): the blocks the write touches get memory, cleared, behind the
     // region's device pages. The GPU mapping stays as it is, so the images over the region keep
     // their storage and only see the write.
+    // The memory comes from m_reserve, and nothing here waits for the kernel: the GPU thread can
+    // hold a cache lock that a guest core waits for in host code (a CPU read of GPU-written
+    // memory), and the guest thread holding the kernel lock can need that core. Mario Kart World
+    // deadlocked loading a race that way. A block with no memory ready keeps what is written to
+    // it, and reads it back, until FillReserve gives it memory (BlockDeferred).
     void BackSparseWrite(u64 gpu_address, u64 size, const u8* data) {
-        struct Pending {
-            u64 region;
-            u64 block;
-        };
-        std::vector<Pending> todo;
         const u64 end = gpu_address + size;
-        // Calls fn(region_start, region, first_block, last_block) for each region the write touches.
-        auto for_regions = [&](auto&& fn) {
-            auto it = m_sparse_regions.upper_bound(gpu_address);
-            if (it != m_sparse_regions.begin()) {
-                --it;
+        u64 zero_bytes = 0;
+        bool touched = false;
+        std::scoped_lock lk{m_region_mutex};
+        auto it = m_sparse_regions.upper_bound(gpu_address);
+        if (it != m_sparse_regions.begin()) {
+            --it;
+        }
+        for (; it != m_sparse_regions.end() && it->first < end; ++it) {
+            auto& [start, region] = *it;
+            if (start + region.size <= gpu_address) {
+                continue;
             }
-            for (; it != m_sparse_regions.end() && it->first < end; ++it) {
-                auto& [start, region] = *it;
-                if (start + region.size <= gpu_address) {
+            const u64 first = ((std::max)(gpu_address, start) - start) / SparseBlockSize;
+            const u64 last = ((std::min)(end, start + region.size) - 1 - start) / SparseBlockSize;
+            for (u64 block = first; block <= last; ++block) {
+                if (region.blocks[block] != BlockEmpty) {
                     continue;
                 }
-                fn(start, region, ((std::max)(gpu_address, start) - start) / SparseBlockSize,
-                   ((std::min)(end, start + region.size) - 1 - start) / SparseBlockSize);
-            }
-        };
-        bool waits_for_other = false;
-        u64 zero_bytes = 0;
-        {
-            std::unique_lock lk{m_region_mutex};
-            for_regions([&](u64 start, SparseRegion& region, u64 first, u64 last) {
-                for (u64 block = first; block <= last; ++block) {
-                    if (region.blocks[block] == BlockEmpty && region.tiles) {
-                        // The write lands in the game's own memory (a tile it mapped) or nowhere;
-                        // the texture cache only learns that the block has contents now.
-                        region.blocks[block] = BlockWritten;
-                        Tegra::Nx2SparseBlockWritten(start, block);
-                    } else if (region.blocks[block] == BlockEmpty) {
-                        // Zeros over a block nobody wrote change nothing: it reads zero without
-                        // memory. Title 1 clears ~1 GB of them at boot.
-                        const u64 block_begin = start + block * SparseBlockSize;
-                        const u64 write_begin = (std::max)(gpu_address, block_begin);
-                        const u64 write_end = (std::min)(
-                            {end, block_begin + SparseBlockSize, start + region.size});
-                        if (data != nullptr &&
-                            IsAllZero(data + (write_begin - gpu_address), write_end - write_begin) &&
-                            !Tegra::Nx2SparseBlockIsWritten(start, block)) {
-                            zero_bytes += write_end - write_begin;
-                            continue;
-                        }
-                        region.blocks[block] = BlockPending;
-                        todo.push_back({start, block});
-                    } else if (region.blocks[block] == BlockPending) {
-                        waits_for_other = true;
-                    }
+                if (region.tiles) {
+                    // The write lands in the game's own memory (a tile it mapped) or nowhere;
+                    // the texture cache only learns that the block has contents now.
+                    region.blocks[block] = BlockWritten;
+                    Tegra::Nx2SparseBlockWritten(start, block);
+                    continue;
                 }
-            });
+                // Zeros over a block nobody wrote change nothing: it reads zero without
+                // memory. Title 1 clears ~1 GB of them at boot.
+                const u64 block_begin = start + block * SparseBlockSize;
+                const u64 write_begin = (std::max)(gpu_address, block_begin);
+                const u64 write_end =
+                    (std::min)({end, block_begin + SparseBlockSize, start + region.size});
+                if (data != nullptr &&
+                    IsAllZero(data + (write_begin - gpu_address), write_end - write_begin) &&
+                    !Tegra::Nx2SparseBlockIsWritten(start, block)) {
+                    zero_bytes += write_end - write_begin;
+                    continue;
+                }
+                BackBlock(start, region, block);
+                touched = true;
+            }
         }
         if (zero_bytes != 0) {
-            std::scoped_lock lk{m_region_mutex};
             const u64 before = m_sparse_zero_bytes;
             m_sparse_zero_bytes += zero_bytes;
             if (before == 0 || (before >> 28) != (m_sparse_zero_bytes >> 28)) {
@@ -1022,77 +1063,8 @@ private:
                          m_sparse_zero_bytes >> 20);
             }
         }
-        // Allocating and mapping happens outside the lock (see AllocateGpuOnlyBacking).
-        for (const auto& [start, block] : todo) {
-            u64 block_size = SparseBlockSize;
-            {
-                std::scoped_lock lk{m_region_mutex};
-                const auto it = m_sparse_regions.find(start);
-                if (it != m_sparse_regions.end()) {
-                    block_size = (std::min)(SparseBlockSize, it->second.size - block * SparseBlockSize);
-                }
-            }
-            auto backing = AllocateGpuOnlyBacking(block_size, false, true);
-            bool stale = false;
-            {
-                std::scoped_lock lk{m_region_mutex};
-                const auto it = m_sparse_regions.find(start);
-                if (it == m_sparse_regions.end() || block >= it->second.blocks.size()) {
-                    stale = true; // the region was destroyed while its block was being backed
-                } else if (it->second.tiles) {
-                    // The game started mapping its tiles there meanwhile (216): no block.
-                    stale = true;
-                    it->second.blocks[block] = BlockWritten;
-                    Tegra::Nx2SparseBlockWritten(start, block);
-                } else if (!backing) {
-                    auto& region = it->second;
-                    region.blocks[block] = BlockFailed; // out of memory: not again for every write
-                    if (!region.warned) {
-                        region.warned = true;
-                        LOG_WARNING(Service, "nx2:gpu sparse region at {:#x}: pool exhausted, GPU writes "
-                                             "to its unbacked blocks are dropped",
-                                    start);
-                    }
-                } else {
-                    const u64 block_address = start + block * SparseBlockSize;
-                    const u64 address = backing->address;
-                    it->second.blocks[block] = BlockBacked;
-                    RegisterGpuOnlyBacking(block_address, std::move(*backing));
-                    Nvidia::Devices::Nx2GpuMemoryRegistry::Get().BackSparse(block_address, address,
-                                                                            block_size);
-                    Tegra::Nx2SparseBlockWritten(start, block);
-                    m_sparse_backed_bytes += block_size;
-                    if (++m_sparse_blocks == 1 || (m_sparse_blocks % 64) == 0) {
-                        LOG_INFO(Service, "nx2:gpu {} sparse blocks backed ({} MiB); {} MiB of GPU-only "
-                                          "memory in use, peak {} MiB",
-                                 m_sparse_blocks, m_sparse_backed_bytes >> 20, m_gpu_only_bytes >> 20,
-                                 m_gpu_only_peak >> 20);
-                    }
-                }
-            }
-            m_region_cv.notify_all();
-            if (stale && backing) {
-                // Never handed to the GPU: unmap and free right away.
-                if (auto* const process = system.ApplicationProcess(); process != nullptr) {
-                    process->GetPageTable().UnmapPageGroup(Common::ProcessAddress{backing->address},
-                                                           *backing->pages,
-                                                           Kernel::KMemoryState::IoMemory);
-                }
-                backing->pages->Close(system.Kernel());
-            }
-        }
-        if (waits_for_other) {
-            // Another thread is backing a block this write needs: wait until it is done.
-            std::unique_lock lk{m_region_mutex};
-            m_region_cv.wait(lk, [&] {
-                bool pending = false;
-                for_regions([&](u64, SparseRegion& region, u64 first, u64 last) {
-                    for (u64 block = first; block <= last; ++block) {
-                        pending |= region.blocks[block] == BlockPending;
-                    }
-                });
-                return !pending;
-            });
+        if (touched) {
+            m_reserve_cv.notify_all();
         }
     }
 
@@ -1106,6 +1078,13 @@ private:
     }
 
     // EDEN_NX2_GPU_ONLY_LAZY=0 backs GPU-only regions whole, as before.
+    // The Duskbloods network test binds constant buffers there and the CPU writes them, so unbacked
+    // blocks read as zero and nothing draws.
+    bool KeepsConstantsInGpuOnlyRegions() const {
+        const auto* const process = system.ApplicationProcess();
+        return process != nullptr && process->GetProgramId() == 0x0400D1D02399A000ULL;
+    }
+
     static bool LazyGpuOnlyRegions() {
         static const bool lazy = [] {
             const char* value = std::getenv("EDEN_NX2_GPU_ONLY_LAZY");
@@ -1116,15 +1095,15 @@ private:
 
     static constexpr u32 SparseRegionFlag = 0x200; ///< Word 7 of 214 (0x60c arrays, 0xa0c pools)
     static constexpr u64 SparseBlockSize = 4ULL << 20;
+    static constexpr size_t ReserveBlocks = 16; ///< Whole blocks FillReserve keeps ready (64 MiB)
     static constexpr u8 BlockEmpty = 0;
     static constexpr u8 BlockBacked = 1;
-    static constexpr u8 BlockFailed = 2;
-    static constexpr u8 BlockPending = 3; ///< Being allocated and mapped by BackSparseWrite
+    static constexpr u8 BlockDeferred = 3; ///< Waits for memory; its writes are kept meanwhile
     static constexpr u8 BlockWritten = 4; ///< Written in a region the game maps tiles into
     struct SparseRegion {
         bool gpu_only{};        ///< A GPU-only region (no sparse flag), backed lazily as well
         u64 size;
-        std::vector<u8> blocks; ///< BlockEmpty / Backed / Failed / Pending / Written per block
+        std::vector<u8> blocks; ///< BlockEmpty / Backed / Deferred / Written per block
         bool warned{};          ///< Logged that the pool ran out for its blocks
         bool tiles{};           ///< The game maps its own memory into it (216): no blocks
         std::vector<bool> tile_pages; ///< Pages a tile maps, once `tiles`
@@ -1134,6 +1113,150 @@ private:
     u64 m_sparse_backed_bytes{}; ///< Sparse region memory given out so far
     u64 m_sparse_zero_bytes{};   ///< Zeros written over unwritten sparse blocks, left out
     u64 m_sparse_released_bytes{}; ///< Blocks given back once the game mapped tiles there
+
+    // Gives a sparse region's block memory from the reserve. Without memory ready, the block keeps
+    // what is written to it in the SMMU, which reads it back and copies it into the memory
+    // BackDeferredBlocks maps there later. Needs m_region_mutex.
+    void BackBlock(u64 start, SparseRegion& region, u64 block) {
+        const u64 block_address = start + block * SparseBlockSize;
+        const u64 block_size = (std::min)(SparseBlockSize, region.size - block * SparseBlockSize);
+        if (auto backing = TakeBacking(block_size)) {
+            MapBlock(start, region, block, std::move(*backing));
+            return;
+        }
+        if (m_reserve_exhausted && !region.warned) {
+            region.warned = true;
+            LOG_WARNING(Service, "nx2:gpu sparse region at {:#x}: pool exhausted, its blocks keep "
+                                 "their writes in host memory until memory is freed",
+                        start);
+        }
+        // The guest may have freed memory since the last fill failed: FillReserve tries again for
+        // this block, so kept writes only pile up while the pool really has none.
+        m_reserve_exhausted = false;
+        region.blocks[block] = BlockDeferred;
+        Nvidia::Devices::Nx2GpuMemoryRegistry::Get().KeepSparseWrites(block_address, block_size);
+        Tegra::Nx2SparseBlockWritten(start, block);
+        m_deferred_blocks.push_back({start, block});
+        if (++m_deferred_count <= 16 || (m_deferred_count % 1000) == 0) {
+            LOG_WARNING(Service, "nx2:gpu sparse block {:#x}: no memory ready for it, its writes are "
+                                 "kept until there is ({} blocks so far)",
+                        block_address, m_deferred_count);
+        }
+    }
+
+    // Needs m_region_mutex.
+    void MapBlock(u64 start, SparseRegion& region, u64 block, MappedBacking&& backing) {
+        const u64 block_address = start + block * SparseBlockSize;
+        const u64 address = backing.address;
+        const u64 block_size = backing.size;
+        region.blocks[block] = BlockBacked;
+        RegisterGpuOnlyBacking(block_address, std::move(backing));
+        Nvidia::Devices::Nx2GpuMemoryRegistry::Get().BackSparse(block_address, address, block_size);
+        Tegra::Nx2SparseBlockWritten(start, block);
+        m_sparse_backed_bytes += block_size;
+        if (++m_sparse_blocks == 1 || (m_sparse_blocks % 64) == 0) {
+            LOG_INFO(Service, "nx2:gpu {} sparse blocks backed ({} MiB); {} MiB of GPU-only "
+                              "memory in use, peak {} MiB",
+                     m_sparse_blocks, m_sparse_backed_bytes >> 20, m_gpu_only_bytes >> 20,
+                     m_gpu_only_peak >> 20);
+        }
+    }
+
+    // Maps reserve memory behind the blocks that wait for it, oldest first. Needs m_region_mutex.
+    void BackDeferredBlocks() {
+        while (!m_deferred_blocks.empty()) {
+            const auto [start, block] = m_deferred_blocks.front();
+            const auto it = m_sparse_regions.find(start);
+            if (it == m_sparse_regions.end() || block >= it->second.blocks.size() ||
+                it->second.blocks[block] != BlockDeferred) {
+                m_deferred_blocks.pop_front(); // destroyed, or given to the game's tiles
+                continue;
+            }
+            auto& region = it->second;
+            auto backing =
+                TakeBacking((std::min)(SparseBlockSize, region.size - block * SparseBlockSize));
+            if (!backing) {
+                return;
+            }
+            m_deferred_blocks.pop_front();
+            MapBlock(start, region, block, std::move(*backing));
+        }
+    }
+
+    // Reserve memory for size bytes: the smallest entry that holds them, split when it is larger
+    // (a region's last block can be short). Needs m_region_mutex.
+    std::optional<MappedBacking> TakeBacking(u64 size) {
+        using Core::Memory::YUZU_PAGESIZE;
+        auto best = m_reserve.end();
+        for (auto it = m_reserve.begin(); it != m_reserve.end(); ++it) {
+            if (it->size >= size && (best == m_reserve.end() || it->size < best->size)) {
+                best = it;
+            }
+        }
+        if (best == m_reserve.end()) {
+            return std::nullopt;
+        }
+        if (best->size == size) {
+            MappedBacking backing = std::move(*best);
+            m_reserve.erase(best);
+            return backing;
+        }
+        auto& kernel_core = system.Kernel();
+        auto* const block_infos =
+            std::addressof(kernel_core.GetSystemSystemResource().GetBlockInfoManager());
+        auto front = std::make_unique<Kernel::KPageGroup>(kernel_core, block_infos);
+        auto rest = std::make_unique<Kernel::KPageGroup>(kernel_core, block_infos);
+        u64 front_pages = size / YUZU_PAGESIZE;
+        for (const auto& block : *best->pages) {
+            const u64 pages = block.GetNumPages();
+            const u64 taken = (std::min)(front_pages, pages);
+            front_pages -= taken;
+            if (R_FAILED(front->AddBlock(block.GetAddress(), taken)) ||
+                R_FAILED(rest->AddBlock(block.GetAddress() + taken * YUZU_PAGESIZE, pages - taken))) {
+                return std::nullopt;
+            }
+        }
+        const bool reserved = best->reserved != 0;
+        MappedBacking backing{best->address, size, std::move(front), reserved ? size : 0};
+        best->address += size;
+        best->size -= size;
+        best->pages = std::move(rest);
+        best->reserved = reserved ? best->size : 0;
+        return backing;
+    }
+
+    // A lazily backed region exists: FillReserve keeps memory ready for its blocks. Needs
+    // m_region_mutex.
+    void WantReserve() {
+        m_reserve_wanted = true;
+        m_reserve_cv.notify_all();
+    }
+
+    // Allocates and maps the memory BackSparseWrite takes, ahead of the writes, and backs the blocks
+    // that had to wait for it. Ports the spare blocks of godpow/Eglantine 7c815b729b (Eglantine
+    // #503), without the wait for them there: this thread waits for the kernel so that the GPU
+    // thread never does.
+    void FillReserve() {
+        const auto stop = m_reserve_stop.get_token();
+        const auto needs_block = [this] {
+            const auto whole = std::ranges::count_if(
+                m_reserve, [](const MappedBacking& backing) { return backing.size == SparseBlockSize; });
+            return m_reserve_wanted && !m_reserve_exhausted &&
+                   static_cast<size_t>(whole) < ReserveBlocks;
+        };
+        std::unique_lock lk{m_region_mutex};
+        while (m_reserve_cv.wait(lk, stop, needs_block) && !stop.stop_requested()) {
+            lk.unlock();
+            auto backing = AllocateGpuOnlyBacking(SparseBlockSize, false, true);
+            lk.lock();
+            if (backing) {
+                m_reserve.push_back(std::move(*backing));
+                BackDeferredBlocks();
+            } else {
+                m_reserve_exhausted = true;
+            }
+        }
+    }
 
     // nn::gpu::sdk::SparseMapRequest (216), filled from NvRm's nvgpu_as_remap_op.
     struct SparseMapRequest {
@@ -1384,11 +1507,18 @@ private:
         std::shared_ptr<std::atomic<bool>> done;
         u64 released = 0;
         for (u64 block = 0; block < region.blocks.size(); ++block) {
+            const u64 block_address = start + block * SparseBlockSize;
+            if (region.blocks[block] == BlockDeferred) {
+                // What it kept goes, as a backed block's memory does.
+                region.blocks[block] = BlockWritten;
+                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapSparseTile(
+                    block_address, 0, (std::min)(SparseBlockSize, region.size - block * SparseBlockSize));
+                continue;
+            }
             if (region.blocks[block] != BlockBacked) {
                 continue;
             }
             region.blocks[block] = BlockWritten;
-            const u64 block_address = start + block * SparseBlockSize;
             const auto backing = m_gpu_only_regions.find(block_address);
             if (backing == m_gpu_only_regions.end()) {
                 continue;
@@ -1432,14 +1562,23 @@ private:
     u64 m_gpu_only_bytes{};      ///< Backing of GPU-only regions and sparse blocks right now
     u64 m_gpu_only_peak{};
     std::atomic<u64> m_alias_hint{}; ///< 2 MiB slot after the last backing in the alias code region
-    /// Regions are created and destroyed on the service thread and backed on the GPU thread.
+    /// Regions are created and destroyed on the service thread and backed on the GPU thread. Never
+    /// held across kernel calls: the GPU thread takes it (BackSparseWrite).
     std::recursive_mutex m_region_mutex;
-    std::condition_variable_any m_region_cv; ///< Signalled when a pending sparse block resolves
+    std::condition_variable_any m_reserve_cv; ///< Wakes FillReserve
+    std::vector<MappedBacking> m_reserve; ///< Mapped and cleared memory for sparse blocks
+    bool m_reserve_wanted{};    ///< A lazily backed region was created
+    bool m_reserve_exhausted{}; ///< The last fill found no memory; again once backing is freed or a block defers
+    std::deque<std::pair<u64, u64>> m_deferred_blocks; ///< BlockDeferred (region, block), oldest first
+    u64 m_deferred_count{};     ///< Blocks that had to wait for memory
+    std::stop_source m_reserve_stop;
+    std::jthread m_reserve_thread; ///< FillReserve, joined by the destructor
 
     struct GpuOnlyRegion {
         u64 cpu_address;
         u64 size;
         std::unique_ptr<Kernel::KPageGroup> pages;
+        u64 reserved; ///< Application memory reserved for pages taken from its pool
     };
     struct ReleasedRegion {
         GpuOnlyRegion region;
@@ -1462,6 +1601,46 @@ private:
     u64 m_gpu_only_tile_max{};   ///< Largest such tile, bounds the search
     u64 m_gpu_only_tile_bytes{}; ///< GPU-only region memory the game maps right now
     std::vector<ReleasedRegion> m_released_regions;
+
+    // Takes the destroyed regions the GPU thread is done with. Needs m_region_mutex; FreeBackings
+    // returns their pages to the kernel without it.
+    std::vector<GpuOnlyRegion> TakeReleasedRegions() {
+        std::vector<GpuOnlyRegion> regions;
+        std::erase_if(m_released_regions, [&](ReleasedRegion& released) {
+            if (!released.done->load(std::memory_order_acquire)) {
+                return false;
+            }
+            regions.push_back(std::move(released.region));
+            return true;
+        });
+        return regions;
+    }
+
+    // Unmaps backings and frees their pages. Takes kernel locks: called without m_region_mutex.
+    void FreeBackings(std::vector<GpuOnlyRegion>&& regions) {
+        if (regions.empty()) {
+            return;
+        }
+        auto* const process = system.ApplicationProcess();
+        u64 freed = 0;
+        for (auto& region : regions) {
+            if (process != nullptr &&
+                R_FAILED(process->GetPageTable().UnmapPageGroup(
+                    region.cpu_address, *region.pages, Kernel::KMemoryState::IoMemory))) {
+                LOG_ERROR(Service, "nx2:gpu could not unmap GPU-only backing {:#x}+{:#x}",
+                          region.cpu_address, region.size);
+                continue; // still mapped: keep its pages
+            }
+            region.pages->Close(system.Kernel());
+            ReleaseReservation(region.reserved);
+            freed += region.size;
+        }
+        std::scoped_lock lk{m_region_mutex};
+        m_gpu_only_bytes -= freed;
+        // Memory came back: a fill that found none can try again.
+        m_reserve_exhausted = false;
+        m_reserve_cv.notify_all();
+    }
 
     struct GpuMemory {
         u64 address;
@@ -1774,18 +1953,6 @@ public:
             {232, &INx2Vi2Session::StubReplyZeroed, "Unknown232"},
             {251, &INx2Vi2Session::StubReplyZeroed, "Unknown251"},
             {252, &INx2Vi2Session::StubReplyZeroed, "Unknown252"},
-            {261, &INx2Vi2Session::StubReplyZeroed, "Unknown261"},
-            {262, &INx2Vi2Session::StubReplyZeroed, "Unknown262"},
-            {263, &INx2Vi2Session::StubReplyZeroed, "Unknown263"},
-            {264, &INx2Vi2Session::StubReplyZeroed, "Unknown264"},
-            {265, &INx2Vi2Session::StubReplyZeroed, "Unknown265"},
-            {266, &INx2Vi2Session::StubReplyZeroed, "Unknown266"},
-            {267, &INx2Vi2Session::StubReplyZeroed, "Unknown267"},
-            {268, &INx2Vi2Session::StubReplyZeroed, "Unknown268"},
-            {269, &INx2Vi2Session::StubReplyZeroed, "Unknown269"},
-            {270, &INx2Vi2Session::StubReplyZeroed, "Unknown270"},
-            {271, &INx2Vi2Session::StubReplyZeroed, "Unknown271"},
-            {272, &INx2Vi2Session::StubReplyZeroed, "Unknown272"},
             {301, &INx2Vi2Session::StubReplyZeroed, "Unknown301"},
             {302, &INx2Vi2Session::StubReplyZeroed, "Unknown302"},
             {351, &INx2Vi2Session::StubReplyZeroed, "Unknown351"},
@@ -1825,6 +1992,9 @@ private:
     void PresentClientBuffer(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         ++m_presents;
+        if (Kernel::Nx2ThreadStats::g_enabled) {
+            Kernel::Nx2ThreadStats::OnPresent(&ctx.GetThread());
+        }
         if (Common::DkbFrameTrace::Enabled()) {
             m_vsync->trace_present.store(m_presents, std::memory_order_relaxed);
         }
@@ -1865,7 +2035,16 @@ private:
             frames_ahead = 1;
         }
         const auto entered = std::chrono::steady_clock::now();
-        if (frames_ahead == 1 || (frames_ahead == -1 && !WaitForFrame(~w[22], w[24], true))) {
+        static const bool fence_trace = [] {
+            const char* value = std::getenv("EDEN_NX2_PRESENT_FENCE_TRACE");
+            return value != nullptr && value[0] == '1';
+        }();
+        std::shared_ptr<TracedPresent> traced;
+        if (fence_trace) {
+            traced = TracePresentFence(~w[22], w[24], entered);
+        }
+        const bool auto_reached = frames_ahead == -1 && WaitForFrame(~w[22], w[24], true);
+        if (frames_ahead == 1 || (frames_ahead == -1 && !auto_reached)) {
             LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
                       m_presents, ~w[22], w[24], m_previous_fence_id, m_previous_fence_value,
                       ~w[22] < 192 ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~w[22]) : 0U);
@@ -1893,6 +2072,9 @@ private:
         const auto composited = std::chrono::steady_clock::now();
         PaceToVblank(w[12], ctx.GetThread().GetOwnerProcess());
         const auto paced = std::chrono::steady_clock::now();
+        if (traced) {
+            FinishPresentFence(*traced, frames_ahead == -1 && !auto_reached, paced);
+        }
         if (Common::DkbFrameTrace::Enabled()) {
             const auto ms = [](auto duration) {
                 return std::chrono::duration<double, std::milli>(duration).count();
@@ -1991,6 +2173,131 @@ private:
         bool deadline_reset{};
     } m_frame_trace;
 
+    /// EDEN_NX2_PRESENT_FENCE_TRACE: a present's fence from the present's entry until the GPU
+    /// thread reaches it. The guest action that notes it keeps it alive.
+    struct TracedPresent {
+        u8 kind{};
+        u32 fence_id{};
+        Tegra::Host1x::SyncpointManager::ActionHandle action{};
+        std::chrono::steady_clock::time_point entered{}, returned{};
+        std::atomic<std::chrono::steady_clock::rep> reached{}; ///< 0 until reached
+    };
+    struct FenceTrace {
+        /// At the present's entry: the fence is reached; the guest has submitted the increment
+        /// that reaches it (nvdrv's syncpoint max is at or past it); it has not; nvdrv has no such
+        /// syncpoint; the present has no fence.
+        enum Kind : u8 { Reached, Submitted, Beyond, Unallocated, NoFence, Count };
+        std::deque<std::shared_ptr<TracedPresent>> pending;
+        std::array<u32, Kind::Count> presents{}, suspended{}, gave_up{}, timed{};
+        std::array<double, Kind::Count> total_ms{}, max_ms{};
+        double after_return_ms{};
+        u32 after_return{};
+        u32 window{};
+        u32 last_id{}, last_value{}, last_guest{}, last_max{};
+    } m_fence_trace;
+
+    std::shared_ptr<TracedPresent> TracePresentFence(u32 fence_id, u32 fence_value,
+                                                     std::chrono::steady_clock::time_point entered) {
+        using Clock = std::chrono::steady_clock;
+        using Kind = FenceTrace::Kind;
+        auto& trace = m_fence_trace;
+        const auto ms = [](Clock::duration duration) {
+            return std::chrono::duration<double, std::milli>(duration).count();
+        };
+        // Earlier presents whose fence was reached since.
+        std::erase_if(trace.pending, [&](const std::shared_ptr<TracedPresent>& present) {
+            const auto reached = present->reached.load(std::memory_order_acquire);
+            if (reached == 0) {
+                return false;
+            }
+            const Clock::time_point reached_at{Clock::duration{reached}};
+            const double wait_ms = ms(reached_at - present->entered);
+            ++trace.timed[present->kind];
+            trace.total_ms[present->kind] += wait_ms;
+            trace.max_ms[present->kind] = (std::max)(trace.max_ms[present->kind], wait_ms);
+            if (reached_at > present->returned) {
+                trace.after_return_ms += ms(reached_at - present->returned);
+                ++trace.after_return;
+            }
+            return true;
+        });
+        auto present = std::make_shared<TracedPresent>();
+        present->entered = entered;
+        Kind kind = Kind::NoFence;
+        if (fence_id < 192) {
+            auto& syncpoints = system.Host1x().GetSyncpointManager();
+            auto& nvdrv = system.ServiceManager()
+                              .GetService<Nvidia::NVDRV>("nvdrv", true)
+                              ->GetModule()
+                              ->GetContainer()
+                              .GetSyncpointManager();
+            const bool allocated = nvdrv.IsSyncpointAllocated(fence_id);
+            const u32 submitted = allocated ? nvdrv.PeekSyncpointMaxValue(fence_id) : 0;
+            if (syncpoints.IsReadyGuest(fence_id, fence_value)) {
+                kind = Kind::Reached;
+            } else if (!allocated) {
+                kind = Kind::Unallocated;
+            } else {
+                kind = static_cast<s32>(fence_value - submitted) <= 0 ? Kind::Submitted
+                                                                       : Kind::Beyond;
+            }
+            trace.last_id = fence_id;
+            trace.last_value = fence_value;
+            trace.last_guest = syncpoints.GetGuestSyncpointValue(fence_id);
+            trace.last_max = submitted;
+            if (kind != Kind::Reached) {
+                present->fence_id = fence_id;
+                present->action =
+                    syncpoints.RegisterGuestAction(fence_id, fence_value, [present] {
+                        present->reached.store(Clock::now().time_since_epoch().count(),
+                                               std::memory_order_release);
+                    });
+                trace.pending.push_back(present);
+                if (trace.pending.size() > 64) {
+                    // A fence that is never reached keeps its action registered otherwise.
+                    const auto& dropped = trace.pending.front();
+                    syncpoints.DeregisterGuestAction(dropped->fence_id, dropped->action);
+                    trace.pending.pop_front();
+                }
+            }
+        }
+        present->kind = kind;
+        ++trace.presents[kind];
+        trace.suspended[kind] += system.GPU().HasSuspendedChannels() ? 1 : 0;
+        return present;
+    }
+
+    void FinishPresentFence(TracedPresent& present, bool gave_up,
+                            std::chrono::steady_clock::time_point returned) {
+        using Kind = FenceTrace::Kind;
+        auto& trace = m_fence_trace;
+        present.returned = returned;
+        trace.gave_up[present.kind] += gave_up ? 1 : 0;
+        if (++trace.window < 600) {
+            return;
+        }
+        static constexpr std::array<const char*, Kind::Count> names{
+            "reached at entry", "submitted", "beyond submitted", "not allocated in nvdrv",
+            "no fence"};
+        std::string kinds;
+        for (size_t i = 0; i < Kind::Count; ++i) {
+            kinds += fmt::format(
+                "{} {} {} ({} with a suspended channel, {} auto waits gave up, reached in {:.2f} "
+                "ms mean, {:.2f} max over {})",
+                i == 0 ? "" : ",", names[i], trace.presents[i], trace.suspended[i],
+                trace.gave_up[i], trace.timed[i] == 0 ? 0.0 : trace.total_ms[i] / trace.timed[i],
+                trace.max_ms[i], trace.timed[i]);
+        }
+        LOG_INFO(Service,
+                 "nx2:vi2 present fences, last 600 presents:{}; reached after the present "
+                 "returned: {} presents, {:.2f} ms mean; last fence ({}, {:#x}) guest {:#x} nvdrv "
+                 "max {:#x}",
+                 kinds, trace.after_return,
+                 trace.after_return == 0 ? 0.0 : trace.after_return_ms / trace.after_return,
+                 trace.last_id, trace.last_value, trace.last_guest, trace.last_max);
+        trace = {.pending = std::move(trace.pending)};
+    }
+
     /**
      * Holds this present until the next vblank its word asks for, or for longer when an FPS limit
      * (the setting, or EDEN_NX2_FPS_LIMIT) is below that rate.
@@ -2022,7 +2329,7 @@ private:
         }();
         const bool mkw_dynamic =
             process != nullptr && process->GetProgramId() == Settings::MarioKartWorldProgramId &&
-            process->IsMkwDynamicFpsPatchApplied() && Settings::values.mkw_dynamic_fps.GetValue();
+            process->IsMkwDynamicFpsPatchApplied();
         u32 swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
         if (mkw_dynamic) {
             swap_interval = 1;
@@ -2153,16 +2460,18 @@ private:
 
     // Shows a presented native image: word 5 is the image id, ~word 22 / word 24 the GPU fence
     // (syncpoint, value) to wait for (layout from changes.patch). The image is a block-linear
-    // RGBA8 surface in the console's native GOB layout at GPU address == CPU address.
+    // surface in the console's native GOB layout at GPU address == CPU address.
     // shown_size: the present's word 7, ((height - 1) << 16) | (width - 1) of the area the game drew
     // into from the image's top-left corner (0 when it gives none).
     void Composite(u32 image_id, u32 fence_id, u32 fence_value, u32 shown_size) {
+        NotifyHdrChange();
         u64 address{};
         u32 parent{};
         u64 parent_offset{};
         std::optional<Nx2NativeObjects::VideoTrace> video_trace;
         Nx2ImageLayout layout{};
-        u32 image_format{};
+        Nx2NativeImageFormat image_format{};
+        u32 image_word7{};
         {
             std::scoped_lock lk{m_objects->mutex};
             const auto image = m_objects->images.find(image_id);
@@ -2177,7 +2486,8 @@ private:
             parent = memory->second.parent;
             parent_offset = memory->second.parent_offset + image->second.offset;
             layout = Nx2CalculateImageLayout(image->second.preference.data());
-            image_format = image->second.preference[6];
+            image_format = static_cast<Nx2NativeImageFormat>(image->second.preference[6]);
+            image_word7 = image->second.preference[7];
             if (Nx2VideoTraceEnabled()) {
                 video_trace = m_objects->last_video_write;
             }
@@ -2261,14 +2571,21 @@ private:
             .offset = 0,
             .width = layout.width,
             .height = layout.height,
-            .stride = static_cast<u32>(layout.pitch / 4),
-            // Preference word 6: 1 = RGBA8, 4 = RGB10A2.
-            .pixel_format = image_format == 4 ? android::PixelFormat::Rgba1010102
-                                              : android::PixelFormat::Rgba8888,
+            .stride = static_cast<u32>(
+                layout.pitch / (image_format == Nx2NativeImageFormat::Rgba16Float ? 8 : 4)),
+            .pixel_format = image_format == Nx2NativeImageFormat::Rgba16Float
+                                ? android::PixelFormat::RgbaFp16
+                            : image_format == Nx2NativeImageFormat::Rgb10A2
+                                ? android::PixelFormat::Rgba1010102
+                                : android::PixelFormat::Rgba8888,
             .transform_flags = android::BufferTransformFlags::Unset,
             .crop_rect = {0, 0, static_cast<int>(crop_width), static_cast<int>(crop_height)},
             .blending = Tegra::BlendMode::Opaque,
             .native_tiling = true,
+            .color_space = Nx2NativeImageColorSpace(image_format, m_told_hdr.load()),
+            .linear_unit_luminance = image_format == Nx2NativeImageFormat::Rgba16Float
+                                         ? static_cast<u16>((image_word7 >> 8) & 0xFFFF)
+                                         : u16{},
         }};
         std::vector<Nvidia::NvFence> fences;
         if (fence_id < 192) {
@@ -2375,22 +2692,82 @@ private:
         TipcReplyWords(ctx, {60, 0});
     }
 
-    // nn::vi2::QueryDisplayHdrPaperWhite(display name): u16 paper white in nits. The empty reply
-    // left it to the message buffer's leftovers; answer the BT.2408 reference white.
-    void QueryDisplayHdrPaperWhite(HLERequestContext& ctx) {
-        TipcReplyWords(ctx, {203});
+    // The HDR output the guest is told about: the HDR settings combined with the state of the
+    // monitor showing the game (on Windows: Windows HDR on, the EDID peak, the SDR content
+    // brightness), and HDR only while the host swapchain really presents HDR, so an SDR desktop
+    // or surface gets an SDR frame and an HDR one the game's own HDR.
+    Common::HdrOutput ResolveHostHdrOutput(std::optional<Common::DisplayHdrInfo>& display) {
+        auto& monitor = Common::DisplayHdrMonitor::Instance();
+        monitor.Watch(system.GPU().Renderer().GetRenderWindow().GetWindowInfo().render_surface);
+        display = monitor.Current();
+        const bool vulkan =
+            Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan;
+        return Common::ResolveGuestHdrOutput(
+            display, vulkan ? Settings::values.hdr_mode.GetValue() : Settings::HdrMode::Off,
+            Settings::values.hdr_peak_luminance.GetValue(),
+            Settings::values.hdr_reference_white.GetValue(), monitor.PresentingHdr());
     }
 
-    // nn::vi2::QueryDisplayHdrStatus(display name): u64 HdrOutputFormat, u16. The sdk's
-    // DefaultDisplay::QueryHdrStatus takes format 1 as HDR output and fails with 0x272 on
-    // anything above 1. With the empty auto stub reply it read the request's leftover words as
-    // the format; Kirby Air Riders re-queries whenever its HDR status event fires and rebuilt its
-    // window images every few frames, which showed black. Report SDR output.
-    // nn::vi2::QueryDisplayHdrStatus(display name): u64 output format, u16 peak luminance in
-    // nits. The sdk takes format 1 as SDR and 2 as HDR and fails the query on any other value.
-    // Report SDR output with a typical SDR panel's peak.
+    static u64 HdrOutputKey(const Common::HdrOutput& output) {
+        return (u64{output.enabled} << 32) | (u64{output.peak_luminance} << 16) |
+               output.reference_white;
+    }
+
+    // What the game is told; m_logged_hdr_output keeps the last answer.
+    Common::HdrOutput HostHdrOutput() {
+        std::optional<Common::DisplayHdrInfo> display;
+        const auto output = ResolveHostHdrOutput(display);
+        const u64 logged = HdrOutputKey(output);
+        if (logged != m_logged_hdr_output) {
+            m_logged_hdr_output = logged;
+            LOG_INFO(Service,
+                     "nx2:vi2 HDR status: {} peak {} nits, reference white {} nits (display: {}, "
+                     "swapchain: {})",
+                     output.enabled ? "HDR" : "SDR", output.peak_luminance, output.reference_white,
+                     display ? fmt::format("hdr={} max {} nits, SDR white {} nits",
+                                           display->hdr_enabled, display->max_luminance,
+                                           display->sdr_white_level)
+                             : std::string{"no host query"},
+                     Common::DisplayHdrMonitor::Instance().PresentingHdr() ? "HDR" : "SDR");
+        }
+        return output;
+    }
+
+    // Fires the slots bound to the HDR status and paper white events once the monitor's state
+    // changed what the game was last told (Windows HDR toggled, the window moved to another
+    // monitor, a new HDR calibration or SDR content brightness), so it queries again and switches
+    // between SDR and HDR images. Runs at every present; costs an atomic load while nothing
+    // changes.
+    void NotifyHdrChange() {
+        const u64 generation = Common::DisplayHdrMonitor::Instance().Generation();
+        if (generation == m_hdr_generation) {
+            return;
+        }
+        m_hdr_generation = generation;
+        std::optional<Common::DisplayHdrInfo> display;
+        if (m_hdr_change_slots == 0 || m_logged_hdr_output == ~u64{} ||
+            HdrOutputKey(ResolveHostHdrOutput(display)) == m_logged_hdr_output) {
+            return;
+        }
+        LOG_INFO(Service, "nx2:vi2 display HDR state changed, signalling the game");
+        for (u32 index = 0; index < m_native_events.size(); ++index) {
+            if ((m_hdr_change_slots >> index) & 1 && m_native_events[index]) {
+                m_native_events[index]->Signal(system.Kernel());
+            }
+        }
+    }
+
+    // nn::vi2::QueryDisplayHdrPaperWhite(display name): u16 reference white in nits.
+    void QueryDisplayHdrPaperWhite(HLERequestContext& ctx) {
+        TipcReplyWords(ctx, {HostHdrOutput().reference_white});
+    }
+
+    // Wire reply: u64 output format (1 = SDR, 2 = HDR), u16 peak luminance in nits.
+    // MKW's SDK converts these to public formats 0/1 before DefaultDisplay tests for HDR.
     void QueryDisplayHdrStatus(HLERequestContext& ctx) {
-        TipcReplyWords(ctx, {1, 0, 400});
+        const auto output = HostHdrOutput();
+        m_told_hdr = output.enabled;
+        TipcReplyWords(ctx, {output.enabled ? 2U : 1U, 0, output.peak_luminance});
     }
 
     // 212(u64 layer): u64 bits of the layer's buffer slots that are ready. The client polls it once
@@ -2492,20 +2869,28 @@ private:
         LOG_INFO(Service, "nx2:vi2 261 native event {} -> vsync", index);
         if (index < m_native_events.size() && m_native_events[index]) {
             SetVsyncSlot(index, true);
+            m_hdr_change_slots &= ~(1U << index);
         }
         TipcReplyWords(ctx, {});
     }
 
     // 263/265/267/269/271(u64 display name, u32 index): fire the slot when the display's refresh
     // rate, HDR status, HDR paper white, buffer max resolution or mode capability changes, so the
-    // game re-queries it. None of them change here: fire once so the game reads the current
-    // state, then leave the slot quiet. Kirby Air Riders re-queried its HDR status on every
-    // present while this slot fired with vsync.
+    // game re-queries it. Fire once so the game reads the current state, then leave the slot
+    // quiet; HDR status and paper white fire again when the host monitor changes
+    // (NotifyHdrChange). Kirby Air Riders re-queried its HDR status on every present while this
+    // slot fired with vsync.
     void BindChange(HLERequestContext& ctx) {
         const u32 index = ctx.CommandBuffer()[4];
         LOG_INFO(Service, "nx2:vi2 {} native event {} -> change notification", ctx.GetCommand(), index);
         if (index < m_native_events.size() && m_native_events[index]) {
             SetVsyncSlot(index, false);
+            const u32 command = ctx.GetCommand();
+            if (command == 265 || command == 267) {
+                m_hdr_change_slots |= 1U << index;
+            } else {
+                m_hdr_change_slots &= ~(1U << index);
+            }
             m_native_events[index]->Signal(system.Kernel());
         }
         TipcReplyWords(ctx, {});
@@ -2517,6 +2902,7 @@ private:
         LOG_INFO(Service, "nx2:vi2 {} native event {} unbound", ctx.GetCommand(), index);
         if (index < m_native_events.size() && m_native_events[index]) {
             SetVsyncSlot(index, false);
+            m_hdr_change_slots &= ~(1U << index);
         }
         TipcReplyWords(ctx, {});
     }
@@ -2615,6 +3001,10 @@ private:
     std::shared_ptr<Core::Timing::EventType> m_vsync_timer;
     u64 m_presents{};
     u64 m_shown_layout{}; // image and crop size last logged
+    u64 m_logged_hdr_output{~u64{}}; // HDR status last logged
+    u64 m_hdr_generation{};           // DisplayHdrMonitor generation NotifyHdrChange last saw
+    u32 m_hdr_change_slots{};         // native event slots bound to HDR status / paper white
+    std::atomic<bool> m_told_hdr{};   // the last HDR status answer was HDR
     std::shared_ptr<std::atomic<bool>> m_capture_pending = std::make_shared<std::atomic<bool>>(false);
 };
 
@@ -3547,7 +3937,6 @@ public:
             {403, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission403"},
             {424, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown424"},
             {425, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown425"},
-            {427, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown427"},
             {434, &INx2GraphicsSystemSession::AttachGpuAddressSpace, "AttachGpuAddressSpace"},
             {436, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown436"},
             {461, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown461"},
@@ -3967,8 +4356,11 @@ private:
         image.memory = w[19];
         std::copy_n(w + 2, image.preference.size(), image.preference.begin());
         image.size = Nx2CalculateImageLayout(w + 2).size;
-        LOG_INFO(Service, "nx2:gsv 429 CreateNativeImage memory={} count={} size={:#x} -> id {}",
-                 w[19], w[18], image.size, id);
+        LOG_INFO(Service,
+                 "nx2:gsv {} CreateNativeImage memory={} count={} size={:#x} format={} "
+                 "word7={:#x} -> id {}",
+                 ctx.GetCommand(), w[19], w[18], image.size, image.preference[6],
+                 image.preference[7], id);
         TipcReplyWords(ctx, {id});
     }
 

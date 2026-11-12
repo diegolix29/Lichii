@@ -117,6 +117,10 @@ add_library(video_core STATIC
     native_qmd.h
     native_query_trace.h
     nx2.h
+    nx2_back_idle_trace.cpp
+    nx2_back_idle_trace.h
+    nx2_list_macro_trace.cpp
+    nx2_list_macro_trace.h
     nx2_cmdpage_diag.h
     nx2_debug_control.cpp
     nx2_recipe.cpp
@@ -163,6 +167,8 @@ add_library(video_core STATIC
     renderer_vulkan/present/fsr3.h
     renderer_vulkan/present/fxaa.cpp
     renderer_vulkan/present/fxaa.h
+    renderer_vulkan/present/hdr_convert.cpp
+    renderer_vulkan/present/hdr_convert.h
     renderer_vulkan/present/layer.cpp
     renderer_vulkan/present/layer.h
     renderer_vulkan/present/present_push_constants.h
@@ -186,6 +192,7 @@ add_library(video_core STATIC
     renderer_vulkan/pipeline_build_failure.cpp
     renderer_vulkan/pipeline_build_failure.h
     renderer_vulkan/pipeline_build_trace.h
+    renderer_vulkan/pipeline_eviction_policy.h
     renderer_vulkan/pipeline_helper.h
     renderer_vulkan/pipeline_optimization.h
     renderer_vulkan/pipeline_shader_emission.h
@@ -246,6 +253,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_rasterizer.cpp
     renderer_vulkan/vk_rasterizer.h
     renderer_vulkan/submission_policy.h
+    renderer_vulkan/upload_batch.h
     renderer_vulkan/vk_render_pass_cache.cpp
     renderer_vulkan/vk_render_pass_cache.h
     renderer_vulkan/vk_resource_pool.cpp
@@ -309,6 +317,7 @@ add_library(video_core STATIC
     shader_environment.cpp
     shader_environment.h
     evicted_pointer_slots.h
+    bounded_store.h
     shader_handle_program.h
     shader_jobs.cpp
     shader_jobs.h
@@ -337,6 +346,7 @@ add_library(video_core STATIC
     texture_cache/format_lookup_table.h
     texture_cache/image_base.cpp
     texture_cache/image_base.h
+    texture_cache/eviction_age.h
     texture_cache/host_memory_limit.h
     texture_cache/host_mip_limits.h
     texture_cache/image_info.cpp

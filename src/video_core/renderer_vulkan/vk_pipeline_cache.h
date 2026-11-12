@@ -33,6 +33,7 @@
 #include "shader_recompiler/profile.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/bounded_store.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
@@ -153,6 +154,9 @@ private:
     /// pointers whatever they hold now.
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
         const VideoCommon::EvictedPointerSlots::Slots* keep_pointers = nullptr);
+
+    /// Builds the current key's pipeline again from what an evicted one kept, without translating
+    std::unique_ptr<GraphicsPipeline> RebuildGraphicsPipeline(KeptGraphicsStages kept);
 
     /// Logs a kept pointer slot (an index of keep_pointers) that this translation would otherwise
     /// have classified as no pointer: null, unmapped, or out of range right now.
@@ -405,6 +409,10 @@ private:
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
     VideoCommon::EvictedPointerSlots evicted_pointer_slots;
+    /// The SPIR-V and stage infos of evicted pipelines, which build them again when used again
+    VideoCommon::BoundedStore<GraphicsPipelineCacheKey, KeptGraphicsStages> kept_stages{0};
+    u64 rebuilt_from_kept{};  ///< Since the last eviction
+    u64 translated_again{};   ///< Evicted pipelines translated again since the last eviction
 
     ::Common::unordered_map<ComputePipelineCacheKey, ComputePipelineCacheEntry> compute_cache;
     /// Replaced compute pipelines, destroyed once the GPU and their queued build are done with

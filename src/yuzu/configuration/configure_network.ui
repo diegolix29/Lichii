@@ -42,6 +42,77 @@
           </property>
          </widget>
         </item>
+        <item row="3" column="0" colspan="2">
+         <widget class="QCheckBox" name="lan_play">
+          <property name="toolTip">
+           <string>Plays local wireless games with other Lichii instances or ldn_mitm consoles on the same network, without a room. If you are in a room when a game starts local play, the room is used instead.</string>
+          </property>
+          <property name="text">
+           <string>LAN play</string>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+     </item>
+     <item>
+      <widget class="QGroupBox" name="nextendo_group">
+       <property name="title">
+        <string>Nextendo Network</string>
+       </property>
+       <layout class="QGridLayout" name="nextendo_layout">
+        <item row="0" column="0" colspan="2">
+         <widget class="QCheckBox" name="nextendo_enabled">
+          <property name="text">
+           <string>Play online through Nextendo Network</string>
+          </property>
+         </widget>
+        </item>
+        <item row="1" column="0" colspan="2">
+         <widget class="QLabel" name="nextendo_description">
+          <property name="text">
+           <string>Nextendo Network is a community service that replaces Nintendo's online servers for Switch 1 games. When this is on, those games connect to Nextendo instead of Nintendo and send your Nextendo account token to it. Airplane mode is turned off.</string>
+          </property>
+          <property name="wordWrap">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+        <item row="2" column="0">
+         <widget class="QLabel" name="nextendo_client_id_label">
+          <property name="text">
+           <string>Client ID</string>
+          </property>
+         </widget>
+        </item>
+        <item row="2" column="1">
+         <widget class="QLineEdit" name="nextendo_client_id"/>
+        </item>
+        <item row="3" column="0" colspan="2">
+         <widget class="QLabel" name="nextendo_status">
+          <property name="wordWrap">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+        <item row="4" column="0" colspan="2">
+         <layout class="QHBoxLayout" name="nextendo_buttons">
+          <item>
+           <widget class="QPushButton" name="nextendo_sign_in">
+            <property name="text">
+             <string>Sign in to Nextendo</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPushButton" name="nextendo_sign_out">
+            <property name="text">
+             <string>Sign out</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </item>
        </layout>
       </widget>
      </item>

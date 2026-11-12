@@ -551,6 +551,22 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         first_next = &diagnostics_nv;
     }
 
+    // AMD's driver fails device-local allocations once the heap is full unless overallocation is
+    // allowed, which lets them fall back to system memory.
+    VkDeviceMemoryOverallocationCreateInfoAMD overallocation_amd{
+        .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_OVERALLOCATION_CREATE_INFO_AMD,
+        .pNext = first_next,
+        .overallocationBehavior = VK_MEMORY_OVERALLOCATION_BEHAVIOR_ALLOWED_AMD,
+    };
+    if (is_amd_driver &&
+        supported_extensions.contains(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME)) {
+        loaded_extensions.insert(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME);
+        first_next = &overallocation_amd;
+        LOG_INFO(Render_Vulkan,
+                 "VK_AMD_memory_overallocation_behavior enabled: device memory may overflow into "
+                 "system memory");
+    }
+
     is_blit_depth24_stencil8_supported = TestDepthStencilBlits(VK_FORMAT_D24_UNORM_S8_UINT);
     is_blit_depth32_stencil8_supported = TestDepthStencilBlits(VK_FORMAT_D32_SFLOAT_S8_UINT);
     is_optimal_astc_supported = ComputeIsOptimalAstcSupported();

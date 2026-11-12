@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <set>
@@ -142,11 +143,38 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
     return targets;
 }
 
+/// The address range of every loaded module, sorted.
+using Modules = std::vector<std::pair<DWORD64, DWORD64>>;
+
+Modules LoadedModules() {
+    Modules modules;
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return modules;
+    }
+    MODULEENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    for (BOOL ok = Module32FirstW(snapshot, &entry); ok; ok = Module32NextW(snapshot, &entry)) {
+        const auto begin = reinterpret_cast<DWORD64>(entry.modBaseAddr);
+        modules.emplace_back(begin, begin + entry.modBaseSize);
+    }
+    CloseHandle(snapshot);
+    std::sort(modules.begin(), modules.end());
+    return modules;
+}
+
+bool InModule(const Modules& modules, DWORD64 address) {
+    const auto next = std::upper_bound(modules.begin(), modules.end(),
+                                       std::pair{address, ~DWORD64{0}});
+    return next != modules.begin() && address < std::prev(next)->second;
+}
+
 // Walks a suspended thread's stack from its context. Nothing here may allocate: the thread
 // could be paused holding the heap lock. A wrong unwind step (code with missing or wrong unwind
 // data) leaves a garbage stack pointer: reading through it crashed the process, so the walk
 // stops once the stack pointer leaves the thread's stack.
-unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_TIB* tib) {
+unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_TIB* tib,
+              const Modules& modules) {
     if (tib == nullptr) {
         return 0;
     }
@@ -157,11 +185,16 @@ unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames, const NT_T
     unsigned depth = 0;
     while (depth < MaxDepth && context.Rip != 0 && on_stack(context.Rsp)) {
         frames[depth++] = context.Rip;
+        // Generated code ends the walk. The JIT's unwind data describes its entry prologue only,
+        // so unwinding from inside a block restores guest values as registers, and the next
+        // frame that reads its stack through a frame pointer crashed the process.
+        if (!InModule(modules, context.Rip)) {
+            break;
+        }
         DWORD64 image_base{};
         const PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
         if (function == nullptr) {
-            // A leaf function (no unwind data): its return address is on top of the stack. JIT
-            // code has none either; past the first frame, stop there.
+            // A leaf function (no unwind data): its return address is on top of the stack.
             if (depth != 1) {
                 break;
             }
@@ -356,6 +389,7 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
     if (targets.empty()) {
         return "no thread matches";
     }
+    const Modules modules = LoadedModules();
     std::vector<Sample> samples;
     samples.reserve(static_cast<size_t>(seconds * 1100.0) * targets.size() + 16);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
@@ -371,7 +405,7 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
             if (GetThreadContext(handle, &context)) {
                 Sample& sample = samples.emplace_back();
                 sample.thread = i;
-                sample.depth = Walk(context, sample.frames, targets[i].tib);
+                sample.depth = Walk(context, sample.frames, targets[i].tib, modules);
             }
             ResumeThread(handle);
         }

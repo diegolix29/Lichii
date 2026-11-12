@@ -111,6 +111,9 @@ private:
                         RequestType request, float multiplier,
                         Settings::BasicSetting* other_setting, const QString& suffix);
 
+    // Marks the widget as set for this game, for the stylesheet and the global combo box text.
+    void SetCustom(bool custom);
+
     QLabel* CreateLabel(const QString& text);
     QWidget* CreateCheckBox(Settings::BasicSetting* bool_setting, const QString& label,
                             std::function<std::string()>& serializer,

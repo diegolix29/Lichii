@@ -31,6 +31,8 @@
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/memory_detect.h"
+#include "common/zstd_compression.h"
 #include "common/thread.h"
 #include "common/thread_worker.h"
 #include "core/core.h"
@@ -55,6 +57,7 @@
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/mesh_fallback_limits.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
+#include "video_core/renderer_vulkan/pipeline_eviction_policy.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_shader_emission.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
@@ -186,6 +189,29 @@ Shader::AttributeType AttributeType(const FixedPipelineState& state, size_t inde
         return Shader::AttributeType::UnsignedInt;
     }
     return Shader::AttributeType::Disabled;
+}
+
+// Switch 2 geometry shaders may write all 32 generic outputs next to Position and Layer: 133
+// components where Vulkan devices allow 128 (maxGeometryOutputComponents). AMD's Windows driver
+// closed the emulator compiling such a shader at the Mario Tennis Fever match start. Drop the
+// outputs the fragment shader never reads; skipped where it can't tell (legacy, indexed, XFB) and
+// for passthrough shaders the host runs natively (no IR writes the outputs there).
+void PruneUnreadGeometryOutputs(Shader::IR::Program& geometry, const Shader::IR::Program& fragment,
+                                const GraphicsPipelineCacheKey& key, bool native_passthrough) {
+    const Shader::Info& fs{fragment.info};
+    Shader::VaryingState& stores{geometry.info.stores};
+    if (fragment.stage != Shader::Stage::Fragment || key.state.xfb_enabled ||
+        (geometry.is_geometry_passthrough && native_passthrough) || fs.loads_indexed_attributes ||
+        fs.loads.Legacy() || stores.Legacy()) {
+        return;
+    }
+    for (size_t index = 0; index < Shader::IR::NUM_GENERICS; ++index) {
+        if (!fs.loads.Generic(index)) {
+            for (size_t element = 0; element < 4; ++element) {
+                stores.Set(Shader::IR::Attribute::Generic0X + index * 4 + element, false);
+            }
+        }
+    }
 }
 
 Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> programs,
@@ -444,8 +470,8 @@ std::vector<u32> ReadKeptSpirv(std::ifstream& file, std::pair<u64, u32> blob) {
 }
 
 /// A shader stage from the SPIR-V the preparation step kept (precompiled_infos), on a worker.
-vk::ShaderModule BuildKeptSpirv(const Device& device, const std::filesystem::path& path,
-                                std::pair<u64, u32> blob, u64 pipeline_hash) {
+std::vector<u32> LoadKeptSpirv(const std::filesystem::path& path, std::pair<u64, u32> blob,
+                               u64 pipeline_hash) {
     thread_local std::ifstream file;
     thread_local std::filesystem::path file_path;
     thread_local std::vector<u8> compressed;
@@ -467,8 +493,14 @@ vk::ShaderModule BuildKeptSpirv(const Device& device, const std::filesystem::pat
         throw Shader::LogicError("Precompiled pipeline {:016x}: kept SPIR-V unreadable",
                                  pipeline_hash);
     }
-    return BuildShader(device, std::span<const u32>(reinterpret_cast<const u32*>(words.data()),
-                                                    words.size() / sizeof(u32)));
+    std::vector<u32> code(words.size() / sizeof(u32));
+    std::memcpy(code.data(), words.data(), code.size() * sizeof(u32));
+    return code;
+}
+
+vk::ShaderModule BuildKeptSpirv(const Device& device, const std::filesystem::path& path,
+                                std::pair<u64, u32> blob, u64 pipeline_hash) {
+    return BuildShader(device, LoadKeptSpirv(path, blob, pipeline_hash));
 }
 constexpr u32 NoInfo = ~0U;
 
@@ -479,19 +511,13 @@ void AddRuntimeSpirvTime(size_t thread, std::chrono::steady_clock::time_point be
         std::memory_order::relaxed);
 }
 
-vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& profile,
-                                 const Shader::RuntimeInfo& runtime_info,
-                                 Shader::IR::Program& program, Shader::Backend::Bindings& binding,
-                                 u64 shader_hash, size_t stage_index,
-                                 std::span<const u32> reference = {},
-                                 std::vector<u32>* code_out = nullptr) {
-    const auto code =
-        EmitPipelineShader(profile, runtime_info, program, binding, shader_hash, reference);
-    if (code_out) {
-        *code_out = code;
-    }
+std::vector<u32> EmitStageSpirv(const Device& device, const Shader::Profile& profile,
+                                const Shader::RuntimeInfo& runtime_info,
+                                Shader::IR::Program& program, Shader::Backend::Bindings& binding,
+                                u64 shader_hash, size_t stage_index,
+                                std::span<const u32> reference = {}) {
+    auto code = EmitPipelineShader(profile, runtime_info, program, binding, shader_hash, reference);
     device.SaveShader(code);
-    vk::ShaderModule module{BuildShader(device, code)};
 
     // Text log + .spv dump. Text log is gated by gpu_log_level != Off; .spv dump
     // is independent and gated only by gpu_log_shader_dumps.
@@ -512,12 +538,7 @@ vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& p
                                          std::span<const u32>(code.data(), code.size()));
         }
     }
-
-    if (device.HasDebuggingToolAttached()) {
-        const std::string name{fmt::format("Shader {:016x}", shader_hash)};
-        module.SetObjectNameEXT(name.c_str());
-    }
-    return module;
+    return code;
 }
 
 vk::ShaderModule EmitComputeModule(const Device& device, const Shader::Profile& profile,
@@ -739,6 +760,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue() &&
                                 !device_.DriverCachesPipelines()},
       serialization_thread(1, "VkPipelineSerialization", {}, Common::ThreadPlacement::Background) {
+    // A sixty-fourth of the RAM (16 GB: 256 MB), about 25 KB per evicted pipeline
+    const u64 ram = Common::GetMemInfo().TotalPhysicalMemory;
+    kept_stages = decltype(kept_stages){ram != 0 ? ram / 64 : u64{256} << 20};
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -1018,13 +1042,19 @@ u64 IrBytes(std::span<const Shader::IR::Program> programs) {
     return bytes;
 }
 
-// EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
-bool PreloadAllPipelines() {
-    static const bool all = [] {
-        const char* value = std::getenv("EDEN_NX2_PRELOAD_ALL_PIPELINES");
-        return value != nullptr && value[0] == '1';
-    }();
-    return all;
+// A graphics pipeline unused for this many frames (~2.5 min at 60 FPS) may be destroyed.
+constexpr u64 EvictAfterFrames = 9000;
+
+/// Built graphics pipelines kept before unused ones are destroyed (KeptPipelinesForMemory). 0 on
+/// Android, where driver memory is short: every pipeline unused for EvictAfterFrames is destroyed
+/// there, except up to MaxUnusedPrebuiltPipelines prebuilt ones no draw has used.
+size_t KeptPipelines() {
+#ifdef __ANDROID__
+    return 0;
+#else
+    static const size_t kept = KeptPipelinesForMemory(Common::GetMemInfo().TotalPhysicalMemory);
+    return kept;
+#endif
 }
 } // Anonymous namespace
 
@@ -1566,6 +1596,16 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
     size_t compute_records = 0;
     size_t skipped_pipelines = 0;
     size_t queued_graphics = 0;
+    // build_all_cached_shaders: the rest too, in the room the recent sessions' pipelines leave
+    // under the pipelines kept built
+    const bool build_all = Settings::values.build_all_cached_shaders.GetValue();
+    const size_t kept_pipelines = KeptPipelines();
+    const size_t boot_used =
+        used_pipelines.empty() ? MaxPipelinesWithoutUsedList : used_pipelines.size();
+    const size_t spare_pipelines = kept_pipelines == 0
+                                       ? std::numeric_limits<size_t>::max()
+                                       : kept_pipelines - std::min(kept_pipelines, boot_used);
+    size_t queued_spare = 0;
     for (const CacheV2::LogRecord* const planned : plan) {
         const CacheV2::LogRecord& record = *planned;
         if (stop_loading.stop_requested()) {
@@ -1600,9 +1640,11 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
         if (!disk_pipelines.insert(hash).second) {
             continue;
         }
-        if (PreloadAllPipelines() || (used_pipelines.empty()
-                                          ? queued_graphics < MaxPipelinesWithoutUsedList
-                                          : used_pipelines.contains(hash))) {
+        const bool used = used_pipelines.empty() ? queued_graphics < MaxPipelinesWithoutUsedList
+                                                 : used_pipelines.contains(hash);
+        const bool spare = !used && build_all && queued_spare < spare_pipelines;
+        if (used || spare) {
+            queued_spare += spare ? 1 : 0;
             ++queued_graphics;
             boot_graphics.emplace_back(index, *key);
             continue;
@@ -1770,6 +1812,11 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
     }
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+    if (kept_pipelines != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Unused graphics pipelines are destroyed only past {} built{}", kept_pipelines,
+                 build_all ? "; all cached ones are built at boot up to that" : "");
+    }
     if (skipped_pipelines != 0) {
         LOG_INFO(Render_Vulkan,
                  "{} cached graphics pipelines skipped at boot, {} {} for background prebuild",
@@ -1883,9 +1930,16 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
             file.read(magic.data(), magic.size())
                 .read(reinterpret_cast<char*>(&version), sizeof(version));
             constexpr std::array<char, 8> expected_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
-            if (magic != expected_magic || version != CACHE_VERSION) {
-                LOG_WARNING(Render_Vulkan, "Shader precache: {} is not a version {} file", path,
-                            CACHE_VERSION);
+            // The file holds environments only, which read the same in every compatible version:
+            // one from an older version is built again under this one (the marker carries it).
+            const auto& compatible = VideoCommon::CompatibleVulkanPipelineCacheVersions;
+            if (magic != expected_magic ||
+                (version != CACHE_VERSION &&
+                 std::ranges::find(compatible, version) == compatible.end())) {
+                LOG_WARNING(Render_Vulkan,
+                            "Shader precache: {} is a version {} file, not {} or a compatible "
+                            "one; pre-compile the game's shaders again",
+                            path, version, CACHE_VERSION);
                 throw std::runtime_error("wrong version");
             }
             while (file.tellg() != end) {
@@ -2811,22 +2865,21 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::MakeKeptGraphicsPipeline(
         }
         spirv_blobs[stage] = precompiled_info_blobs[record.spirv[stage]];
     }
-    auto build_kept = [this, hash = key.Hash(), path = precompiled_infos_path, spirv_blobs,
-                       present] {
-        std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
-        for (size_t stage = 0; stage < modules.size(); ++stage) {
+    auto build_kept = [hash = key.Hash(), path = precompiled_infos_path, spirv_blobs, present] {
+        std::array<std::vector<u32>, Maxwell::MaxShaderStage> code;
+        for (size_t stage = 0; stage < code.size(); ++stage) {
             if (present[stage]) {
-                modules[stage] = BuildKeptSpirv(device, path, spirv_blobs[stage], hash);
+                code[stage] = LoadKeptSpirv(path, spirv_blobs[stage], hash);
             }
         }
         precompiled_from_spirv.fetch_add(1, std::memory_order_relaxed);
-        return modules;
+        return code;
     };
     auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, pipeline_binaries.get(),
         &shader_notify, device, descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
         BuildQueue(true), nullptr, render_pass_cache, key,
-        std::array<vk::ShaderModule, Maxwell::MaxShaderStage>{}, info_ptrs, std::move(build_kept),
+        std::array<std::vector<u32>, Maxwell::MaxShaderStage>{}, info_ptrs, std::move(build_kept),
         std::nullopt);
     pipeline->MarkPrecompiled();
     return pipeline;
@@ -2998,18 +3051,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
             throw Shader::LogicError("Precompiled pipeline {:016x} is not drawn natively",
                                      key.Hash());
         }
-        std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
+        std::array<std::vector<u32>, Maxwell::MaxShaderStage> code;
         Shader::Backend::Bindings binding;
-        for (size_t stage = 0; stage < modules.size(); ++stage) {
+        for (size_t stage = 0; stage < code.size(); ++stage) {
             if (stages.runtime_infos[stage].has_value() != present[stage]) {
                 throw Shader::LogicError("Precompiled pipeline {:016x}: other stages", key.Hash());
             }
             if (!present[stage]) {
                 continue;
             }
-            modules[stage] = EmitShaderModule(device, profile, *stages.runtime_infos[stage],
-                                              stages.programs[stage + 1], binding,
-                                              key.unique_hashes[stage + 1], stage);
+            code[stage] = EmitStageSpirv(device, profile, *stages.runtime_infos[stage],
+                                         stages.programs[stage + 1], binding,
+                                         key.unique_hashes[stage + 1], stage);
             std::vector<u8> translated, stored;
             Shader::SerializeInfo(stages.programs[stage + 1].info, translated);
             Shader::SerializeInfo(infos[stage], stored);
@@ -3020,7 +3073,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
             }
         }
         precompiled_drawn.fetch_add(1, std::memory_order_relaxed);
-        return modules;
+        return code;
     };
     u64 recorded_bytes = 0;
     for (const FileEnvironment& env : *recorded) {
@@ -3030,7 +3083,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeli
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, pipeline_binaries.get(),
         &shader_notify, device, descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
         BuildQueue(true, TranslationBytes(recorded_bytes)), nullptr, render_pass_cache,
-        graphics_key, std::array<vk::ShaderModule, Maxwell::MaxShaderStage>{}, info_ptrs,
+        graphics_key, std::array<std::vector<u32>, Maxwell::MaxShaderStage>{}, info_ptrs,
         std::move(emit_stages), std::nullopt);
     pipeline->MarkPrecompiled();
     return pipeline;
@@ -3418,7 +3471,13 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
         }
         if (!pipeline) {
             const auto keep = evicted_pointer_slots.Take(graphics_key.Hash());
-            pipeline = CreateGraphicsPipeline(keep ? &*keep : nullptr);
+            if (auto kept = kept_stages.Take(graphics_key)) {
+                pipeline = RebuildGraphicsPipeline(std::move(*kept));
+                ++rebuilt_from_kept;
+            } else {
+                translated_again += keep ? 1 : 0;
+                pipeline = CreateGraphicsPipeline(keep ? &*keep : nullptr);
+            }
         }
     } else if (StutterTrace::Enabled() && pipeline && !pipeline->WasUsed()) {
         StutterTrace::CountLookup(StutterTrace::Lookup::GraphicsPrebuilt);
@@ -3463,68 +3522,82 @@ void PipelineCache::TickFrame() {
 void PipelineCache::EvictUnusedPipelines() {
     // Building a pipeline again on MoltenVK means a Metal compile mid-game, far dearer than the
     // rebuild cost below, so none are evicted there.
-    if (device.IsMoltenVK()) {
+    if (device.IsMoltenVK() || frame_count <= EvictAfterFrames) {
         return;
     }
-    // EDEN_NX2_PRELOAD_ALL_PIPELINES asked for every cached pipeline built: evicting the ones not
-    // used yet threw the preload away after 9000 frames (Ocarina: 22,510 of 24,285, then rebuilt
-    // one by one in new places).
-    if (PreloadAllPipelines()) {
-        return;
-    }
-    // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
-    // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
-    // this long is destroyed; rebuilding it later requires a full GPU-thread shader translation
-    // (~8.5 ms each) plus a driver pipeline cache hit.
-    // EDEN_NX2_EVICT_AFTER_FRAMES=<frames> changes the limit; 0 keeps every pipeline.
-    static const u64 EvictAfterFrames = [] {
-        const char* value = std::getenv("EDEN_NX2_EVICT_AFTER_FRAMES");
-        return value ? std::strtoull(value, nullptr, 10) : u64{9000};
-    }();
-    if (EvictAfterFrames == 0 || frame_count <= EvictAfterFrames) {
-        return;
-    }
+    // An evicted pipeline used again is translated again on the GPU thread (~8.5 ms) and built
+    // from the driver's pipeline cache (2-3 ms on NVIDIA, a full compile on some AMD drivers), and
+    // a place visited again after a few minutes needs hundreds of them at once (OoT: 8,158
+    // rebuilt in 80 min, multi-second freezes). So they go only past the kept limit, least
+    // recently used first; a prebuilt one no draw has used counts as used at boot.
     const u64 cutoff = frame_count - EvictAfterFrames;
+    std::vector<GraphicsPipelineCacheKey> evict;
+    if (const size_t kept = KeptPipelines(); kept != 0) {
+        const size_t built = static_cast<size_t>(
+            std::ranges::count_if(graphics_cache, [](const auto& entry) {
+                return entry.second != nullptr && entry.second->IsBuilt();
+            }));
+        if (built <= kept) {
+            return;
+        }
+        std::vector<GraphicsPipelineCacheKey> keys;
+        std::vector<u64> last_uses;
+        for (const auto& [key, pipeline] : graphics_cache) {
+            if (pipeline != nullptr && pipeline.get() != current_pipeline && pipeline->IsBuilt() &&
+                pipeline->LastUse() < cutoff) {
+                keys.push_back(key);
+                last_uses.push_back(pipeline->WasUsed() ? pipeline->LastUse() : 0);
+            }
+        }
+        for (const size_t index : PipelinesToEvict(last_uses, built, kept)) {
+            evict.push_back(keys[index]);
+        }
+    } else if (!Settings::values.build_all_cached_shaders.GetValue()) {
+        // Prebuilt pipelines no draw has used stay up to this budget (~0.9 GB of driver memory):
+        // evicting them throws the prebuild away (OoT: 1174 of 1346 evicted on the title screen,
+        // 684 rebuilt in 10 s on entering the field).
+        constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
+        size_t kept_prebuilt = 0;
+        for (const auto& [key, pipeline] : graphics_cache) {
+            if (pipeline == nullptr || pipeline.get() == current_pipeline ||
+                !pipeline->IsBuilt() || pipeline->LastUse() >= cutoff) {
+                continue;
+            }
+            if (!pipeline->WasUsed() && kept_prebuilt < MaxUnusedPrebuiltPipelines) {
+                ++kept_prebuilt;
+                continue;
+            }
+            evict.push_back(key);
+        }
+    }
+    if (evict.empty()) {
+        return;
+    }
     const u64 tick = scheduler.CurrentTick();
-    // ~0.9 GB of driver memory at ~0.45 MB each.
-    constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
-    size_t kept_prebuilt = 0;
-    size_t evicted = 0;
-    for (auto it = graphics_cache.begin(); it != graphics_cache.end();) {
-        GraphicsPipeline* const pipeline = it->second.get();
-        if (pipeline == nullptr || pipeline == current_pipeline || !pipeline->IsBuilt() ||
-            pipeline->LastUse() >= cutoff) {
-            ++it;
-            continue;
-        }
-        // A pipeline built from the disk cache at boot that no draw has used yet stays, up to a
-        // budget: evicting it throws the prebuild away, and the game translates it again on the
-        // GPU thread when it reaches that content (OoT: 1174 of 1346 evicted on the title screen,
-        // 684 rebuilt in 10 s on entering the field). Past the budget they go like the rest, so a
-        // large cache can't hold their driver memory for the whole session.
-        if (!pipeline->WasUsed() && kept_prebuilt < MaxUnusedPrebuiltPipelines) {
-            ++kept_prebuilt;
-            ++it;
-            continue;
-        }
-        if (used_this_session.erase(pipeline) != 0) {
+    for (const GraphicsPipelineCacheKey& key : evict) {
+        const auto it = graphics_cache.find(key);
+        if (used_this_session.erase(it->second.get()) != 0) {
             used_and_evicted.insert(it->first.Hash());
         }
-        evicted_pointer_slots.Remember(it->first.Hash(), pipeline->MappedPointers());
+        evicted_pointer_slots.Remember(it->first.Hash(), it->second->MappedPointers());
+        KeptGraphicsStages kept = it->second->TakeKeptStages();
+        const u64 bytes = kept.Bytes();
+        kept_stages.Add(it->first, std::move(kept), bytes);
         evicted_pipelines.emplace_back(tick, std::move(it->second));
-        it = graphics_cache.erase(it);
-        ++evicted;
-    }
-    if (evicted == 0) {
-        return;
+        graphics_cache.erase(it);
     }
     for (auto& [key, pipeline] : graphics_cache) {
         if (pipeline) {
             pipeline->ClearTransitions();
         }
     }
-    LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
-             EvictAfterFrames, graphics_cache.size());
+    LOG_INFO(Render_Vulkan,
+             "Evicted {} graphics pipelines unused for {} frames, {} left; {} evicted ones kept "
+             "for a rebuild ({} KiB), {} rebuilt from them and {} translated again since the last",
+             evict.size(), EvictAfterFrames, graphics_cache.size(), kept_stages.Size(),
+             kept_stages.Bytes() >> 10, rebuilt_from_kept, translated_again);
+    rebuilt_from_kept = 0;
+    translated_again = 0;
 }
 
 /// Returns `pipeline` when it is built or the current draw must wait for it, and nullptr when the
@@ -3617,6 +3690,34 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
         }
     }
     return discard ? nullptr : pipeline;
+}
+
+std::unique_ptr<GraphicsPipeline> PipelineCache::RebuildGraphicsPipeline(KeptGraphicsStages kept) {
+    std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
+    for (size_t stage = 0; stage < infos.size(); ++stage) {
+        infos[stage] = kept.infos[stage].get();
+    }
+    const u64 bytes = kept.Bytes();
+    auto emit = [spirv = std::move(kept.spirv)] {
+        std::array<std::vector<u32>, Maxwell::MaxShaderStage> code;
+        for (size_t stage = 0; stage < code.size(); ++stage) {
+            if (spirv[stage].empty()) {
+                continue;
+            }
+            const std::vector<u8> data = Common::Compression::DecompressDataZSTD(spirv[stage]);
+            code[stage].resize(data.size() / sizeof(u32));
+            std::memcpy(code[stage].data(), data.data(), code[stage].size() * sizeof(u32));
+        }
+        return code;
+    };
+    auto pipeline = std::make_unique<GraphicsPipeline>(
+        scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, pipeline_binaries.get(),
+        &shader_notify, device, descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
+        BuildQueue(true, bytes), nullptr, render_pass_cache, graphics_key,
+        std::array<std::vector<u32>, Maxwell::MaxShaderStage>{}, infos, std::move(emit),
+        std::move(kept.mesh_emulation));
+    pipeline->SetMappedPointers(std::move(kept.mapped_pointers));
+    return pipeline;
 }
 
 bool PipelineCache::TranslateGraphicsStages(
@@ -3966,6 +4067,11 @@ bool PipelineCache::TranslateGraphicsStages(
             }
         }
         ConvertLegacyToGeneric(program, runtime_info);
+        if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry)) {
+            PruneUnreadGeometryOutputs(
+                program, programs[static_cast<size_t>(Maxwell::ShaderType::Pixel)], key,
+                device.IsNvGeometryShaderPassthroughSupported());
+        }
         // EDEN_NX2_MESH_EMULATION_DUMP=<dir>: write the emulation's vertex shader for spirv-val.
         // (Emitting the mesh program a second time here to dump its compute shader crashed the
         // build that followed, so only the vertex shader is written.)
@@ -4019,8 +4125,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             infos[stage] = &stages.programs[stage + 1].info;
         }
     }
-    std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
-    std::function<std::array<vk::ShaderModule, Maxwell::MaxShaderStage>()> emit_stages;
+    std::array<std::vector<u32>, Maxwell::MaxShaderStage> stage_spirv;
+    std::function<std::array<std::vector<u32>, Maxwell::MaxShaderStage>()> emit_stages;
     if (defer_emission) {
         auto job = std::make_shared<DeferredStages>();
         job->reservation = std::move(ir_reservation);
@@ -4037,14 +4143,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         emit_stages = [this, job = std::move(job), hashes = key.unique_hashes]() mutable {
             const auto begin = std::chrono::steady_clock::now();
-            std::array<vk::ShaderModule, Maxwell::MaxShaderStage> stage_modules;
+            std::array<std::vector<u32>, Maxwell::MaxShaderStage> spirv;
             Shader::Backend::Bindings stage_binding;
-            for (size_t stage = 0; stage < stage_modules.size(); ++stage) {
+            for (size_t stage = 0; stage < spirv.size(); ++stage) {
                 if (job->runtime_infos[stage]) {
-                    stage_modules[stage] =
-                        EmitShaderModule(device, profile, *job->runtime_infos[stage],
-                                         job->programs[stage + 1], stage_binding,
-                                         hashes[stage + 1], stage, job->reference_spirv[stage]);
+                    spirv[stage] =
+                        EmitStageSpirv(device, profile, *job->runtime_infos[stage],
+                                       job->programs[stage + 1], stage_binding, hashes[stage + 1],
+                                       stage, job->reference_spirv[stage]);
                 }
             }
             auto completed_pools = std::move(job->pools);
@@ -4055,30 +4161,41 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 ReturnPools(std::move(stage));
             }
             AddRuntimeSpirvTime(1, begin);
-            return stage_modules;
+            return spirv;
         };
     } else {
         Shader::Backend::Bindings binding;
-        for (size_t stage = 0; stage < modules.size(); ++stage) {
+        for (size_t stage = 0; stage < stage_spirv.size(); ++stage) {
             if (!stages.runtime_infos[stage]) {
                 continue;
             }
             const auto begin = std::chrono::steady_clock::now();
-            modules[stage] = EmitShaderModule(device, profile, *stages.runtime_infos[stage],
-                                              stages.programs[stage + 1], binding,
-                                              key.unique_hashes[stage + 1], stage, {},
-                                              spirv_out ? &(*spirv_out)[stage] : nullptr);
+            stage_spirv[stage] = EmitStageSpirv(device, profile, *stages.runtime_infos[stage],
+                                                stages.programs[stage + 1], binding,
+                                                key.unique_hashes[stage + 1], stage);
+            if (spirv_out) {
+                (*spirv_out)[stage] = stage_spirv[stage];
+            }
             if (build_in_parallel) {
                 AddRuntimeSpirvTime(0, begin);
             }
         }
     }
-    return std::make_unique<GraphicsPipeline>(
+    static_assert(VideoCommon::EvictedPointerSlots::NumPrograms == Maxwell::MaxShaderProgram);
+    VideoCommon::EvictedPointerSlots::Slots mapped_pointers;
+    for (size_t index = 0, mapped_env = 0; index < Maxwell::MaxShaderProgram; ++index) {
+        if (key.unique_hashes[index] != 0) {
+            mapped_pointers[index] = envs[mapped_env++]->MappedStoragePointerKeys();
+        }
+    }
+    auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, pipeline_binaries.get(),
         &shader_notify, device, descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
         BuildQueue(build_in_parallel, defer_emission ? deferred_ir_bytes : 0), statistics,
-        render_pass_cache, key, std::move(modules), infos, std::move(emit_stages),
+        render_pass_cache, key, std::move(stage_spirv), infos, std::move(emit_stages),
         std::move(stages.mesh_emulation));
+    pipeline->SetMappedPointers(std::move(mapped_pointers));
+    return pipeline;
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();

@@ -211,6 +211,17 @@ struct UserConfig {
     // Maximum size is limited by the maximum length of a x86_64 / arm64 jump.
     std::uint32_t code_cache_size = 128 * 1024 * 1024;  // bytes
 
+    /// Diagnostics: when set, the x64 backend counts here the dispatcher's C++ block lookups,
+    /// the blocks it compiles and full code cache clears. The thread that runs the JIT writes
+    /// them (a clear asked for while it is idle runs on the asking thread); JITs that run on the
+    /// same host thread may share one.
+    struct Counters {
+        std::uint64_t block_lookups = 0;
+        std::uint64_t blocks_compiled = 0;
+        std::uint64_t cache_clears = 0;
+    };
+    Counters* counters = nullptr;
+
     /// Determines if we should detect memory accesses via page_table that straddle are
     /// misaligned. Accesses that straddle page boundaries will fallback to the relevant
     /// memory callback.

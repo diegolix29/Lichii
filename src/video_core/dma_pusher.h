@@ -178,6 +178,10 @@ public:
         return puller.HasPendingAcquire() || pending_list_tick.has_value();
     }
     [[nodiscard]] bool CanResumeAcquire();
+    /// Suspended on the GPU's copy of a command list.
+    [[nodiscard]] bool WaitsForListCopy() const {
+        return pending_list_tick.has_value();
+    }
 
     void BindSubchannel(Engines::EngineInterface* engine, u32 subchannel_id, Engines::EngineTypes engine_type) {
         subchannels[subchannel_id] = engine;
@@ -315,6 +319,8 @@ public:
     std::optional<u64> pending_list_tick;
     /// The entry parsed next was suspended on pending_list_tick, which is done now.
     bool resumed_list_read{};
+    /// When the channel suspended on pending_list_tick (EDEN_NX2_LIST_MACRO_TRACE), else 0.
+    u64 list_trace_wait_start{};
 
     // Not bitfields: the fence thread sets synced, and a bitfield write would rewrite the byte it
     // shares with dma_increment_once and signal_sync (#479).

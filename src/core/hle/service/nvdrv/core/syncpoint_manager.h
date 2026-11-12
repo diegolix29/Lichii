@@ -74,6 +74,14 @@ public:
     u32 ReadSyncpointMinValue(u32 id);
 
     /**
+     * @return The maximum value of the syncpoint, without checking that it is allocated
+     * (IsSyncpointAllocated)
+     */
+    u32 PeekSyncpointMaxValue(u32 id) const {
+        return syncpoints[id].counter_max.load(std::memory_order_relaxed);
+    }
+
+    /**
      * @brief Synchronises the minimum value of the syncpoint to with the GPU
      * @return The new minimum value of the syncpoint
      */

@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -137,6 +138,10 @@ struct PerfStatsResults;
 
 FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
                                          const std::string& path);
+
+/// The id of the Switch 2 program in a game file, or nothing for any other program.
+std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 program_id,
+                                      std::size_t program_index);
 
 /// Enumeration representing the return values of the System Initialize and Load process.
 enum class SystemResultStatus : u32 {

@@ -5,13 +5,29 @@
 
 #include <memory>
 #include <vector>
+#include <QIcon>
 #include <QString>
 #include <QWidget>
 #include <qobjectdefs.h>
 
 class QObject;
+class QScrollArea;
+class QSize;
 
 namespace ConfigurationShared {
+
+/// A category or tab icon from the Lichii icon set, accent coloured when selected.
+QIcon PageIcon(const QString& name);
+
+/// Wraps a settings tab in a frameless scroll area, so a long tab scrolls inside its dialog
+/// instead of growing the dialog past the screen.
+QScrollArea* ScrollTab(QWidget* tab);
+
+/// Draws the check boxes under root as switches, for settings that turn a feature on or off.
+void UseToggles(QWidget* root);
+
+/// Resizes a dialog to its preferred size, shrunk to fit the screen it opens on.
+void FitToScreen(QWidget* dialog, const QSize& preferred);
 
 class Tab : public QWidget {
     Q_OBJECT

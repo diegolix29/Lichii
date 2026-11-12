@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -35,19 +36,17 @@ public:
     void AddToNx(const std::string& archive_path);
     void RemoveFromNx(const std::string& archive_path);
     /// Sets the title, publisher and icon the game list shows, in place.
-    void EditNxMetadata(const std::string& archive_path);
+    void EditNxMetadata(const std::string& archive_path, const std::function<bool()>& prepare_write);
 
 signals:
     /// A conversion or an edit started (true) or ended (false).
     void RunningChanged(bool running);
     /// An archive was created or changed: the game list must be refreshed.
     void ArchivesChanged();
+    void MetadataWriteFinished();
 
 private:
     struct Job;
-    /// Loads nxformat before the first call into it; tells the user and returns false when it
-    /// can't be loaded.
-    bool LoadNxformat();
     void Start(std::shared_ptr<Job> job);
     void Finished(std::shared_ptr<Job> job, int code, QString error);
     void ReplyOriginal(Job& job, const QString& text);

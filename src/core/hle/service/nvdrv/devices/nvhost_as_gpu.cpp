@@ -6,8 +6,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <utility>
 
 #include "common/alignment.h"
@@ -16,6 +19,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "core/core.h"
+#include "core/hle/kernel/k_process.h"
 #include "core/hle/service/nvdrv/core/container.h"
 #include "core/hle/service/nvdrv/core/heap_mapper.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
@@ -24,6 +28,7 @@
 #include "core/hle/service/nvdrv/devices/nvhost_gpu.h"
 #include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
 #include "core/hle/service/nvdrv/nvdrv.h"
+#include "core/memory.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
@@ -32,6 +37,53 @@
 #include "video_core/rasterizer_interface.h"
 
 namespace Service::Nvidia::Devices {
+
+namespace {
+
+// A device (SMMU) range keeps the host pages that backed its CPU range when it was mapped. The
+// ranges are reused by CPU address and size: when nx2:gpu 102 destroyed the memory, the game
+// can unmap it and map new pages at the same address, register it again, and get the old device
+// range back. The GPU then reads the old pages, which the kernel may already have given to other
+// data (Ocarina of Time: meshes whose index and vertex bytes were an actor pack and texture
+// blocks, white areas after area changes). Points the range at the current pages again.
+void Nx2RefreshBacking(Tegra::MaxwellDeviceMemoryManager& smmu, Core::Memory::Memory& memory,
+                       Core::Asid asid, DAddr device_address, u64 cpu_address, u64 size) {
+    constexpr u64 PageSize = Core::Memory::YUZU_PAGESIZE;
+    constexpr uintptr_t PageMask = static_cast<uintptr_t>(Core::Memory::YUZU_PAGEMASK);
+    if ((cpu_address & Core::Memory::YUZU_PAGEMASK) != 0 ||
+        (device_address & Core::Memory::YUZU_PAGEMASK) != 0) {
+        return;
+    }
+    u64 stale_pages = 0;
+    u64 first_stale = 0;
+    for (u64 offset = 0; offset < size; offset += PageSize) {
+        const auto device_page =
+            reinterpret_cast<uintptr_t>(smmu.GetPointer<u8>(device_address + offset));
+        const auto cpu_page = reinterpret_cast<uintptr_t>(
+            memory.GetPointerSilent(Common::ProcessAddress{cpu_address + offset}));
+        if ((device_page & ~PageMask) != (cpu_page & ~PageMask)) {
+            if (stale_pages++ == 0) {
+                first_stale = offset;
+            }
+        }
+    }
+    if (stale_pages == 0) {
+        return;
+    }
+    static std::atomic<u32> reports{};
+    if (reports.fetch_add(1, std::memory_order_relaxed) < 256) {
+        LOG_WARNING(Service_NVDRV,
+                    "Switch 2 device range {:#x} of CPU {:#x}+{:#x}: {} of {} pages point at old "
+                    "memory (first at +{:#x}), mapped again",
+                    device_address, cpu_address, size, stale_pages,
+                    (size + PageSize - 1) / PageSize, first_stale);
+    }
+    // Unmapping drops the old pages from the reverse map and invalidates the caches over the range.
+    smmu.Unmap(device_address, size);
+    smmu.Map(device_address, cpu_address, size, asid, true);
+}
+
+} // namespace
 
 nvhost_as_gpu::nvhost_as_gpu(Core::System& system_, Module& module_, NvCore::Container& core)
     : nvdevice{system_}, module{module_}, container{core}, nvmap{core.GetNvMapFile()}, vm{},
@@ -146,6 +198,7 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     // The same CPU range is often mapped twice (at its own address and in a sparse region), so
     // reuse its SMMU mapping.
     Nx2DeviceRange range{};
+    bool fresh = false; ///< Mapped to the current pages just now
     if (const auto it = nx2_device_ranges.find({cpu_address, size}); it != nx2_device_ranges.end()) {
         range = it->second;
     } else if (session->has_preallocated_area && session->mapper->IsInBounds(cpu_address, size)) {
@@ -156,6 +209,7 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
             const DAddr address = smmu.Allocate(Common::AlignUp(size, 0x20000));
             if (address != 0) {
                 smmu.Map(address, cpu_address, size, session->asid, true);
+                fresh = true;
             }
             return address;
         };
@@ -179,8 +233,19 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     Nx2GpuMemoryRegistry::Get().RecordDeviceRange(cpu_address, size, device_address);
     // On the GPU thread, like unmaps: a GMMU map takes the texture cache lock, and the callers hold
     // nx2:gpu locks that the GPU thread takes under that lock (sparse blocks backed on write).
+    // A reused range is checked there too, before the GMMU map, against the pages the CPU range
+    // has now (Nx2RefreshBacking).
+    auto process = fresh ? nullptr
+                         : std::make_shared<Kernel::KScopedAutoObject<Kernel::KProcess>>(
+                               system.Kernel(), session->process);
     system.GPU().MapInOrder(
-        gpu_address, size, [gmmu = gmmu.get(), gpu_address, device_address, size] {
+        gpu_address, size,
+        [gmmu = gmmu.get(), &smmu = system.Host1x().MemoryManager(), process = std::move(process),
+         asid = session->asid, gpu_address, cpu_address, device_address, size] {
+            if (process) {
+                Nx2RefreshBacking(smmu, process->GetPointerUnsafe()->GetMemory(), asid,
+                                  device_address, cpu_address, size);
+            }
             gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
         });
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x}", gpu_address, size,
@@ -199,31 +264,28 @@ void nvhost_as_gpu::Nx2Unmap(u64 gpu_address, u64 size) {
 
 void nvhost_as_gpu::Nx2Release(u64 cpu_address, u64 size) {
     std::scoped_lock lock(mutex);
-    const auto it = nx2_device_ranges.find({cpu_address, size});
-    if (it == nx2_device_ranges.end()) {
-        return;
-    }
-    const Nx2DeviceRange range = it->second;
-    nx2_device_ranges.erase(it);
-    if (range.shared &&
-        !Nx2GpuMemoryRegistry::Get().ReleaseDeviceRange(range.asid, cpu_address, size)) {
-        return; // another address space of the process still maps it
-    }
     auto* session = container.GetSession(nx2_session);
-    auto* const mapper = range.heap && session != nullptr ? session->mapper.get() : nullptr;
     auto& smmu = system.Host1x().MemoryManager();
-    // Queued after the GPU unmaps of the range, so the GPU thread is done with it.
-    system.GPU().RunInOrder([&smmu, mapper, range, cpu_address, size] {
-        if (range.heap) {
-            if (mapper != nullptr) {
-                mapper->Unmap(cpu_address, size);
-            }
-            return;
+    Nx2EraseContainedRanges(nx2_device_ranges, cpu_address, size, [&](u64 range_cpu, u64 range_size,
+                                                                      const Nx2DeviceRange& range) {
+        if (range.shared &&
+            !Nx2GpuMemoryRegistry::Get().ReleaseDeviceRange(range.asid, range_cpu, range_size)) {
+            return; // another address space of the process still maps it
         }
-        smmu.Unmap(range.address, size);
-        smmu.Free(range.address, Common::AlignUp(size, 0x20000));
+        auto* const mapper = range.heap && session != nullptr ? session->mapper.get() : nullptr;
+        // Queued after the GPU unmaps of the range, so the GPU thread is done with it.
+        system.GPU().RunInOrder([&smmu, mapper, range, range_cpu, range_size] {
+            if (range.heap) {
+                if (mapper != nullptr) {
+                    mapper->Unmap(range_cpu, range_size);
+                }
+                return;
+            }
+            smmu.Unmap(range.address, range_size);
+            smmu.Free(range.address, Common::AlignUp(range_size, 0x20000));
+        });
+        LOG_DEBUG(Service_NVDRV, "Switch 2 released backing {:#x}+{:#x}", range_cpu, range_size);
     });
-    LOG_DEBUG(Service_NVDRV, "Switch 2 released backing {:#x}+{:#x}", cpu_address, size);
 }
 
 void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
@@ -278,8 +340,13 @@ void nvhost_as_gpu::Nx2BackSparse(u64 gpu_address, u64 cpu_address, u64 size) {
     if (size > region_size || gpu_address - start > region_size - size) {
         return;
     }
-    system.Host1x().MemoryManager().Map(device_address + (gpu_address - start), cpu_address, size,
-                                        session->asid, true);
+    auto& smmu = system.Host1x().MemoryManager();
+    const DAddr device = device_address + (gpu_address - start);
+    if (cpu_address == 0) {
+        smmu.KeepWrites(device, size);
+        return;
+    }
+    smmu.Map(device, cpu_address, size, session->asid, true);
 }
 
 void nvhost_as_gpu::Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size) {

@@ -14,7 +14,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "core/crypto/key_manager.h"
 #include "core/file_sys/card_image.h"
+#include "core/file_sys/content_archive.h"
 #include "core/file_sys/errors.h"
 #include "core/file_sys/fssystem/fssystem_bucket_tree.h"
 #include "core/file_sys/fssystem/fssystem_compression_configuration.h"
@@ -297,6 +299,14 @@ TEST_CASE("NCA with an AES-XTS section opens a storage", "[core][file_sys]") {
     auto nca = MakeSha256Nca();
     nca.fs.encryption_type = NcaFsHeader::EncryptionType::AesXts;
     REQUIRE(nca.Open() == ResultSuccess);
+}
+
+TEST_CASE("NCA without a header key reports the missing key", "[core][file_sys]") {
+    if (Core::Crypto::KeyManager::Instance().HasKey(Core::Crypto::S256KeyType::Header)) {
+        SKIP("A header key is installed");
+    }
+    const NCA nca{MakeFile(std::vector<u8>(0xC00, 0xA5))};
+    CHECK(nca.GetStatus() == Loader::ResultStatus::ErrorMissingHeaderKey);
 }
 
 TEST_CASE("NCA rejects a file shorter than its header", "[core][file_sys]") {

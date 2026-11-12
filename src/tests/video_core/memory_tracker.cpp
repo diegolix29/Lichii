@@ -700,6 +700,29 @@ TEST_CASE("MemoryTracker: FlushCachedWrites batching") {
     REQUIRE(rasterizer.Count() == WORD * 2 / PAGE - 3);
 }
 
+TEST_CASE("MemoryTracker: engine writes leave their pages tracked", "[video_core]") {
+    RasterizerInterface rasterizer;
+    std::optional<MemoryTracker> memory_track(rasterizer);
+    memory_track->UnmarkRegionAsCpuModified(c, WORD * 2);
+    REQUIRE(rasterizer.Count() == WORD * 2 / PAGE);
+    const auto update_calls = rasterizer.UpdateCalls();
+
+    memory_track->MarkRegionAsWrittenTracked(c + PAGE, PAGE * 2);
+    REQUIRE(rasterizer.UpdateCalls() == update_calls);
+    REQUIRE(rasterizer.Count() == WORD * 2 / PAGE);
+    REQUIRE(memory_track->ModifiedCpuRegion(c, WORD * 2) == Range{c + PAGE, c + PAGE * 3});
+
+    memory_track->UnmarkRegionAsCpuModified(c, WORD * 2);
+    REQUIRE(rasterizer.UpdateCalls() == update_calls);
+    REQUIRE(rasterizer.Count() == WORD * 2 / PAGE);
+    REQUIRE_FALSE(memory_track->IsRegionCpuModified(c, WORD * 2));
+
+    memory_track->MarkRegionAsWrittenTracked(c + PAGE, PAGE);
+    memory_track->MarkRegionAsCpuModified(c + PAGE, PAGE);
+    REQUIRE(rasterizer.Count() == WORD * 2 / PAGE - 1);
+    REQUIRE(rasterizer.Count(c + PAGE) == 0);
+}
+
 TEST_CASE("MemoryTracker: cached writes preserve tracking counts") {
     RasterizerInterface rasterizer;
     std::optional<MemoryTracker> memory_track(rasterizer);

@@ -10,10 +10,13 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "common/thread_worker.h"
@@ -77,6 +80,16 @@ class RescalingPushConstant;
 class RenderAreaPushConstant;
 class Scheduler;
 
+/// EDEN_NX2_DRAW_REUSE_PROBE=1: how many draws repeat the previous frame's slowly changing state,
+/// and what preparing them costs (RasterizerVulkan::NoteDrawReuse).
+inline bool DrawReuseProbeEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_DRAW_REUSE_PROBE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
 /// Mesh emulation on a device without VK_EXT_mesh_shader: the mesh program (stage 0) is built as
 /// a compute shader that writes its output to a storage buffer, and this vertex shader draws it
 /// (see Shader::Backend::SPIRV::EmitMeshEmulationVertex).
@@ -100,6 +113,19 @@ struct MeshEmulationSetup {
     std::array<u32, 4> position_lines{~0U, ~0U, ~0U, ~0U}; ///< line of PositionX..W
 };
 
+/// What an evicted graphics pipeline needs to be built again without translating its shaders
+struct KeptGraphicsStages {
+    static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
+
+    std::array<std::vector<u8>, NUM_STAGES> spirv; ///< zstd, empty for absent stages
+    std::array<std::unique_ptr<Shader::Info>, NUM_STAGES> infos;
+    std::optional<MeshEmulationSetup> mesh_emulation;
+    VideoCommon::EvictedPointerSlots::Slots mapped_pointers;
+
+    /// Memory it holds, roughly
+    [[nodiscard]] u64 Bytes() const noexcept;
+};
+
 class GraphicsPipeline {
     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
 
@@ -112,12 +138,14 @@ public:
         GuestDescriptorQueue& guest_descriptor_queue,
         DescriptorBufferRing& descriptor_buffer_ring, const PipelineBuildQueue& build_queue,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
-        const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
+        const GraphicsPipelineCacheKey& key, std::array<std::vector<u32>, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
-        std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {},
+        std::function<std::array<std::vector<u32>, NUM_STAGES>()> emit_stages = {},
         std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt);
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
+    /// Draws resolved from the texture memo and in full since the last call.
+    static std::pair<u64, u64> TakeTextureMemoCounts() noexcept;
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
@@ -131,7 +159,8 @@ public:
         VideoCommon::SamplerId sampler;
     };
 
-    /// The sampled textures of the last configured draw, kept while a sampled frame dump runs.
+    /// The sampled textures of the last configured draw, kept while a sampled frame dump or the
+    /// draw reuse probe runs.
     std::span<const SampledImage> SampledImages() const noexcept {
         return sampled_images;
     }
@@ -260,6 +289,10 @@ public:
     void SetMappedPointers(VideoCommon::EvictedPointerSlots::Slots slots) noexcept {
         mapped_pointers = std::move(slots);
     }
+
+    /// Moves out the SPIR-V kept after the build, with the stage infos: for a built pipeline being
+    /// evicted
+    [[nodiscard]] KeptGraphicsStages TakeKeptStages();
 
     /// Forgets the transitions, which may point to pipelines the cache evicted.
     void ClearTransitions() noexcept {
@@ -398,7 +431,9 @@ private:
     u64 last_use_frame{};
     bool used{};
 
+    std::array<std::vector<u32>, NUM_STAGES> spirv; ///< Until the build makes its modules
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
+    std::array<std::vector<u8>, NUM_STAGES> kept_spirv; ///< zstd, after the build
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
     std::array<bool, NUM_STAGES> stage_present{};

@@ -9,6 +9,7 @@
 #include <list>
 
 #include "common/math_util.h"
+#include "video_core/renderer_vulkan/present/hdr_convert.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Layout {
@@ -22,7 +23,6 @@ struct FramebufferConfig;
 namespace Vulkan {
 
 class Device;
-struct Frame;
 class Layer;
 class Scheduler;
 class RasterizerVulkan;
@@ -33,9 +33,11 @@ public:
                              vk::ShaderModule&& fragment_shader);
     ~WindowAdaptPass();
 
+    /// Draws the layers into framebuffer, each converted to the encoding output.
     void Draw(const Device& device, RasterizerVulkan& rasterizer, Scheduler& scheduler, size_t image_index,
               std::list<Layer>& layers, std::span<const Tegra::FramebufferConfig> configs,
-              const Layout::FramebufferLayout& layout, Frame* dst);
+              const Layout::FramebufferLayout& layout, VkFramebuffer framebuffer,
+              VkExtent2D extent, const HdrPresent& output);
 
     VkDescriptorSetLayout GetDescriptorSetLayout();
     VkRenderPass GetRenderPass();

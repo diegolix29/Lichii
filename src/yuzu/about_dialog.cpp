@@ -26,8 +26,13 @@ AboutDialog::AboutDialog(QWidget* parent)
     const QIcon yuzu_logo = QIcon::fromTheme(QStringLiteral("io.github.zortos293.lichii"),
                                            QIcon(QStringLiteral(":/img/lichii.ico")));
     if (!yuzu_logo.isNull()) {
-        ui->labelLogo->setPixmap(yuzu_logo.pixmap(200));
+        ui->labelLogo->setPixmap(yuzu_logo.pixmap(112));
     }
+    ui->labelYuzu->setPixmap(QIcon(QStringLiteral(":/img/lichii_wordmark.png")).pixmap(113, 48));
+    ui->labelYuzu->setAccessibleName(QStringLiteral("Lichii"));
+    ui->verticalLayout_3->setContentsMargins(32, 28, 32, 20);
+    ui->horizontalLayout->setSpacing(32);
+    ui->verticalLayout->setSpacing(10);
     ui->labelBuildInfo->setText(
         ui->labelBuildInfo->text().arg(QString::fromStdString(yuzu_build_version),
                                        QString::fromUtf8(Common::g_build_date).left(10)));

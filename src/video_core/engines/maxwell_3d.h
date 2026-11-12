@@ -3281,6 +3281,11 @@ public:
     /// A vertex stream's address, size or limit (not its stride or enable).
     static bool IsFastDrawVertexBuffer(u32 method);
     void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);
+    /// Writes constant buffer data at `offset` (`bytes` within the buffer) through the buffer
+    /// CB_ADDRESS and CB_SIZE select, translated once per selection and memory map. False, having
+    /// done nothing, where the general path has to: the buffer isn't one mapped device range, it
+    /// can reach the texture or sampler headers, or the write lands on Switch 2 sparse memory.
+    bool WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes);
 
     /// Handles a write to the CB_DATA[i] register.
     void ProcessCBData(u32 value);
@@ -3293,9 +3298,48 @@ private:
 
     void ProcessMacro(Core::System& system, u32 method, const u32* base_start, u32 amount, bool is_last_call);
 
-    u32 ProcessShadowRam(u32 method, u32 argument);
+    /// The value a write leaves in the register, as the shadow RAM mode has it: the argument
+    /// (tracked in shadow_state when tracking), or the shadow copy when replaying. Defined here,
+    /// as the hot method paths call it for nearly every write.
+    u32 ProcessShadowRam(u32 method, u32 argument) {
+        const auto control = shadow_state.shadow_ram_control;
+        if (control == Regs::ShadowRamControl::Track ||
+            control == Regs::ShadowRamControl::TrackWithFilter) {
+            return shadow_state.reg_array[method] = argument;
+        }
+        if (control == Regs::ShadowRamControl::Replay) {
+            return shadow_state.reg_array[method];
+        }
+        return argument;
+    }
 
-    void ProcessDirtyRegisters(u32 method, u32 argument);
+    /// Stores a register's value and sets its dirty flags. Defined here for the same reason.
+    void ProcessDirtyRegisters(u32 method, u32 argument) {
+        // The instances after the first are drawn together once their loop ends, and they must see
+        // the state they were begun with: NVN's draw macros reset the base instance (and its copy
+        // in c[0][0x644]) right after the loop, before the macro returns.
+        if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) {
+            draw_manager.DrawDeferred(*this, true);
+        }
+        // A changed register that doesn't only parameterize the next draw ends fast draw reuse.
+        if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
+            !IsFastDrawParameter(method)) {
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
+        }
+        regs.reg_array[method] = argument;
+        for (const auto& table : dirty.tables) {
+            dirty.flags[table[method]] = true;
+        }
+    }
+
+    /// CallMethodFast for a state register (not in execution_mask): a write of the value the
+    /// register holds changes nothing (EDEN_NX2_SKIP_SAME=0 keeps it).
+    void WriteStateRegister(u32 method, u32 method_argument) {
+        const u32 argument = ProcessShadowRam(method, method_argument);
+        if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
+            ProcessDirtyRegisters(method, argument);
+        }
+    }
 
     void ConsumeSinkImpl(Core::System& system) override;
 
@@ -3360,6 +3404,18 @@ private:
     VideoCommon::Nx2FastDraw::DeviceSpans fast_draw_header_spans;
     VideoCommon::Nx2FastDraw::DeviceSpans fast_draw_sampler_spans;
 
+    /// The constant buffer WriteBoundConstantBuffer last translated, and the state it read.
+    struct BoundConstantBuffer {
+        GPUVAddr address{};
+        u32 size{};
+        u64 map_serial{};
+        GPUVAddr tic{};
+        u64 tic_size{};
+        GPUVAddr tsc{};
+        u64 tsc_size{};
+        DAddr device{}; ///< 0: the general path writes its data
+    } bound_constant_buffer;
+
     VideoCore::RasterizerInterface* rasterizer = nullptr;
 
     /// Start offsets of each macro in macro_memory
@@ -3395,7 +3451,8 @@ private:
     // loads nx2_switches.txt.
     const bool trace_first_method_writes = std::getenv("EDEN_NX2_3D_METHODS") != nullptr;
     // EDEN_NX2_SKIP_SAME and EDEN_NX2_PERF_VERIFY, read per engine like the switch above. Every
-    // method checks them, so they are members rather than statics with a guard on the hot path.
+    // method checks them, so they are members rather than function statics (MSVC reads a
+    // thread-local to check a static's initialization on every call).
     const bool skip_same_value_writes = [] {
         const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
         return value == nullptr || value[0] != '0';

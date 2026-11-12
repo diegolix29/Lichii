@@ -4,7 +4,11 @@
 // SPDX-FileCopyrightText: 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <memory>
+#include <tuple>
+#include <QScrollArea>
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -12,6 +16,7 @@
 #include "qt_common/config/uisettings.h"
 #include "qt_common/util/vk.h"
 #include "ui_configure.h"
+#include "yuzu/configuration/configuration_shared.h"
 #include "yuzu/configuration/configure_applets.h"
 #include "yuzu/configuration/configure_audio.h"
 #include "yuzu/configuration/configure_cpu.h"
@@ -91,6 +96,32 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
     general_tab->SetResetCallback([&] { this->close(); });
 
     SetConfiguration();
+
+    const std::array<std::pair<QWidget*, const char*>, 15> tab_icons{{
+        {general_tab.get(), "sliders"},
+        {hotkeys_tab.get(), "keyboard"},
+        {ui_tab.get(), "list"},
+        {web_tab.get(), "cloud"},
+        {debug_tab_tab.get(), "bug"},
+        {system_tab.get(), "system"},
+        {profile_tab.get(), "user"},
+        {network_tab.get(), "globe"},
+        {filesystem_tab.get(), "drive"},
+        {applets_tab.get(), "apps"},
+        {cpu_tab.get(), "cpu"},
+        {graphics_tab.get(), "monitor"},
+        {graphics_advanced_tab.get(), "layers"},
+        {graphics_extensions_tab.get(), "wand"},
+        {audio_tab.get(), "audio"},
+    }};
+    for (const auto& [tab, icon] : tab_icons) {
+        tab->setProperty("tabIcon", QString::fromLatin1(icon));
+        ConfigurationShared::UseToggles(tab);
+    }
+    for (auto* const tab : input_tab->GetSubTabs()) {
+        tab->setProperty("tabIcon", QStringLiteral("gamepad"));
+    }
+
     PopulateSelectionList();
 
     connect(ui->tabWidget, &QTabWidget::currentChanged, this, [this](int index) {
@@ -110,7 +141,9 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
                 &ConfigureDialog::HandleApplyButtonClicked);
     }
 
-    adjustSize();
+    ui->selectorList->setFixedWidth(std::max(184, ui->selectorList->sizeHintForColumn(0) +
+                                                      2 * ui->selectorList->frameWidth() + 32));
+    ConfigurationShared::FitToScreen(this, QSize(1040, 760));
     ui->selectorList->setCurrentRow(0);
 
     // Selects the leftmost button on the bottom bar (Cancel as of writing)
@@ -171,25 +204,29 @@ void ConfigureDialog::HandleApplyButtonClicked() {
 Q_DECLARE_METATYPE(QList<QWidget*>);
 
 void ConfigureDialog::PopulateSelectionList() {
-    const std::array<std::pair<QString, QList<QWidget*>>, 6> items{
+    const std::array<std::tuple<QString, const char*, QList<QWidget*>>, 6> items{
         {{tr("General"),
+          "sliders",
           {general_tab.get(), hotkeys_tab.get(), ui_tab.get(), web_tab.get(), debug_tab_tab.get()}},
          {tr("System"),
+          "system",
           {system_tab.get(), profile_tab.get(), network_tab.get(), filesystem_tab.get(),
            applets_tab.get()}},
-         {tr("CPU"), {cpu_tab.get()}},
+         {tr("CPU"), "cpu", {cpu_tab.get()}},
          {tr("Graphics"),
+          "monitor",
           {graphics_tab.get(), graphics_advanced_tab.get(), graphics_extensions_tab.get()}},
-         {tr("Audio"), {audio_tab.get()}},
-         {tr("Controls"), input_tab->GetSubTabs()}},
+         {tr("Audio"), "audio", {audio_tab.get()}},
+         {tr("Controls"), "gamepad", input_tab->GetSubTabs()}},
     };
 
     [[maybe_unused]] const QSignalBlocker blocker(ui->selectorList);
 
     ui->selectorList->clear();
-    for (const auto& entry : items) {
-        auto* const item = new QListWidgetItem(entry.first);
-        item->setData(Qt::UserRole, QVariant::fromValue(entry.second));
+    for (const auto& [name, icon, tabs] : items) {
+        auto* const item =
+            new QListWidgetItem(ConfigurationShared::PageIcon(QString::fromLatin1(icon)), name);
+        item->setData(Qt::UserRole, QVariant::fromValue(tabs));
 
         ui->selectorList->addItem(item);
     }
@@ -219,6 +256,12 @@ void ConfigureDialog::UpdateVisibleTabs() {
 
     for (auto* const tab : tabs) {
         LOG_DEBUG(Frontend, "{}", tab->accessibleName().toStdString());
-        ui->tabWidget->addTab(tab, tab->accessibleName());
+        auto& area = scroll_areas[tab];
+        if (area == nullptr) {
+            area = ConfigurationShared::ScrollTab(tab);
+        }
+        ui->tabWidget->addTab(area,
+                              ConfigurationShared::PageIcon(tab->property("tabIcon").toString()),
+                              tab->accessibleName());
     }
 }

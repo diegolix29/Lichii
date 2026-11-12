@@ -207,6 +207,12 @@ public:
         }
     }
 
+    /// InnerInvalidation of constant buffer data (MemoryManager::WriteConstantBufferData).
+    virtual void InvalidateConstantBufferData(
+        std::span<const std::pair<DAddr, std::size_t>> sequences) {
+        InnerInvalidation(sequences);
+    }
+
     /// Notify rasterizer that any caches of the specified region are desync with guest
     virtual void OnCacheInvalidation(PAddr addr, u64 size) = 0;
 
@@ -273,7 +279,8 @@ public:
         const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
         const Tegra::Engines::Fermi2D::Surface& motion_vectors,
         const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
-        std::array<f32, 2> motion_scale, bool use_history = true) {
+        std::array<f32, 2> motion_scale, bool use_history = true,
+        std::optional<std::array<u32, 2>> render_region = std::nullopt) {
         return false;
     }
 

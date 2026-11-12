@@ -9,6 +9,7 @@
 #include <memory>
 #include <vector>
 #include <QDialog>
+#include <QHash>
 #include "configuration/shared_widget.h"
 #include "qt_common/config/shared_translation.h"
 #include "qt_common/util/vk.h"
@@ -97,4 +98,7 @@ private:
     std::unique_ptr<ConfigureProfileManager> profile_tab;
     std::unique_ptr<ConfigureSystem> system_tab;
     std::unique_ptr<ConfigureWeb> web_tab;
+
+    /// The scroll area each tab is shown in, created when its category is first opened.
+    QHash<QWidget*, QScrollArea*> scroll_areas;
 };

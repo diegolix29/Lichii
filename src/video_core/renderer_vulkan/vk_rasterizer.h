@@ -9,6 +9,7 @@
 #include <array>
 #include <optional>
 #include <string_view>
+#include <unordered_set>
 
 #include <boost/container/static_vector.hpp>
 
@@ -124,6 +125,8 @@ public:
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
+    void InvalidateConstantBufferData(
+        std::span<const std::pair<DAddr, std::size_t>> sequences) override;
     void OnCacheInvalidation(DAddr addr, u64 size) override;
     void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) override;
     bool TryCacheInvalidation(DAddr addr, u64 size) override;
@@ -162,7 +165,8 @@ public:
                                    const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                                    const Tegra::Texture::TICEntry* depth,
                                    std::array<f32, 2> jitter,
-                                   std::array<f32, 2> motion_scale, bool use_history = true) override;
+                                   std::array<f32, 2> motion_scale, bool use_history,
+                                   std::optional<std::array<u32, 2>> render_region) override;
     VideoCommon::OotNetwork::BypassState* OotNetworkBypass() override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
@@ -248,6 +252,8 @@ private:
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
+    /// Clears a 3D color target whose slices the framebuffer can't reach. Returns true when handled.
+    bool ClearVolumeSlices(const Framebuffer* framebuffer, u32 first_slice, u32 slice_count);
     void FrameDumpPass(const Framebuffer* framebuffer);
     /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
     void TracePendingCpuWrites(bool compute, std::span<const u64> shader_hashes);
@@ -382,6 +388,12 @@ private:
     u64 mesh_arena_size{64ULL << 20};
     /// The current submission's arena, after its counter is reset.
     const MeshArena& AcquireMeshArena();
+    /// Mesh emulation: the draw's staging buffers, held until its commands are recorded.
+    /// Configure can submit (an ASTC decode, a full descriptor buffer ring), so the tick when
+    /// they were requested may be older than the submission that writes them.
+    boost::container::static_vector<StagingBufferRef, 4> mesh_draw_buffers;
+    bool mesh_arena_used{};
+    void ReleaseMeshEmulationBuffers();
 
     /// Fast draw (nx2_fast_draw.h): what the last recorded draw left bound.
     struct ReusableDraw {
@@ -444,12 +456,35 @@ private:
     /// The pipeline the draw can take the delta path with, or null for a full resolve. Clears
     /// the remembered draw either way: only a recorded draw remembers one again.
     GraphicsPipeline* TakeReusableDraw(bool is_indexed, bool is_indirect);
+    void InvalidateCachedWrites(std::span<const std::pair<DAddr, std::size_t>> sequences,
+                                bool constant_buffer_data);
     /// Whether the draw TakeReusableDraw took still holds once the caches are locked (serial and
     /// map_serial as read then), and the images it samples need no preparing.
     bool DeltaStillHolds(u64 serial, u64 map_serial);
     void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
                           u64 map_serial);
     void ReportFastDraws();
+
+    /// EDEN_NX2_DRAW_REUSE_PROBE: a configured draw's key (state that rarely changes between
+    /// frames, leaving out uniform buffers) was in the previous frame, only earlier in this one,
+    /// or in neither.
+    enum class DrawReuse : u8 { Hit, Repeat, Miss, Count };
+    struct DrawReuseProbe {
+        std::unordered_set<u64> previous_frame;
+        std::unordered_set<u64> frame;
+        std::array<std::array<u64, static_cast<size_t>(DrawPath::Count)>,
+                   static_cast<size_t>(DrawReuse::Count)>
+            draws{}, prepare_ns{};
+        u64 gate_ns{}; ///< Full-path hits: their PrepareDraw time over 1.1 us
+        u64 probe_ns{}; ///< NoteDrawReuse's own time, left out of prepare_ns
+        u64 frames{};
+        u64 window_start{};
+    };
+    /// Classifies the draw just configured with `pipeline` and adds its key to the frame's.
+    DrawReuse NoteDrawReuse(const GraphicsPipeline& pipeline, bool is_indexed);
+    void TickDrawReuse();
+    DrawReuseProbe draw_reuse;
+
     ReusableDraw reusable_draw;
     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
     /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
@@ -458,6 +493,10 @@ private:
         handle_spans;
     /// The constant buffer binds and data since the previous draw.
     VideoCommon::Nx2FastDraw::Delta taken_delta;
+    /// taken_delta hasn't reached BeginGraphicsUniforms yet (the draw may still stop before).
+    bool taken_delta_unconsumed{};
+    /// Constant buffer data since the last BeginGraphicsUniforms that no delta it got holds.
+    bool uniform_writes_lost{};
     FastDrawStats fast_draw_stats;
     /// Nx2FastDraw::Enabled and VerifyEnabled as the drawing thread last read them.
     bool fast_draw_on{};

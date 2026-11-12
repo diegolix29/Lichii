@@ -209,7 +209,9 @@ command. With `index: true`, the adapter runs that command itself. The adapter-o
 threads (default `GPU,GPUBack`) about 1000 times a second for `seconds` (default 10) and returns
 the self, self-and-caller and inclusive counts per function. The report and its folded stacks go
 to `samples-<session>-<n>.txt` in the dump directory. Windows only; the threads run slower while
-sampled, so read fps from a run without it.
+sampled, so read fps from a run without it. A stack ends at its first frame in generated code,
+shown as `(jit)`: a guest core thread (`CPUCore_*`) shows `(jit)` while it runs guest code and
+the host functions above `(jit)` while the JIT calls out.
 
 **`speed_limit`** `{on?}`. Lifts (`false`) or restores (`true`) the speed limit live and returns
 the `previous` and current `on` state, so a test script can boot through the logos and menus

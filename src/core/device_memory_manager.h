@@ -15,6 +15,7 @@
 #include <source_location>
 #include <vector>
 #include <span>
+#include <unordered_map>
 
 #include "common/common_types.h"
 #include "common/range_mutex.h"
@@ -66,6 +67,16 @@ public:
     void Map(DAddr address, VAddr virtual_address, size_t size, Asid asid, bool track = false);
 
     void Unmap(DAddr address, size_t size);
+
+    /// Device pages without memory that keep the bytes written to them until Map gives them
+    /// memory, which then holds those bytes (a Switch 2 sparse block waiting for its memory).
+    /// Reads see the kept bytes meanwhile; Unmap drops them.
+    void KeepWrites(DAddr address, size_t size);
+    /// Read or write [address, +size) when it has kept pages (or pages mapped meanwhile): mapped
+    /// pages as usual, the others from the kept bytes. False, doing nothing that counts, when it
+    /// has neither.
+    bool ReadKept(DAddr address, void* dest_pointer, size_t size);
+    bool WriteKept(DAddr address, const void* src_pointer, size_t size);
 
     void TrackContinuityImpl(DAddr address, VAddr virtual_address, size_t size, Asid asid);
     void TrackContinuity(DAddr address, VAddr virtual_address, size_t size, Asid asid) {
@@ -286,6 +297,12 @@ private:
     std::unique_ptr<CachedPages> cached_pages;
     Common::RangeMutex counter_guard;
     std::mutex mapping_guard;
+
+    /// Taken before mapping_guard. The pages KeepWrites keeps, by device page; null reads zero.
+    std::mutex kept_mutex;
+    std::atomic<size_t> kept_count{};
+    using KeptPage = std::array<u8, size_t{1} << page_bits>;
+    std::unordered_map<size_t, std::unique_ptr<KeptPage>> kept_pages;
 
 
 };

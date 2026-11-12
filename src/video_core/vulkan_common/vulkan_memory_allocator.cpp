@@ -257,7 +257,18 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     VmaAllocation allocation{};
     VmaAllocationInfo alloc_info{};
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
-    const bool huge = texels > MaxBackedImageTexels;
+    u64 bytes = 0;
+    if (texels > MaxBackedImageTexels) {
+        // Its memory size decides: an image the driver won't create is too large to back.
+        const auto& dld = device.GetDispatchLoader();
+        VkImage probe{};
+        bytes = ~u64{0};
+        if (dld.vkCreateImage(*device.GetLogical(), &ci, nullptr, &probe) == VK_SUCCESS) {
+            bytes = device.GetLogical().GetImageMemoryRequirements(probe).size;
+            dld.vkDestroyImage(*device.GetLogical(), probe, nullptr);
+        }
+    }
+    const bool huge = IsTooLargeToBack(texels, bytes);
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                            : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
@@ -277,27 +288,10 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
     }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
-        // Still out of device memory: a real image in host memory (slow, but valid) beats one
-        // with nothing bound, which AMD's drivers do not survive being sampled.
-        VmaAllocationCreateInfo host = alloc_ci;
-        host.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-        host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-        host.preferredFlags = 0;
-        result = vmaCreateImage(allocator, &ci, &host, &handle, &allocation, &alloc_info);
-        static u32 host_logged{};
-        if (result == VK_SUCCESS && host_logged++ < 16) {
-            LOG_WARNING(Render_Vulkan,
-                        "Image {}x{}x{} ({} levels, {} layers, format {}) is out of device memory; "
-                        "placed in host memory",
-                        ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
-                        ci.arrayLayers, static_cast<u32>(ci.format));
-        }
-    }
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         pressure_events.fetch_add(1, std::memory_order_relaxed);
     }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ci.imageType != VK_IMAGE_TYPE_1D &&
-        UsesUnbackedFallback(texels, may_fail)) {
+        UsesUnbackedFallback(texels, bytes, may_fail)) {
         // Too big to back at all, e.g. title 1's sparse virtual texture arrays (8192x8192,
         // 68 layers, ~23 GB): on the console only resident tiles have memory. Use an image with
         // nothing bound, so views and copies still work, instead of aborting. A smaller image
@@ -463,7 +457,32 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VkMemoryPropertyFlags property_flags{};
 
     if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
-        vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
+        VkResult result =
+            vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            // Over the device memory budget, as images are in CreateImage: buffers have no
+            // unbacked fallback, and the vk::Exception a failed staging or buffer cache
+            // allocation throws from the GPU thread aborts the process. Phones share RAM with
+            // the GPU, so the budget is often lower than the memory that is really free.
+            static u32 logged{};
+            if (logged++ < 32) {
+                LOG_WARNING(Render_Vulkan,
+                            "Buffer of {} bytes (usage {}) is over the memory budget; "
+                            "allocating it anyway",
+                            ci.size, static_cast<u32>(usage));
+            }
+            // The texture cache answers each pressure event by keeping more device memory free.
+            // Upload and download buffers live in host memory on a discrete GPU, so they only
+            // count when the heaps are shared or the buffer asked for device-local memory.
+            if (device.IsIntegrated() || usage == MemoryUsage::DeviceLocal ||
+                usage == MemoryUsage::Stream) {
+                pressure_events.fetch_add(1, std::memory_order_relaxed);
+            }
+            VmaAllocationCreateInfo relaxed = alloc_ci;
+            relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = vmaCreateBuffer(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+        }
+        vk::Check(result);
     }
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 

@@ -5,10 +5,13 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <random>
+#include <span>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -27,6 +30,8 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_async_readback.h"
+#include "video_core/nx2_fast_draw.h"
+#include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_null/null_rasterizer.h"
 
 namespace VideoCommon {
@@ -272,6 +277,63 @@ std::array<u32, 3> Encode(const Mme& fields) {
     }
     return {bits[2], bits[1], bits[0]};
 }
+
+/// Records the invalidations MemoryManager::FlushCaching hands over.
+class InvalidationRecorder final : public VideoCore::RasterizerInterface {
+public:
+    using Ranges = std::vector<std::pair<DAddr, std::size_t>>;
+
+    void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override {
+        inner.insert(inner.end(), sequences.begin(), sequences.end());
+    }
+    void InvalidateConstantBufferData(
+        std::span<const std::pair<DAddr, std::size_t>> sequences) override {
+        constant_data.insert(constant_data.end(), sequences.begin(), sequences.end());
+    }
+    void Draw(bool, u32) override {}
+    void DrawTexture() override {}
+    void Clear(u32) override {}
+    void DispatchCompute() override {}
+    void ResetCounter(VideoCommon::QueryType) override {}
+    void Query(GPUVAddr, VideoCommon::QueryType, VideoCommon::QueryPropertiesFlags, u32,
+               u32) override {}
+    void BindGraphicsUniformBuffer(size_t, u32, GPUVAddr, u32) override {}
+    void DisableGraphicsUniformBuffer(size_t, u32) override {}
+    void SignalFence(std::function<void()>&&) override {}
+    void SyncOperation(std::function<void()>&&) override {}
+    void SignalSyncPoint(u32) override {}
+    void SignalReference() override {}
+    void ReleaseFences(bool) override {}
+    void FlushAll() override {}
+    void FlushRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    bool MustFlushRegion(DAddr, u64, VideoCommon::CacheType) override {
+        return false;
+    }
+    VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override {
+        return {addr, addr + size, false};
+    }
+    void InvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    void OnCacheInvalidation(DAddr, u64) override {}
+    bool OnCPUWrite(DAddr, u64) override {
+        return false;
+    }
+    void InvalidateGPUCache() override {}
+    void UnmapMemory(DAddr, u64) override {}
+    void ModifyGPUMemory(size_t, GPUVAddr, u64) override {}
+    void FlushAndInvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    void WaitForIdle() override {}
+    void FragmentBarrier() override {}
+    void TiledCacheBarrier() override {}
+    void FlushCommands() override {}
+    void TickFrame() override {}
+    Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override {
+        std::terminate();
+    }
+    void AccelerateInlineToMemory(GPUVAddr, size_t, std::span<const u8>) override {}
+
+    Ranges inner;
+    Ranges constant_data;
+};
 
 /// A Turing MME instruction that sends the next macro parameter to `method` (as in
 /// native_macro_fifo.cpp); `end` makes the instruction after it the macro's last.
@@ -666,6 +728,91 @@ TEST_CASE("GpuSplit CB batching preserves words at the GPU address space end",
         REQUIRE(engine->regs.const_buffer.offset == 8);
     }
     f.Compare();
+}
+
+TEST_CASE("Constant buffer data goes through the bound buffer's translation and invalidation",
+          "[video_core][maxwell_fast_method]") {
+    namespace FastDraw = VideoCommon::Nx2FastDraw;
+    using Ranges = InvalidationRecorder::Ranges;
+    Fixture f;
+    f.system.Initialize();
+    Kernel::KProcess process{f.system.Kernel()};
+    SCOPE_EXIT { f.system.Kernel().UnregisterKernelObject(&process); };
+    auto& table = process.GetPageTable().GetImpl();
+    table.Resize(20, 12);
+    auto* backing = f.physical.GetPointerFromRaw<u8>(0x10000);
+    auto* replacement = f.physical.GetPointerFromRaw<u8>(0x30000);
+    table.entries.GetAndFault(4).Store(false, Common::PageType::Memory, 1,
+                                     reinterpret_cast<uintptr_t>(backing) - 0x4000);
+    table.entries.GetAndFault(0x20).Store(false, Common::PageType::Memory, 1,
+                                        reinterpret_cast<uintptr_t>(replacement) - 0x20000);
+    process.GetMemory().SetCurrentPageTable(process);
+    const auto asid = f.device_memory.RegisterProcess(&process.GetMemory());
+    f.device_memory.BindInterface(&f.rasterizer);
+    SCOPE_EXIT {
+        f.device_memory.Unmap(0x10000, 0x1000);
+        f.device_memory.Unmap(0x30000, 0x1000);
+        f.device_memory.UnregisterProcess(asid);
+    };
+    f.device_memory.Map(0x10000, 0x4000, 0x1000, asid);
+    f.device_memory.Map(0x30000, 0x20000, 0x1000, asid);
+    InvalidationRecorder recorder;
+    f.memory.BindRasterizer(&recorder);
+    f.memory.Map(0x100000, 0x10000, 0x1000, Tegra::PTEKind::PITCH, false);
+    std::memset(backing, 0, 0x1000);
+    std::memset(replacement, 0, 0x1000);
+    FastDraw::g_delta = {};
+    Maxwell3D& engine = f.fast;
+    const auto call = [&](u32 method, u32 argument) {
+        engine.CallMethod(f.system, method, argument, true);
+    };
+    const auto word = [](const u8* bytes) {
+        u32 value{};
+        std::memcpy(&value, bytes, sizeof(value));
+        return value;
+    };
+    call(CbAddressHigh, 0);
+    call(CbAddressLow, 0x100000);
+    call(CbSize, 0x800);
+    call(CbOffset, 0x40);
+    const std::vector<u32> words{1, 2, 3};
+    engine.CallMultiMethod(f.system, CbData, words.data(), 3, 3);
+    call(CbData, 4);
+    REQUIRE(word(backing + 0x40) == 1);
+    REQUIRE(word(backing + 0x4c) == 4);
+    // One merged range for the fast draw delta and for the invalidation, by device address.
+    REQUIRE(FastDraw::g_delta.num_device_writes == 1);
+    REQUIRE(FastDraw::g_delta.device_begin[0] == 0x10040);
+    REQUIRE(FastDraw::g_delta.device_end[0] == 0x10050);
+    REQUIRE(FastDraw::g_delta.num_writes == 1);
+    REQUIRE(FastDraw::g_delta.write_begin[0] == 0x100040);
+    f.memory.FlushCaching();
+    REQUIRE(recorder.constant_data == Ranges{{0x10040, 0x10}});
+    REQUIRE(recorder.inner.empty());
+
+    // The page maps other memory now: data goes there, translated again.
+    f.memory.Map(0x100000, 0x30000, 0x1000, Tegra::PTEKind::PITCH, false);
+    call(CbOffset, 0x40);
+    call(CbData, 5);
+    REQUIRE(word(replacement + 0x40) == 5);
+    REQUIRE(word(backing + 0x40) == 1);
+    recorder.constant_data.clear();
+    f.memory.FlushCaching();
+    REQUIRE(recorder.constant_data == Ranges{{0x30040, 4}});
+
+    // A buffer the texture headers lie in takes the general path, which checks each write.
+    engine.regs.tex_header.address_high = 0;
+    engine.regs.tex_header.address_low = 0x100400;
+    engine.regs.tex_header.limit = 0;
+    call(CbOffset, 0x80);
+    call(CbData, 6);
+    REQUIRE(word(replacement + 0x80) == 6);
+    recorder.constant_data.clear();
+    f.memory.FlushCaching();
+    REQUIRE(recorder.constant_data.empty());
+    REQUIRE(recorder.inner.size() == 1);
+    REQUIRE(recorder.inner[0].first == 0x30080);
+    FastDraw::g_delta = {};
 }
 
 TEST_CASE("Maxwell3D fast method dispatch cost", "[.][maxwell_fast_method_bench]") {

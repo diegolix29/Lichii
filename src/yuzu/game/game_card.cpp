@@ -40,7 +40,7 @@ void GameCard::paint(QPainter* painter, const QStyleOptionViewItem& option,
     painter->setPen(QPen(borderColor, 1));
     painter->drawRoundedRect(cardRect, cardCornerRadius, cardCornerRadius);
 
-    const u32 icon_size = UISettings::values.game_icon_size.GetValue();
+    const u32 icon_size = UISettings::values.game_cover_size.GetValue();
     QPixmap icon_pixmap = index.data(Qt::DecorationRole).value<QPixmap>();
 
     QRect iconRect;

@@ -13,8 +13,10 @@
 
 #include "common/fs/file.h"
 #include "common/hex_util.h"
+#include "common/nextendo.h"
 #include "common/string_util.h"
 
+#include "core/hle/service/sockets/nextendo_redirect.h"
 #include "core/hle/service/ssl/ssl_backend.h"
 #include "core/internal_network/network.h"
 #include "core/internal_network/sockets.h"
@@ -157,7 +159,25 @@ public:
         socket = std::move(socket_in);
     }
 
-    Result SetHostName(const char* hostname) override {
+    Result SetHostName(const char* hostname_in) override {
+        // NSD host names carry "%" for the environment, and some titles pass the redirected
+        // address itself; Nextendo needs the real name for SNI (citron-nextendo).
+        std::string host = hostname_in;
+        if (Common::Nextendo::OnlinePlayActive()) {
+            host = Sockets::Nextendo::ExpandNsdHost(std::move(host));
+        }
+        if (Common::Nextendo::OnlinePlayActive() && socket) {
+            const auto [peer, err] = socket->GetPeerName();
+            if (err == Network::Errno::SUCCESS) {
+                const std::string ip = Network::IPv4AddressToString(peer.ip);
+                if (host.empty() || host == ip) {
+                    if (std::string known = Sockets::Nextendo::HostForAddress(ip); !known.empty()) {
+                        host = std::move(known);
+                    }
+                }
+            }
+        }
+        const char* hostname = host.c_str();
         if (!skip_cert_verification) {
             if (!SSL_set1_host(ssl, hostname)) {
                 LOG_ERROR(Service_SSL, "SSL_set1_host({}) failed", hostname);
@@ -197,6 +217,19 @@ public:
     }
 
     Result DoHandshake() override {
+        // A guest that connects to a redirected Nextendo address without a host name still
+        // needs SNI, because Nextendo routes its :443 servers by name (citron-nextendo).
+        if (socket && !SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name)) {
+            const auto [peer, err] = socket->GetPeerName();
+            if (err == Network::Errno::SUCCESS) {
+                const std::string host = Sockets::Nextendo::HostForAddress(
+                    Network::IPv4AddressToString(peer.ip));
+                if (!host.empty()) {
+                    SSL_set_tlsext_host_name(ssl, host.c_str());
+                }
+            }
+        }
+
         SSL_set_verify_result(ssl, X509_V_OK);
         const int ret = SSL_do_handshake(ssl);
 

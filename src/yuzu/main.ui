@@ -239,6 +239,7 @@
     <addaction name="action_Apply_Recommended_Settings"/>
     <addaction name="action_Restore_Previous_Settings"/>
     <addaction name="separator"/>
+    <addaction name="action_Whats_New"/>
     <addaction name="action_About"/>
     <addaction name="action_Eden_Dependencies"/>
    </widget>
@@ -291,6 +292,11 @@
   <action name="action_Verify_installed_contents">
    <property name="text">
     <string>&amp;Verify Installed Contents</string>
+   </property>
+  </action>
+  <action name="action_Whats_New">
+   <property name="text">
+    <string>&amp;What's New in Lichii</string>
    </property>
   </action>
   <action name="action_About">

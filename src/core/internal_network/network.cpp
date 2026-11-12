@@ -49,6 +49,7 @@ enum class CallType {
 
 /// Set while socket operations are cancelled, for waits that no host socket operation wakes.
 std::atomic_bool socket_operations_cancelled{false};
+std::atomic_bool direct_lan_active{false};
 
 #ifdef _WIN32
 
@@ -333,7 +334,11 @@ Errno GetAndLogLastError(CallType call_type = CallType::Other) {
     int e = errno;
 #endif
     const Errno err = TranslateNativeError(e, call_type);
-    if (err == Errno::AGAIN || err == Errno::TIMEDOUT || err == Errno::INPROGRESS) {
+    if (err == Errno::AGAIN) {
+        // A non-blocking call with nothing to do yet; games poll like this many times a second.
+        return err;
+    }
+    if (err == Errno::TIMEDOUT || err == Errno::INPROGRESS) {
         // These happen during normal operation, so only log them at debug level.
         LOG_DEBUG(Network, "Socket operation error: {}", Common::NativeErrorToString(e));
         return err;
@@ -752,6 +757,9 @@ std::optional<IPv4Address> GetHostIPv4Address() {
 }
 
 std::optional<IPv4Address> GetRoomIPv4Address() {
+    if (IsDirectLanActive()) {
+        return std::nullopt;
+    }
     if (const auto room_member = GetRoomMember().lock()) {
         // The room host and moderators are in the Moderator state instead of Joined
         const auto state = room_member->GetState();
@@ -760,6 +768,14 @@ std::optional<IPv4Address> GetRoomIPv4Address() {
         }
     }
     return std::nullopt;
+}
+
+bool IsDirectLanActive() {
+    return direct_lan_active;
+}
+
+void SetDirectLanActive(bool active) {
+    direct_lan_active = active;
 }
 
 std::string IPv4AddressToString(IPv4Address ip_addr) {

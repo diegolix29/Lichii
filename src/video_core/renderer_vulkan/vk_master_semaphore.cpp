@@ -8,6 +8,7 @@
 
 #include <ranges>
 #include "common/settings.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -75,6 +76,9 @@ void MasterSemaphore::Refresh() {
         }
     } while (!gpu_tick.compare_exchange_weak(this_tick, counter, std::memory_order_release,
                                              std::memory_order_relaxed));
+    if (counter > this_tick) {
+        Tegra::Nx2PendingWake::Get().OnGpuTick(counter);
+    }
 }
 
 void MasterSemaphore::Wait(u64 tick) {
@@ -364,6 +368,7 @@ void MasterSemaphore::WaitThread(std::stop_token token) {
             gpu_tick.store(host_tick, std::memory_order_release);
         }
         gpu_tick.notify_one();
+        Tegra::Nx2PendingWake::Get().OnGpuTick(host_tick);
     }
 }
 

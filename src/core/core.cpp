@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <optional>
 #include <array>
 #include <cstdlib>
 #include <atomic>
@@ -12,7 +13,9 @@
 #include "common/cpu_features.h"
 #include "audio_core/audio_core.h"
 #include "common/fs/fs.h"
+#include "common/literals.h"
 #include "common/logging.h"
+#include "common/memory_detect.h"
 #include "common/nx2_sampler.h"
 #include "common/adpf.h"
 #include "common/settings.h"
@@ -45,6 +48,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_resource_limit.h"
 #include "core/hle/kernel/k_scheduler.h"
+#include "core/hle/kernel/k_system_control.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/physical_core.h"
 #include "core/hle/service/acc/profile_manager.h"
@@ -129,13 +133,26 @@ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
 
 namespace {
 
-// Detect the platform before initializing the kernel memory layout and guest clock.
-bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::size_t program_index) {
+// The program id from a Switch 2 program's main.npdm, if it is one.
+std::optional<u64> Switch2ProgramId(FileSys::ProgramMetadata& metadata,
+                                    const FileSys::VirtualFile& npdm) {
+    if (npdm == nullptr || metadata.Load(npdm) != Loader::ResultStatus::Success ||
+        !metadata.IsSwitch2()) {
+        return std::nullopt;
+    }
+    return metadata.GetTitleID();
+}
+
+} // namespace
+
+// Detect the platform and program before initializing the kernel memory layout and guest clock.
+std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 program_id,
+                                      std::size_t program_index) {
     FileSys::ProgramMetadata metadata;
     if (FileSys::NupContainer::IsNupFile(file)) {
         FileSys::NupContainer nup{file};
         if (nup.GetStatus() != Loader::ResultStatus::Success) {
-            return false;
+            return std::nullopt;
         }
         const auto base = nup.FindBasePackage();
         const auto update = nup.FindBestUpdatePackage();
@@ -147,17 +164,17 @@ bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::siz
         }
         const auto exefs = program ? nup.GetExeFSDir(*program) : nullptr;
         const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-               metadata.IsSwitch2();
+        return Switch2ProgramId(metadata, npdm);
     }
     const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
     if (type == Loader::FileType::NX) {
-        return Loader::AppLoader_NX::ReadPlatform(file, program_id) == 2;
+        const auto found = Loader::AppLoader_NX::ReadProgramPlatform(file, program_id);
+        return found && found->platform == 2 ? std::optional{found->program_id} : std::nullopt;
     }
     if (type == Loader::FileType::XCI || type == Loader::FileType::XCZ) {
         const FileSys::XCI xci{file, program_id, program_index};
         if (xci.GetStatus() != Loader::ResultStatus::Success) {
-            return false;
+            return std::nullopt;
         }
         const auto partition = xci.GetSecurePartitionNSP();
         const auto program = partition != nullptr
@@ -166,13 +183,12 @@ bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::siz
                                  : nullptr;
         const auto exefs = program != nullptr ? program->GetExeFS() : nullptr;
         const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-               metadata.IsSwitch2();
+        return Switch2ProgramId(metadata, npdm);
     }
     if (type == Loader::FileType::NSP || type == Loader::FileType::NSZ) {
         const FileSys::NSP nsp{file, program_id, program_index};
         if (nsp.GetStatus() != Loader::ResultStatus::Success) {
-            return false;
+            return std::nullopt;
         }
         auto exefs = nsp.GetExeFS();
         if (!nsp.IsExtractedType()) {
@@ -181,16 +197,12 @@ bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::siz
             exefs = program != nullptr ? program->GetExeFS() : nullptr;
         }
         const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-               metadata.IsSwitch2();
+        return Switch2ProgramId(metadata, npdm);
     }
     const auto dir = file != nullptr ? file->GetContainingDirectory() : nullptr;
     const auto npdm = dir != nullptr ? dir->GetFile("main.npdm") : nullptr;
-    return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-           metadata.IsSwitch2();
+    return Switch2ProgramId(metadata, npdm);
 }
-
-} // namespace
 
 struct System::Impl {
     explicit Impl(System& system)
@@ -257,14 +269,22 @@ struct System::Impl {
             return;
         }
 
+        // The settings and time services start on the emulated cores, which only run once the
+        // game has finished loading (shaders included). Waiting for them here froze the UI
+        // thread for the whole loading screen when settings were applied during it. If they
+        // are not up yet there is nothing to refresh: they read the current settings when
+        // they start.
+        auto& manager = system.ServiceManager();
         auto settings_service =
-            system.ServiceManager().GetService<Service::Set::ISystemSettingsServer>("set:sys",
-                                                                                    true);
+            manager.GetService<Service::Set::ISystemSettingsServer>("set:sys");
         auto static_service_a =
-            system.ServiceManager().GetService<Service::Glue::Time::StaticService>("time:a", true);
-
+            manager.GetService<Service::Glue::Time::StaticService>("time:a");
         auto static_service_s =
-            system.ServiceManager().GetService<Service::PSC::Time::StaticService>("time:s", true);
+            manager.GetService<Service::PSC::Time::StaticService>("time:s");
+        if (!settings_service || !static_service_a || !static_service_s) {
+            LOG_INFO(Core, "Time services not started yet, they will use the current settings");
+            return;
+        }
 
         std::shared_ptr<Service::PSC::Time::SystemClock> user_clock;
         static_service_a->GetStandardUserSystemClock(&user_clock);
@@ -284,15 +304,16 @@ struct System::Impl {
 
         timezone_service->SetDeviceLocationName(name);
 
-        u64 time_offset = 0;
+        s64 time_offset = 0;
         if (Settings::values.custom_rtc_enabled) {
             time_offset = Settings::values.custom_rtc_offset.GetValue();
         }
 
         const auto posix_time = std::chrono::system_clock::now().time_since_epoch();
-        const u64 current_time =
-            +std::chrono::duration_cast<std::chrono::seconds>(posix_time).count();
-        const u64 new_time = current_time + time_offset;
+        const s64 current_time =
+            std::chrono::duration_cast<std::chrono::seconds>(posix_time).count();
+        const s64 target_time = current_time + time_offset;
+        const u64 new_time = static_cast<u64>((std::max<s64>)(0, target_time));
 
         Service::PSC::Time::SystemClockContext context{};
         settings_service->SetUserSystemClockContext(context);
@@ -394,12 +415,25 @@ struct System::Impl {
             fs_controller.InitTempStorage();
         }
 
-        const bool switch2_program =
-            virtual_filesystem != nullptr &&
-            IsSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath), params.program_id,
-                             params.program_index);
+        const std::optional<u64> switch2_program_id =
+            virtual_filesystem != nullptr
+                ? FindSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath),
+                                     params.program_id, params.program_index)
+                : std::nullopt;
+        const bool switch2_program = switch2_program_id.has_value();
+        Kernel::KSystemControl::SetApplicationProgramId(switch2_program_id.value_or(0));
         Settings::SetCurrentProgramIsSwitch2(switch2_program);
         Settings::SetAstcRecompressionOverride(std::nullopt);
+
+        if (const auto ram = Common::GetHostRam();
+            switch2_program && Common::IsBelowSwitch2RamMinimum(ram)) {
+            using namespace Common::Literals;
+            LOG_WARNING(Core,
+                        "Low host RAM: {:.3g} GB {}; Switch 2 titles need at least 16 GB (32 GB "
+                        "recommended)",
+                        static_cast<f64>(ram.bytes) / f64{1_GiB},
+                        ram.installed ? "installed" : "usable");
+        }
 
         // Switch 2 titles size their heap from the total memory and need the 12 GiB layout. Set it
         // as a per-game value, so RestoreGlobalState brings back the configured layout afterwards.
@@ -455,6 +489,9 @@ struct System::Impl {
 
         if (!app_loader) {
             LOG_CRITICAL(Core, "Failed to obtain loader for {}!", filepath);
+            // The kernel is already initialized. Left running, it is destroyed with the global
+            // System after main() returns, when device memory is already gone, and exit crashes.
+            ShutdownMainProcess();
             return SystemResultStatus::ErrorGetLoader;
         }
 
@@ -563,6 +600,11 @@ struct System::Impl {
         // Reset per-game flags
         Settings::values.use_squashed_iterated_blend = false;
 
+        // Once powered off, services stop writing replies, so a guest thread whose IPC call
+        // completes would read its own request back and abort (2010-0212, a Userspace PANIC on
+        // every stop). Keep guest threads from running again first; the wait for running ones
+        // comes after the GPU has released any that it holds in host code.
+        kernel.RequestSuspendEmulation();
         is_powered_on = false;
         exit_locked = false;
         exit_requested = false;

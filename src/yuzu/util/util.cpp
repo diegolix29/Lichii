@@ -9,6 +9,7 @@
 #include "applets/qt_profile_select.h"
 #include "core/frontend/applets/profile_select.h"
 #include "core/hle/service/acc/profile_manager.h"
+#include "qt_common/config/uisettings.h"
 #include "qt_common/qt_common.h"
 #include "yuzu/util/util.h"
 
@@ -23,6 +24,17 @@ QFont GetMonospaceFont() {
     font.setStyleHint(QFont::Monospace);
     font.setFixedPitch(true);
     return font;
+}
+
+QIcon MenuIcon(const char* name) {
+    QIcon icon;
+    if (UISettings::values.theme != "lichii") {
+        return icon;
+    }
+    icon.addFile(QStringLiteral(":/lichii/icons/menu_%1.png").arg(QLatin1String(name)));
+    icon.addFile(QStringLiteral(":/lichii/icons/menu_%1_white.png").arg(QLatin1String(name)), {},
+                 QIcon::Active);
+    return icon;
 }
 
 const std::optional<Common::UUID> GetProfileID() {

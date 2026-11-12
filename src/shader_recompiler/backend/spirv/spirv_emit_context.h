@@ -7,9 +7,11 @@
 #pragma once
 
 #include <array>
+#include <bit>
 #include <optional>
 
 #include <sirit/sirit.h>
+#include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 
 #include "shader_recompiler/backend/bindings.h"
@@ -188,7 +190,7 @@ public:
     }
 
     Id Const(u32 value) {
-        return Constant(U32[1], value);
+        return CachedConstant(u32_constants, U32[1], value);
     }
 
     Id Const(u32 element_1, u32 element_2) {
@@ -222,7 +224,7 @@ public:
     }
 
     Id Const(f32 value) {
-        return Constant(F32[1], value);
+        return CachedConstant(f32_constants, F32[1], value);
     }
 
     const Profile& profile;
@@ -446,6 +448,21 @@ public:
     bool uses_nonuniform_storage_texel_buffer{};
 
 private:
+    /// Sirit deduplicates constants, but by hashing a freshly allocated copy of their words on
+    /// every call; immediates are emitted over and over, so remember the ids of scalar constants.
+    /// Keys are bit patterns, like Sirit's (0.0f and -0.0f, and NaN payloads, stay distinct).
+    template <typename T>
+    Id CachedConstant(::Common::unordered_map<u32, Id>& cache, Id type, T value) {
+        const auto [it, is_new]{cache.try_emplace(std::bit_cast<u32>(value))};
+        if (is_new) {
+            it->second = Constant(type, value);
+        }
+        return it->second;
+    }
+
+    ::Common::unordered_map<u32, Id> u32_constants;
+    ::Common::unordered_map<u32, Id> f32_constants;
+
     void DefineCommonTypes(const Info& info);
     void DefineCommonConstants();
     void DefineInterfaces(const IR::Program& program);

@@ -23,6 +23,7 @@
 
 #include "common/bit_field.h"
 #include "common/scope_exit.h"
+#include "common/zstd_compression.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -375,6 +376,11 @@ std::chrono::nanoseconds GraphicsPipeline::TakeHoldTime() noexcept {
     return std::chrono::nanoseconds{hold_time_ns.exchange(0, std::memory_order::relaxed)};
 }
 
+std::pair<u64, u64> GraphicsPipeline::TakeTextureMemoCounts() noexcept {
+    return {g_memo_hits.exchange(0, std::memory_order_relaxed),
+            g_memo_misses.exchange(0, std::memory_order_relaxed)};
+}
+
 // TODO(crueter): This is the worst-formatted code I have EVER seen
 GraphicsPipeline::GraphicsPipeline(
     Scheduler& scheduler_, BufferCache& buffer_cache_, TextureCache& texture_cache_,
@@ -384,14 +390,14 @@ GraphicsPipeline::GraphicsPipeline(
     GuestDescriptorQueue& guest_descriptor_queue_, DescriptorBufferRing& descriptor_buffer_ring_,
     const PipelineBuildQueue& build_queue,
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
-    const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
+    const GraphicsPipelineCacheKey& key_, std::array<std::vector<u32>, NUM_STAGES> stages,
     const std::array<const Shader::Info*, NUM_STAGES>& infos,
-    std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages,
+    std::function<std::array<std::vector<u32>, NUM_STAGES>()> emit_stages,
     std::optional<MeshEmulationSetup> mesh_emulation_)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), binaries{binaries_}, scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
-      descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)},
+      descriptor_buffer_ring{descriptor_buffer_ring_}, spirv{std::move(stages)},
       worker_only_build{build_queue.jobs && static_cast<bool>(emit_stages)},
       mesh_emulation{std::move(mesh_emulation_)} {
     if (shader_notify) {
@@ -576,7 +582,7 @@ GraphicsPipeline::GraphicsPipeline(
     if (build_queue.jobs && emit_stages) {
         emit = [this, shader_notify, emit_stages = std::exchange(emit_stages, {})] {
             try {
-                spv_modules = emit_stages();
+                spirv = emit_stages();
             } catch (const Shader::Exception& exception) {
                 LOG_ERROR(Render_Vulkan, "Graphics pipeline {:016x}: {}", key.Hash(),
                           exception.what());
@@ -602,7 +608,18 @@ GraphicsPipeline::GraphicsPipeline(
         };
         try {
             if (emit_stages) {
-                spv_modules = emit_stages();
+                spirv = emit_stages();
+            }
+            for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+                if (spirv[stage].empty()) {
+                    continue;
+                }
+                spv_modules[stage] = BuildShader(device, spirv[stage]);
+                if (device.HasDebuggingToolAttached()) {
+                    const std::string name{
+                        fmt::format("Shader {:016x}", key.unique_hashes[stage + 1])};
+                    spv_modules[stage].SetObjectNameEXT(name.c_str());
+                }
             }
             const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
             Validate();
@@ -625,8 +642,17 @@ GraphicsPipeline::GraphicsPipeline(
         }
         // Nothing reads the shader modules once the pipeline exists, and the driver keeps a copy
         // of each one's SPIR-V while it lives (title 1: ~1,500 pipelines, 2-5 modules each).
-        for (vk::ShaderModule& module : spv_modules) {
-            module.reset();
+        // Its SPIR-V is kept compressed (about a tenth of it), so that an evicted pipeline is
+        // built again without translating its shaders.
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            spv_modules[stage].reset();
+            if (!spirv[stage].empty()) {
+                kept_spirv[stage] = Common::Compression::CompressDataZSTD(
+                    reinterpret_cast<const u8*>(spirv[stage].data()),
+                    spirv[stage].size() * sizeof(u32), 1);
+                kept_spirv[stage].shrink_to_fit();
+                spirv[stage] = std::vector<u32>{};
+            }
         }
         if (worker_only_build) {
             const auto elapsed = std::chrono::steady_clock::now() - begin;
@@ -645,6 +671,32 @@ GraphicsPipeline::GraphicsPipeline(
     }
     configure_func = ConfigureFunc(present_stages, stage_infos);
     build.emplace(build_queue, std::move(func), std::move(emit));
+}
+
+u64 KeptGraphicsStages::Bytes() const noexcept {
+    u64 bytes = sizeof(*this);
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        bytes += spirv[stage].size() + (infos[stage] ? sizeof(Shader::Info) : 0);
+    }
+    if (mesh_emulation) {
+        bytes += (mesh_emulation->vertex_spirv.size() + mesh_emulation->distribution_spirv.size()) *
+                 sizeof(u32);
+    }
+    return bytes;
+}
+
+KeptGraphicsStages GraphicsPipeline::TakeKeptStages() {
+    KeptGraphicsStages kept{
+        .spirv = std::move(kept_spirv),
+        .mesh_emulation = mesh_emulation,
+        .mapped_pointers = mapped_pointers,
+    };
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (!kept.spirv[stage].empty()) {
+            kept.infos[stage] = std::make_unique<Shader::Info>(stage_infos[stage]);
+        }
+    }
+    return kept;
 }
 
 void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
@@ -888,7 +940,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         ReportTextureMemo();
     }
-    if (RecordingSampledTextures()) {
+    if (RecordingSampledTextures() || DrawReuseProbeEnabled()) {
         sampled_images.clear();
         size_t view_index{};
         size_t sampler_index{};

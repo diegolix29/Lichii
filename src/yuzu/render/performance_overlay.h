@@ -4,22 +4,17 @@
 #pragma once
 
 #include <deque>
+#include <optional>
+#include <vector>
 #include <QWidget>
+
+#include "common/dkb_cpu_trace.h"
+#include "core/perf_stats.h"
 
 namespace VideoCore {
 class ShaderNotify;
 }
-namespace Core {
-struct PerfStatsResults;
-}
-namespace Ui {
-class PerformanceOverlay;
-}
 
-class QLineSeries;
-class QChart;
-class QChartView;
-class QValueAxis;
 class MainWindow;
 
 class PerformanceOverlay : public QWidget {
@@ -27,10 +22,10 @@ class PerformanceOverlay : public QWidget {
 
 public:
     explicit PerformanceOverlay(MainWindow* parent = nullptr);
-    ~PerformanceOverlay();
 
 protected:
     void paintEvent(QPaintEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
 
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
@@ -39,34 +34,24 @@ protected:
 private:
     void resetPosition(const QPoint& pos);
     void updateStats(const Core::PerfStatsResults& results, const VideoCore::ShaderNotify& shaders);
+    void paintGraph(QPainter& painter, const QRectF& area);
 
     MainWindow* m_mainWindow = nullptr;
-    Ui::PerformanceOverlay* ui;
-
-    // colors
-    QColor m_background{127, 127, 127, 190};
 
     QPoint m_offset{25, 75};
-
-    // frametime
-    const size_t NUM_FRAMETIME_SAMPLES = 300;
-    std::deque<double> m_frametimeSamples;
-
-    // fps
-    const size_t NUM_FPS_SAMPLES = 120;
-    qreal m_xPos = 0;
-    std::deque<double> m_fpsSamples;
-    std::deque<QPointF> m_fpsPoints;
 
     // drag
     QPoint m_drag_start_pos;
 
-    // fps chart
-    QLineSeries* m_fpsSeries = nullptr;
-    QChart* m_fpsChart = nullptr;
-    QChartView* m_fpsChartView = nullptr;
-    QValueAxis* m_fpsX = nullptr;
-    QValueAxis* m_fpsY = nullptr;
+    std::optional<double> m_fps;
+    /// The last 5 s of 500 ms fps readings, for min/median/max
+    std::deque<float> m_fpsSamples;
+    std::optional<double> m_frameMs;
+    std::optional<double> m_cpuPercent;
+    std::optional<double> m_gpuPercent;
+    std::optional<Common::DkbCpuTrace::Snapshot> m_cpuSnapshot;
+    std::vector<Core::FrameTimeHistory::Entry> m_frames;
+    QString m_tags;
 
 signals:
     void closed();

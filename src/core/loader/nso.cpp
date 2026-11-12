@@ -192,8 +192,12 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     }
 
     // Mario Kart World selects a 1- or 2-vblank frame mode in its main loop. Force its native
-    // 30 FPS mode, or let it choose dynamically using the whole frame time (CPU + GPU wait).
-    // Match the instruction sequence instead of relying on a title-version-specific address.
+    // 30 FPS mode, or let it choose dynamically. In dynamic mode the game keeps a time account
+    // (frame cost - interval * 16.67 ms) and advances 1 or 2 steps per frame, so it stays in real
+    // time as long as the cost it reads is the real frame time: use the whole frame time and skip
+    // the game's own wait for the second vblank, or every 2-step frame reads as 33 ms and the game
+    // never leaves 30 FPS (found by SerkiGohan). Presents are then paced with interval 1.
+    // Match the instruction sequences instead of relying on a title-version-specific address.
     const bool mkw_dynamic = Settings::values.mkw_dynamic_fps.GetValue();
     bool mkw_dynamic_fps_patch_applied = false;
     if ((mkw_dynamic || Settings::values.mkw_30fps.GetValue()) && name == "main" &&
@@ -237,13 +241,32 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
             }
         }
 
-        if (mode_matches == 1 && (!mkw_dynamic || frame_time_matches == 1)) {
+        // The vsync function waits until 0.99 * interval / 60 s after the frame start:
+        // ldr w8, [x19, #0x88] ; cmp w8, #2 ; b.lo <done> ; ucvtf ; mov w8, #60.0f
+        size_t vblank_wait_site = 0;
+        size_t vblank_wait_matches = 0;
+        if (mkw_dynamic) {
+            for (size_t i = 0; i + 4 < count; ++i) {
+                if (word(i) == 0xB9408A68 && word(i + 1) == 0x7100091F &&
+                    (word(i + 2) & 0xFF00001F) == 0x54000003 && word(i + 4) == 0x52A84E08) {
+                    vblank_wait_site = i + 2;
+                    ++vblank_wait_matches;
+                }
+            }
+        }
+
+        if (mode_matches == 1 &&
+            (!mkw_dynamic || (frame_time_matches == 1 && vblank_wait_matches == 1))) {
             std::memcpy(code + mode_site * sizeof(u32), &mode_instruction,
                         sizeof(mode_instruction));
             if (mkw_dynamic) {
                 const u32 whole_frame_time = 0xF9407660 | (word(frame_time_site) & 0x1F);
                 std::memcpy(code + frame_time_site * sizeof(u32), &whole_frame_time,
                             sizeof(whole_frame_time));
+                // b.lo -> b to the same target.
+                const s32 offset = static_cast<s32>(word(vblank_wait_site) << 8) >> 13;
+                const u32 branch = 0x14000000U | (static_cast<u32>(offset) & 0x03FFFFFFU);
+                std::memcpy(code + vblank_wait_site * sizeof(u32), &branch, sizeof(branch));
                 mkw_dynamic_fps_patch_applied = true;
             }
             LOG_INFO(Loader, "Mario Kart World: {} FPS mode enabled (main+{:#x})",
@@ -251,8 +274,9 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
                      text.location + mode_site * sizeof(u32));
         } else {
             LOG_WARNING(Loader,
-                        "Mario Kart World FPS patch skipped (mode matches {}, frame-time matches {})",
-                        mode_matches, frame_time_matches);
+                        "Mario Kart World FPS patch skipped (mode matches {}, frame-time matches "
+                        "{}, vblank-wait matches {})",
+                        mode_matches, frame_time_matches, vblank_wait_matches);
         }
     }
 

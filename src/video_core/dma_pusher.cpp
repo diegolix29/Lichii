@@ -30,6 +30,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
+#include "video_core/nx2_list_macro_trace.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra {
@@ -61,6 +62,8 @@ DmaPusher::~DmaPusher() = default;
 bool DmaPusher::CanResumeAcquire() {
     if (pending_list_tick) {
         VideoCommon::Count(VideoCommon::g_acquire_stats.list_polls);
+        // Before the check: a tick the host GPU passes after it wakes the GPU thread.
+        Nx2PendingWake::Get().WaitForGpuTick(*pending_list_tick);
         return rasterizer->IsGpuTickDone(*pending_list_tick);
     }
     VideoCommon::Count(VideoCommon::g_acquire_stats.acquire_polls);
@@ -314,6 +317,43 @@ bool DmaPusher::Step() {
                 ? LiveReadReason::SuspensionsChanged
             : gpu_written ? LiveReadReason::GpuWritten
                           : LiveReadReason::SafeDirty;
+        // EDEN_NX2_LIST_MACRO_TRACE: what a GPU-written entry held and the macro calls it fed.
+        namespace ListTrace = VideoCommon::ListMacroTrace;
+        const auto begin_list_trace = [&](ListTrace::Path path) {
+            if (!ListTrace::g_enabled) {
+                return false;
+            }
+            const auto type = subchannel_type[dma_state.subchannel];
+            const auto engine = type == Engines::EngineTypes::Maxwell3D ? ListTrace::Engine::Maxwell3D
+                                : type == Engines::EngineTypes::KeplerCompute
+                                    ? ListTrace::Engine::Compute
+                                    : ListTrace::Engine::Other;
+            const u64 wait_start = std::exchange(list_trace_wait_start, 0);
+            ListTrace::BeginEntry(wait_start != 0 ? ListTrace::Path::Waited : path,
+                                  wait_start != 0 ? ListTrace::Now() - wait_start : 0, engine,
+                                  subchannels[dma_state.subchannel], dma_state.method,
+                                  dma_state.method_count,
+                                  static_cast<u32>(header.size - command_resume_offset));
+            return true;
+        };
+        const auto end_list_trace = [&] {
+            // Only a call the front runs reaches ListTrace::BeginCall (see CallMethod).
+            auto* const engine = subchannels[dma_state.subchannel];
+            const auto type = subchannel_type[dma_state.subchannel];
+            const auto& split = VideoCommon::GpuSplit::Get();
+            const bool front_macro =
+                dma_state.method_count != 0 && dma_state.method >= MacroRegistersStart &&
+                split.Active() && split.FrontMacros() &&
+                (type == Engines::EngineTypes::Maxwell3D
+                     ? static_cast<Engines::Maxwell3D*>(engine)
+                           ->GetNativeMacroEngine()
+                           .native_turing
+                     : type == Engines::EngineTypes::KeplerCompute &&
+                           static_cast<Engines::KeplerCompute*>(engine)->FrontRunsMacros() &&
+                           static_cast<Engines::KeplerCompute*>(engine)->FrontRunsMacroWord(
+                               dma_state.method));
+            ListTrace::EndEntry(front_macro ? engine : nullptr, dma_state.method_count);
+        };
         if (submitted) {
             const std::span<const CommandHeader> commands{
                 command_list.submitted_words.data() +
@@ -338,6 +378,9 @@ bool DmaPusher::Step() {
                    pending) {
             if (pending) {
                 // Parsed again once the GPU copied the list; other channels run meanwhile.
+                if (ListTrace::g_enabled && list_trace_wait_start == 0) {
+                    list_trace_wait_start = ListTrace::Now();
+                }
                 return false;
             }
             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
@@ -346,10 +389,15 @@ bool DmaPusher::Step() {
                 CheckLiveRead(live_read_reason, header, commands, submitted_copy);
             }
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Copy);
+            const bool traced = begin_list_trace(ListTrace::Path::Copied);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+            if (traced) {
+                end_list_trace();
+            }
         } else {
-            FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+            const bool flushed =
+                FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
@@ -357,8 +405,12 @@ bool DmaPusher::Step() {
                 CheckLiveRead(live_read_reason, header, commands, submitted_copy);
             }
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Slow);
+            const bool traced = flushed && begin_list_trace(ListTrace::Path::Flushed);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+            if (traced) {
+                end_list_trace();
+            }
         }
         if (puller.HasPendingAcquire()) {
             return false;

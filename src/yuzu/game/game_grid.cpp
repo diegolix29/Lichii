@@ -55,7 +55,7 @@ void GameGrid::ApplyFilter(const QString& edit_filter_text, GameListModel* model
 }
 
 void GameGrid::UpdateIconSize() {
-    const u32 icon_size = UISettings::values.game_icon_size.GetValue();
+    const u32 icon_size = UISettings::values.game_cover_size.GetValue();
 
     int heightMargin = 0;
     int widthMargin = 80;
@@ -63,12 +63,14 @@ void GameGrid::UpdateIconSize() {
     if (UISettings::values.show_game_name) {
         switch (icon_size) {
         case 128:
+        case 160:
             heightMargin = 65;
             break;
         case 0:
             widthMargin = 120;
             heightMargin = 120;
             break;
+        case 44:
         case 64:
             heightMargin = 77;
             break;
