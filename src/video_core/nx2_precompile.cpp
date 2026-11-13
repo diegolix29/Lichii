@@ -101,6 +101,24 @@ std::vector<FileSys::VirtualDir> OpenGameFiles(u64 title_id) {
     return g_game_files();
 }
 
+/// A "recipes" folder next to the executable, where recipes shipped with the build live. Empty
+/// when the executable's directory cannot be found.
+std::filesystem::path ExeRecipesDirectory() {
+#ifdef _WIN32
+    return Common::FS::GetExeDirectory() / "recipes";
+#elif defined(__APPLE__)
+    return Common::FS::GetBundleDirectory() / "Contents/MacOS/recipes";
+#elif defined(__linux__)
+    std::error_code error;
+    if (const auto exe = std::filesystem::read_symlink("/proc/self/exe", error); !error) {
+        return exe.parent_path() / "recipes";
+    }
+    return {};
+#else
+    return {};
+#endif
+}
+
 std::filesystem::path PrecompiledPath(const std::filesystem::path& title_dir, u32 cache_version) {
     return title_dir / fmt::format("precompiled.fork-v{}.nx2prep", cache_version);
 }
@@ -112,7 +130,11 @@ std::optional<Recipe> FindRecipe(u64 title_id, const std::filesystem::path& titl
         forced != nullptr && *forced != '\0') {
         candidates.emplace_back(forced);
     }
-    for (const auto& folder : {title_dir, Common::FS::GetExeDirectory() / "recipes"}) {
+    const std::filesystem::path exe_recipes = ExeRecipesDirectory();
+    for (const std::filesystem::path& folder : {title_dir, exe_recipes}) {
+        if (folder.empty()) {
+            continue;
+        }
         std::error_code error;
         std::vector<std::filesystem::path> found;
         for (std::filesystem::directory_iterator it{folder, error}, end; !error && it != end;
@@ -162,7 +184,7 @@ std::filesystem::path EnsurePrecompiledFile(u64 title_id, const std::filesystem:
                      "Precompiled pipelines: no {} and no recipe for {:016X} (looked in {} and {})",
                      precompiled.filename().string(), title_id,
                      Common::FS::PathToUTF8String(title_dir),
-                     Common::FS::PathToUTF8String(Common::FS::GetExeDirectory() / "recipes"));
+                     Common::FS::PathToUTF8String(ExeRecipesDirectory()));
             return {};
         }
         return precompiled;
