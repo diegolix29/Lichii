@@ -499,7 +499,7 @@ bool DeviceMemoryManager<Traits>::ReadKept(DAddr address, void* dest_pointer, si
     while (size != 0) {
         const size_t page = address >> Memory::YUZU_PAGEBITS;
         const size_t offset = address & Memory::YUZU_PAGEMASK;
-        const size_t amount = (std::min)(Memory::YUZU_PAGESIZE - offset, size);
+        const size_t amount = (std::min<size_t>)(Memory::YUZU_PAGESIZE - offset, size);
         if (const auto phys = tracked_entries[page].compressed_physical_ptr; phys != 0) {
             handled = true; // mapped since the caller looked
             std::memcpy(dest, GetPointerFromRaw<u8>((PAddr(phys - 1) << Memory::YUZU_PAGEBITS) + offset),
@@ -532,7 +532,7 @@ bool DeviceMemoryManager<Traits>::WriteKept(DAddr address, const void* src_point
     while (size != 0) {
         const size_t page = address >> Memory::YUZU_PAGEBITS;
         const size_t offset = address & Memory::YUZU_PAGEMASK;
-        const size_t amount = (std::min)(Memory::YUZU_PAGESIZE - offset, size);
+        const size_t amount = (std::min<size_t>)(Memory::YUZU_PAGESIZE - offset, size);
         if (const auto phys = tracked_entries[page].compressed_physical_ptr; phys != 0) {
             handled = true;
             std::memcpy(GetPointerFromRaw<u8>((PAddr(phys - 1) << Memory::YUZU_PAGEBITS) + offset), src,
