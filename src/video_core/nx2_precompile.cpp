@@ -75,6 +75,24 @@ std::optional<std::vector<u8>> ReadWholeFile(const std::filesystem::path& path) 
     return bytes;
 }
 
+/// A "recipes" folder next to the executable, where recipes shipped with the build live. Empty
+/// when the executable's directory cannot be found.
+std::filesystem::path ExeRecipesDirectory() {
+#ifdef _WIN32
+    return Common::FS::GetExeDirectory() / "recipes";
+#elif defined(__APPLE__)
+    return Common::FS::GetBundleDirectory() / "Contents/MacOS/recipes";
+#elif defined(__linux__)
+    std::error_code error;
+    if (const auto exe = std::filesystem::read_symlink("/proc/self/exe", error); !error) {
+        return exe.parent_path() / "recipes";
+    }
+    return {};
+#else
+    return {};
+#endif
+}
+
 } // Anonymous namespace
 
 unsigned Threads() {
@@ -99,24 +117,6 @@ std::vector<FileSys::VirtualDir> OpenGameFiles(u64 title_id) {
         return {};
     }
     return g_game_files();
-}
-
-/// A "recipes" folder next to the executable, where recipes shipped with the build live. Empty
-/// when the executable's directory cannot be found.
-std::filesystem::path ExeRecipesDirectory() {
-#ifdef _WIN32
-    return Common::FS::GetExeDirectory() / "recipes";
-#elif defined(__APPLE__)
-    return Common::FS::GetBundleDirectory() / "Contents/MacOS/recipes";
-#elif defined(__linux__)
-    std::error_code error;
-    if (const auto exe = std::filesystem::read_symlink("/proc/self/exe", error); !error) {
-        return exe.parent_path() / "recipes";
-    }
-    return {};
-#else
-    return {};
-#endif
 }
 
 std::filesystem::path PrecompiledPath(const std::filesystem::path& title_dir, u32 cache_version) {
