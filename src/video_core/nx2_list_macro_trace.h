@@ -19,6 +19,14 @@
 // code and its first calls (parameters, registers read, methods written) are written once to
 // EDEN_NX2_DEBUG_DIR (else list-macros in the log directory) as list-macro-<engine>-<hash>.txt.
 //
+// The trace also follows the data RAM words such calls store. A front call that may use the data
+// RAM then runs on the interpreter, which reports its data RAM reads and writes. A call that reads
+// a stored word is a reader: the trace lines add, by reader, the words it read and who stored them,
+// the methods that carry each word as is (a replay with the words tagged), and where an inline
+// upload (0x6c/0x6d) or a 3D constant buffer load (0x8e4) puts it. The back reports a QMD it loads
+// or runs (PCAS, inline QMD) and a 3D constant buffer it binds that holds such an address. The
+// reader's code and first calls go to its dump file.
+//
 // EDEN_NX2_LIST_MACRO_VERIFY=1 (implies the trace): every such call the front ran is run again
 // with its GPU-written words replaced by tags (CheckForwarding), and the trace lines add, by
 // macro, how many calls only forward those words to the methods they write, which methods take
@@ -55,16 +63,19 @@ void BeginEntry(Path path, u64 waited_ns, Engine engine, const void* engine_obje
 void EndEntry(const void* macro_engine, u32 method_count);
 
 struct Call {
-    bool capture{}; ///< Note the call's register reads and method writes
+    bool capture{};  ///< Note the call's register reads and method writes
+    bool data_ram{}; ///< Run it on the interpreter, which notes its data RAM reads and writes
     std::vector<std::pair<u32, u32>> reads;
     std::vector<std::pair<u32, u32>> writes;
 };
 
-/// GPU thread, as a front macro call starts with `data_ram` as it is then: the call to note if
-/// a GPU-written entry fed it (valid until EndCall), else nullptr.
+/// GPU thread, as a front macro call starts with `data_ram` and the engine's `registers` as they
+/// are then: the call to note if a GPU-written entry fed it or it may read a data RAM word one of
+/// those stored (valid until EndCall), else nullptr. With `data_ram` set, the engine runs it on
+/// the interpreter.
 Call* BeginCall(Engine engine, const void* engine_object, u32 method, std::span<const u32> code,
                 u64 code_generation, u32 start, std::span<const u32> parameters,
-                std::span<const u32> data_ram);
+                std::span<const u32> data_ram, std::span<const u32> registers);
 
 inline void NoteRead(Call* call, u32 address, u32 value) {
     if (call != nullptr && call->capture) {
@@ -78,8 +89,18 @@ inline void NoteWrite(Call* call, u32 address, u32 value) {
     }
 }
 
-/// The call ran; on the split's back in the front's place if `on_back` (its effects unseen).
-void EndCall(Call& call, bool on_back);
+using DataRamAccesses = std::span<const std::pair<u32, u32>>;
+
+/// The call ran; on the split's back in the front's place if `on_back` (its effects unseen). With
+/// Call::data_ram, the interpreter's data RAM reads and writes (address, value) in order.
+void EndCall(Call& call, bool on_back, DataRamAccesses data_ram_reads = {},
+             DataRamAccesses data_ram_writes = {});
+
+/// Any thread: the native QMD scheduler read the QMD at `address` to load or run it.
+void NoteQmd(u64 address, std::span<const u32, 64> qmd);
+
+/// Any thread: Maxwell3D bound [address, address + size) to constant buffer `slot` of `stage`.
+void NoteConstBufferBind(u32 stage, u32 slot, u64 address, u32 size);
 
 enum class Forwarding : u8 {
     Forwards,     ///< Each write is fixed by the other words or is one GPU-written word as is

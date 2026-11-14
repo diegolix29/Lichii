@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
     common/addon_config.cpp
+    common/thread_worker.cpp
     video_core/vulkan_overlay_filter.cpp
     video_core/buffer_cache_ports.cpp
     video_core/unswizzle_workers.cpp
@@ -19,13 +19,18 @@ add_executable(tests
     video_core/gpu_timestamp.cpp
     video_core/semaphore_waiters.cpp
     video_core/hdr_output.cpp
+    core/mii_model.cpp
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
     core/nx2_thread_stats.cpp
     core/nx2_debug_server.cpp
+    core/nx2_zip.cpp
     core/nx2_present_pacer.cpp
+    core/nx2_fence_action.cpp
+    core/nx2_frame_interval.cpp
     core/ldn_lan_protocol.cpp
     core/perf_stats.cpp
+    core/key_derivation.cpp
     common/display_hdr.cpp
     common/dkb_cpu_trace.cpp
     common/dkb_frame_trace.cpp
@@ -45,6 +50,7 @@ add_executable(tests
     audio_core/hardware_audio_codec.cpp
     core/gpu_dirty_memory.cpp
     core/memory_acquire.cpp
+    core/memory_span.cpp
     core/builtin_patches.cpp
     core/builtin_font_glyphs.cpp
     core/system_test_context.h
@@ -58,11 +64,16 @@ add_executable(tests
     video_core/storage_buffer_pointer_tracking.cpp
     video_core/storage_write_extent.cpp
     video_core/storage_buffer_control_flow.cpp
+    video_core/conditional_barrier.cpp
     video_core/storage_buffer_shared_tracking.cpp
     core/nup_validation.cpp
     core/nx_archive.cpp
     frontend_common/nx_archive.cpp
     core/vfs_vector.cpp
+    core/ncz_cache.cpp
+    core/ncz_decompressor.cpp
+    core/ncz_io_guards.cpp
+    core/ncz_container.cpp
     core/file_sys_parsers.cpp
     input_common/calibration_lifetime.cpp
     video_core/ampere_logged_numeric.cpp
@@ -86,6 +97,7 @@ add_executable(tests
     video_core/fire_emblem_upscale.cpp
     video_core/dlss_contract.cpp
     video_core/dlss_mode.cpp
+    video_core/frame_gen_choice.cpp
     video_core/ampere_fast_fusion.cpp
     video_core/ampere_async_copy.cpp
     video_core/ampere_trap_guards.cpp
@@ -95,6 +107,7 @@ add_executable(tests
     video_core/async_shader_emission.cpp
     video_core/oot_network.cpp
     video_core/page_filter.cpp
+    video_core/query_stream.cpp
     video_core/pipeline_optimization.cpp
     video_core/spirv_atomic_retry.cpp
     video_core/spirv_storage_alignment.cpp
@@ -102,6 +115,7 @@ add_executable(tests
     video_core/mesh_fallback.cpp
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
+    video_core/gpu_trace.cpp
     video_core/gpu_written_pages.cpp
     video_core/nx2_semaphore_mirror.cpp
     video_core/command_writer.cpp
@@ -152,6 +166,7 @@ add_executable(tests
     video_core/ssa_fixed_variables.cpp
     video_core/virtual_range_cache.cpp
     video_core/ocarina_upscale.cpp
+    video_core/ocarina_camera.cpp
     video_core/fsr4_support.cpp
     common/bit_field.cpp
     common/bit_util.cpp
@@ -162,6 +177,7 @@ add_executable(tests
     common/event.cpp
     common/fibers.cpp
     common/fs_iterate.cpp
+    frontend_common/install_keys.cpp
     common/game_presets.cpp
     common/host_memory.cpp
     common/host_memory_failure.cpp
@@ -182,7 +198,10 @@ add_executable(tests
     common/unique_function.cpp
     common/zstd_compression.cpp
     core/core_timing.cpp
+    core/host_wait_margin.cpp
+    core/local_redirect.cpp
     core/nextendo_redirect.cpp
+    core/filesystem_rename.cpp
     core/thread_startup_policy.cpp
     core/nup_writer.cpp
     core/nup_metadata.cpp
@@ -196,6 +215,8 @@ add_executable(tests
     core/internal_network/socket_proxy.cpp
     core/priority_queue.cpp
     core/internal_network/network.cpp
+    core/numeric_name_info.cpp
+    core/numeric_name_info_ipc.cpp
     video_core/memory_tracker.cpp
     video_core/invalidation_accumulator.cpp
     video_core/memory_manager_runs.cpp
@@ -207,6 +228,7 @@ add_executable(tests
     video_core/ampere_lowering.cpp
     video_core/ampere_geometry.cpp
     video_core/ampere_i2f.cpp
+    video_core/ampere_gradient.cpp
     video_core/ampere_returns.cpp
     video_core/ampere_guarded_ulea.cpp
     video_core/ampere_compute_lowering.cpp
@@ -217,6 +239,8 @@ add_executable(tests
     video_core/turing_macro_ram.cpp
     video_core/uniform_stream_reuse.cpp
     video_core/usage_tracker.cpp
+    video_core/nx2_backx.cpp
+    video_core/vertex_input_cache.cpp
     video_core/shader_invalidation.cpp
     video_core/descriptor_table.cpp
     video_core/descriptor_payload_growth.cpp
@@ -234,11 +258,28 @@ add_executable(tests
 
 create_target_directory_groups(tests)
 
-target_link_libraries(tests PRIVATE common core audio_core input_common video_core frontend_common)
+target_link_libraries(tests PRIVATE common core audio_core input_common video_core frontend_common ZLIB::ZLIB)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
+add_executable(ncz_tests
+    core/ncz_cache.cpp
+    core/ncz_decompressor.cpp
+    core/ncz_io_guards.cpp
+    ../core/crypto/ncz_cache.cpp
+    ../core/crypto/ncz_decompressor.cpp
+    ../core/crypto/aes_util.cpp
+    ../core/file_sys/vfs/vfs.cpp
+    ../core/file_sys/vfs/vfs_vector.cpp)
+target_sources(ncz_tests PRIVATE
+    ../core/file_sys/fssystem/fssystem_utility.cpp
+    ../core/file_sys/fssystem/fssystem_aes_ctr_storage.cpp
+    ../core/file_sys/fssystem/fssystem_alignment_matching_storage_impl.cpp)
+target_link_libraries(ncz_tests PRIVATE common OpenSSL::Crypto zstd::zstd
+    ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
+add_test(NAME ncz_tests COMMAND ncz_tests)
+
 if (TARGET dynarmic::dynarmic)
-    target_sources(tests PRIVATE core/jit_ordered_loads.cpp core/window_trace.cpp)
+    target_sources(tests PRIVATE core/jit_codegen_options.cpp core/jit_ordered_loads.cpp core/window_trace.cpp)
     target_link_libraries(tests PRIVATE dynarmic::dynarmic)
 endif()
 
@@ -252,8 +293,13 @@ add_executable(profile_migration_tests
 target_link_libraries(profile_migration_tests PRIVATE common Catch2::Catch2WithMain)
 add_test(NAME profile_migration_tests COMMAND profile_migration_tests)
 
+add_executable(log_file_flush_tests
+    common/log_file_flush.cpp)
+target_link_libraries(log_file_flush_tests PRIVATE common Catch2::Catch2WithMain)
+add_test(NAME log_file_flush_tests COMMAND log_file_flush_tests)
+
 if (TARGET SDL3::SDL3)
-    add_executable(sdl_window_state_tests yuzu_cmd/sdl_window_state.cpp)
+    add_executable(sdl_window_state_tests lichii_cmd/sdl_window_state.cpp)
     target_link_libraries(sdl_window_state_tests PRIVATE SDL3::SDL3 Catch2::Catch2WithMain)
     add_test(NAME sdl_window_state_tests COMMAND sdl_window_state_tests)
 endif()
@@ -323,14 +369,16 @@ target_compile_definitions(shader_translation_tests PRIVATE
 add_test(NAME shader_translation_tests COMMAND shader_translation_tests)
 
 if (NOT ANDROID)
-    target_sources(tests PRIVATE input_common/joycon_subcommand_response.cpp)
+    target_sources(tests PRIVATE input_common/joycon_subcommand_response.cpp
+                                 input_common/rumble_mapping.cpp)
     target_link_libraries(tests PRIVATE SDL3::SDL3)
 
     add_executable(config_tests
         common/first_run_config.cpp
         common/recommended_settings.cpp
         ../frontend_common/profile_import.cpp
-        ../frontend_common/config.cpp)
+        ../frontend_common/config.cpp
+        ../frontend_common/recommended_settings.cpp)
     target_link_libraries(config_tests PRIVATE common SimpleIni::SimpleIni Catch2::Catch2WithMain
         ${PLATFORM_LIBRARIES})
     add_test(NAME config_tests COMMAND config_tests)

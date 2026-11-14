@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -58,6 +57,7 @@ public:
 
     /// Marks the memory behind [address, address + size) cold (Common::HostMemory::HintCold),
     /// from a low-priority thread: data the host GPU has its own copy of, e.g. uploaded textures.
+    /// Only while the host is short of RAM (Common::IsHostLowOnMemory).
     void HintCold(DAddr address, size_t size);
 
     DAddr Allocate(size_t size);
@@ -155,6 +155,17 @@ public:
 
     // New batch API to update multiple ranges with a single lock acquisition.
     void UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta);
+
+    /// Held by a thread from before it drops the lock it untracked pages under until it has
+    /// applied their count changes (RasterizerVulkan::OnCPUWrite). Unmap waits for every holder
+    /// after invalidating the range: a change applied once the page has no backing is lost, and
+    /// the page would keep its count and never be protected again.
+    void BeginDeferredCachedUpdates() {
+        deferred_cached_updates.fetch_add(1, std::memory_order_relaxed);
+    }
+    void EndDeferredCachedUpdates() {
+        deferred_cached_updates.fetch_sub(1, std::memory_order_release);
+    }
 
     /// Traps the next guest CPU read of these pages, to learn which GPU writes the CPU reads.
     void ArmReadTraps(DAddr addr, size_t size);
@@ -297,6 +308,7 @@ private:
     std::unique_ptr<CachedPages> cached_pages;
     Common::RangeMutex counter_guard;
     std::mutex mapping_guard;
+    std::atomic<u32> deferred_cached_updates{};
 
     /// Taken before mapping_guard. The pages KeepWrites keeps, by device page; null reads zero.
     std::mutex kept_mutex;

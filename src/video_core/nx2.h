@@ -27,6 +27,10 @@ namespace Tegra {
 // Ampere classes and the Turing+ macro ISA, which Eden's Maxwell engines don't implement.
 inline std::atomic<bool> g_nx2_ampere{false};
 
+// The frame interval nx2:vi2 paces the game's presents to, in ns (0: not paced there, or not
+// known). Frame generation plans against it (FrameGenPacer).
+inline std::atomic<u64> g_nx2_guest_frame_interval_ns{0};
+
 // GPU VA that nx2:gpu GetVaRange and GetUserPartition report to NVN. The in-process
 // allocator hands out addresses in [Nx2GpuVaStart, Nx2GpuVaEnd). NvRm's AllocAsEx range
 // can be smaller; the GMMU page tables still have to cover this one.

@@ -4,6 +4,7 @@
 #include <optional>
 #include <array>
 #include <cstdlib>
+#include <chrono>
 #include <atomic>
 #include <memory>
 #include <new>
@@ -20,6 +21,7 @@
 #include "common/adpf.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "common/shutdown_progress.h"
 #include "common/string_util.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
@@ -68,6 +70,7 @@
 #include "core/hle/service/services.h"
 #include "core/hle/service/set/system_settings_server.h"
 #include "core/hle/service/sm/sm.h"
+#include "core/internal_network/local_redirect.h"
 #include "core/internal_network/network.h"
 #include "core/loader/loader.h"
 #include "core/loader/nx.h"
@@ -80,6 +83,7 @@
 #include "hid_core/hid_core.h"
 #include "network/network.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_stutter_trace.h"
 #include "video_core/nx2_precompile.h"
 #include "video_core/renderer_base.h"
@@ -90,7 +94,15 @@ namespace Core {
 std::atomic<u64> g_nx2_present_count{};
 static_assert(std::atomic<u64>::is_always_lock_free);
 std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns{};
-std::atomic<u32> g_nx2_present_time_services{};
+
+void RecordGuestPresent() {
+    const u64 present = g_nx2_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const u64 present_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+    g_nx2_present_times_ns[present % g_nx2_present_times_ns.size()].store(
+        present_ns, std::memory_order_relaxed);
+}
 
 FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
                                          const std::string& path) {
@@ -375,6 +387,20 @@ struct System::Impl {
     SystemResultStatus InitializeKernel(System& system) {
         LOG_DEBUG(Core, "initialized OK");
 
+        // ShutdownMainProcess releases it after a Switch 2 game; create it before the check below
+        // so an empty slot alone does not rerun the full Initialize.
+        if (guest_memory_released) {
+            guest_memory_released = false;
+            try {
+                device_memory.emplace();
+            } catch (const std::bad_alloc&) {
+                LOG_CRITICAL(Core, "Failed to allocate guest memory");
+            }
+            if (device_memory && !device_memory->buffer.BackingBasePointer()) {
+                device_memory.reset();
+            }
+        }
+
         // Setting changes may require a full system reinitialization (e.g., disabling multicore).
         ReinitializeIfNecessary(system);
         if (!device_memory) {
@@ -382,6 +408,21 @@ struct System::Impl {
             return SystemResultStatus::ErrorMemoryAllocation;
         }
         kernel.Initialize();
+        return SystemResultStatus::Success;
+    }
+
+    SystemResultStatus InitializeForGpuReplay(System& system, Frontend::EmuWindow& emu_window,
+                                              u64 replay_program_id) {
+        if (const auto result = InitializeKernel(system); result != SystemResultStatus::Success) {
+            return result;
+        }
+        host1x_core.emplace(system);
+        VideoCore::CreateGPU(gpu_core, emu_window, system);
+        if (!gpu_core) {
+            return SystemResultStatus::ErrorVideoCore;
+        }
+        is_powered_on = true;
+        perf_stats.emplace(replay_program_id);
         return SystemResultStatus::Success;
     }
 
@@ -424,6 +465,7 @@ struct System::Impl {
         Kernel::KSystemControl::SetApplicationProgramId(switch2_program_id.value_or(0));
         Settings::SetCurrentProgramIsSwitch2(switch2_program);
         Settings::SetAstcRecompressionOverride(std::nullopt);
+        Network::LocalRedirect::Configure();
 
         if (const auto ram = Common::GetHostRam();
             switch2_program && Common::IsBelowSwitch2RamMinimum(ram)) {
@@ -585,12 +627,14 @@ struct System::Impl {
             game_info.version = title_version;
             room_member->SendGameInfo(game_info);
         }
+        VideoCore::Nx2Debug::BeginSession();
         debug_service = Nx2Debug::MaybeStartService(system, name, params.program_id);
         Nx2Sampler::StartFromEnvironment();
         return SystemResultStatus::Success;
     }
 
     void ShutdownMainProcess() {
+        VideoCore::Nx2Debug::EndSession();
         debug_service.reset();
         // Waits for a call in progress (it opens the RomFS, a quick step).
         VideoCommon::Nx2Precompile::SetGameFiles(0, {});
@@ -615,16 +659,28 @@ struct System::Impl {
         core_timing.SyncPause(false);
         Network::CancelPendingSocketOperations();
         kernel.SuspendEmulation(true);
+        if (service_manager) {
+            // Services on host threads that still wait for one on the guest cores give up (after
+            // a close during the boot shader load, the guest cores never started).
+            service_manager->Close();
+        }
         kernel.CloseServices();
+        applet_manager.DropPendingProcess();
         kernel.ShutdownCores();
+        // Each step done tells the frontend the teardown still moves (see
+        // Common::ShutdownProgress); the GPU's (pipeline caches) reports its own steps.
+        Common::NoteShutdownProgress();
         services.reset();
         service_manager.reset();
         fs_controller.Reset();
         cheat_engine.reset();
         core_timing.ClearPendingEvents();
         app_loader.reset();
+        Common::NoteShutdownProgress();
         audio_core.reset();
+        Common::NoteShutdownProgress();
         gpu_core.reset();
+        Common::NoteShutdownProgress();
         host1x_core.reset();
         perf_stats.reset();
         cpu_manager.Shutdown();
@@ -640,6 +696,14 @@ struct System::Impl {
 
         // Reset all glue registrations
         arp_manager.ResetAll();
+
+        // The guest RAM section keeps every page the game touched until it is destroyed (up to
+        // 12 GiB), and the next Load reuses it. Switch 2 only: Switch 1 keeps its behaviour.
+        // InitializeKernel creates it again, sized for the next game.
+        if (Settings::CurrentProgramIsSwitch2()) {
+            device_memory.reset();
+            guest_memory_released = true;
+        }
 
         LOG_DEBUG(Core, "Shutdown OK");
     }
@@ -693,6 +757,7 @@ struct System::Impl {
     std::optional<Core::PerfStats> perf_stats;
     std::optional<Tegra::Host1x::Host1x> host1x_core;
     std::optional<Core::DeviceMemory> device_memory;
+    bool guest_memory_released{};
     std::optional<AudioCore::AudioCore> audio_core;
     std::optional<Memory::CheatEngine> cheat_engine;
     std::optional<Tools::Freezer> memory_freezer;
@@ -801,6 +866,11 @@ bool System::GetNVDECActive() {
 
 void System::InitializeDebugger() {
     impl->InitializeDebugger(*this, Settings::values.gdbstub_port.GetValue());
+}
+
+SystemResultStatus System::InitializeForGpuReplay(Frontend::EmuWindow& emu_window,
+                                                  u64 program_id) {
+    return impl->InitializeForGpuReplay(*this, emu_window, program_id);
 }
 
 SystemResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::string& filepath,

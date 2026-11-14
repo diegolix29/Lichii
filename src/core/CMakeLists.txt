@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_library(core STATIC
@@ -21,6 +20,7 @@ add_library(core STATIC
     game_settings.h
     core_timing.cpp
     core_timing.h
+    host_wait_margin.h
     cpu_manager.cpp
     cpu_manager.h
     launch_params.cpp
@@ -35,6 +35,8 @@ add_library(core STATIC
     crypto/key_manager.h
     crypto/ncz_decompressor.cpp
     crypto/ncz_decompressor.h
+    crypto/ncz_cache.cpp
+    crypto/ncz_cache.h
     crypto/partition_data_manager.cpp
     crypto/partition_data_manager.h
     crypto/xts_encryption_layer.cpp
@@ -46,10 +48,14 @@ add_library(core STATIC
     debugger/gdbstub.h
     debugger/gdbstub_arch.cpp
     debugger/gdbstub_arch.h
+    debugger/nx2_bug_bundle.cpp
+    debugger/nx2_bug_bundle.h
     debugger/nx2_debug_server.cpp
     debugger/nx2_debug_server.h
     debugger/nx2_debug_tools.cpp
     debugger/nx2_debug_tools.h
+    debugger/nx2_zip.cpp
+    debugger/nx2_zip.h
     device_memory.cpp
     device_memory.h
     device_memory_manager.h
@@ -1070,6 +1076,8 @@ add_library(core STATIC
     hle/service/nx2_streamplay.h
     hle/service/nx2_stub_interface.h
     hle/service/nx2_gsv.h
+    hle/service/nx2_fence_action.h
+    hle/service/nx2_frame_interval.h
     hle/service/nx2_movie_clock.h
     hle/service/nx2_video_input_queue.h
     hle/service/nx2_image_layout.h
@@ -1107,6 +1115,8 @@ add_library(core STATIC
     hle/service/sockets/nsd.h
     hle/service/sockets/nextendo_redirect.cpp
     hle/service/sockets/nextendo_redirect.h
+    hle/service/sockets/numeric_name_info.cpp
+    hle/service/sockets/numeric_name_info.h
     hle/service/sockets/sfdnsres.cpp
     hle/service/sockets/sfdnsres.h
     hle/service/sockets/sockets.cpp
@@ -1167,6 +1177,8 @@ add_library(core STATIC
     hle/service/wlan/wlan.h
     internal_network/emu_net_state.cpp
     internal_network/emu_net_state.h
+    internal_network/local_redirect.cpp
+    internal_network/local_redirect.h
     internal_network/network.cpp
     internal_network/network.h
     internal_network/network_interface.cpp
@@ -1231,6 +1243,10 @@ if (WIN32)
         target_link_libraries(core PRIVATE iw)
         message(STATUS "Linking 'core' with iw on Linux.")
     endif()
+endif()
+
+if (APPLE)
+    target_link_libraries(core PRIVATE "-framework SystemConfiguration" "-framework CoreFoundation")
 endif()
 
 if (MSVC)

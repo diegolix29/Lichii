@@ -76,6 +76,10 @@ struct GpuSplitTestAccess {
         return split.hook_requested.load();
     }
 
+    static void SetBackRunning(GpuSplit& split, bool running) {
+        split.back_running.store(running, std::memory_order_release);
+    }
+
     static u64 NearWrap() {
         return GpuSplit::RingWords - 1;
     }
@@ -96,6 +100,15 @@ struct GpuSplitTestAccess {
     static u64 WritesTarget(const GpuSplit& split, const Tegra::MemoryManager& memory,
                             GPUVAddr address, u64 size) {
         return split.WritesTarget(memory, address, size);
+    }
+
+    /// The ring word at `position`.
+    static u64 Word(const GpuSplit& split, u64 position) {
+        return split.ring[position & GpuSplit::RingMask];
+    }
+
+    static u64 StateKind() {
+        return static_cast<u64>(GpuSplit::Kind::State);
     }
 
     /// Whether writes to two device addresses share a slot of the noted write positions.
@@ -1599,4 +1612,194 @@ TEST_CASE("Split macro DMA reads wait only for the queued work that can write th
     split.Drain(VideoCommon::DrainSite::Other);
     CHECK(engine.regs.reg_array[state] == 0x88888888);
     CHECK(engine.regs.reg_array[copy] == 0x88888888);
+}
+
+TEST_CASE("Split front sends state writes to the back as register blocks that match single writes",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    {
+        // Changed state writes in a row are one entry: the writes, their dirty flags and the
+        // last one that ends fast draw reuse.
+        Fixture f;
+        VideoCommon::GpuSplit split;
+        Access::Initialize(split, f.system);
+        auto& engine = f.fast;
+        const u32 first = f.state_methods[10];
+        const u32 second = f.state_methods[20];
+        engine.FrontCallMethod(f.system, split, MAXWELL3D_REG_INDEX(vertex_buffer.first), 1, true);
+        engine.FrontCallMethod(f.system, split, first, 0x1111, true);
+        engine.FrontCallMethod(f.system, split, second, 0x2222, true);
+        engine.FrontCallMethod(f.system, split, second, 0x2222, true); // Same value: dropped
+        const u64 start = Access::End(split); // Nothing sent since the executable write
+        REQUIRE(split.Position() == start + 7);
+        const u64 head = Access::Word(split, start);
+        CHECK((head & 0xf) == Access::StateKind());
+        CHECK((head >> 32) == 2);
+        CHECK(Access::Word(split, start + 5) == (u64{first} | u64{0x1111} << 32));
+        CHECK(Access::Word(split, start + 6) == (u64{second} | u64{0x2222} << 32));
+        const auto flag_set = [&](u8 flag) {
+            return ((Access::Word(split, start + 1 + flag / 64) >> (flag % 64)) & 1) != 0;
+        };
+        for (const u32 method : {first, second}) {
+            CHECK(flag_set(engine.dirty.tables[0][method]));
+            CHECK(flag_set(engine.dirty.tables[1][method]));
+        }
+    }
+
+    // The same front stream through an engine that sends blocks and one that sends every write
+    // as its own entry, each with its back: registers, shadow RAM, dirty
+    // flags, draws and fast draw breaks agree. Macro 0 sends its three parameters to state
+    // registers; instance loops leave deferred draws for state writes to issue.
+    Fixture f;
+    const std::array<u32, 3> macro_registers{f.state_methods[30], f.state_methods[31],
+                                             f.state_methods[200]};
+    std::vector<u32> code;
+    for (const auto instruction :
+         {FifoInstruction(macro_registers[0], false), FifoInstruction(macro_registers[1], false),
+          FifoInstruction(macro_registers[2], true), Encode(Mme{})}) {
+        code.insert(code.end(), instruction.begin(), instruction.end());
+    }
+    std::array<VideoCommon::GpuSplit, 2> splits;
+    std::array<Maxwell3D*, 2> engines{&f.fast, &f.slow};
+    for (size_t i = 0; i < 2; ++i) {
+        Access::Start(splits[i], f.system);
+        engines[i]->SetNativeTuringMacroMode(true);
+    }
+    SCOPE_EXIT {
+        for (auto& split : splits) {
+            split.Stop();
+        }
+    };
+    struct Step {
+        u32 method;
+        u32 argument;
+        bool is_last;
+    };
+    struct Result {
+        std::array<u32, Maxwell3D::Regs::NUM_REGS> regs;
+        std::array<u32, Maxwell3D::Regs::NUM_REGS> shadow;
+        Maxwell3D::DirtyState::Flags dirty;
+        bool broke;
+        u32 last_break;
+    };
+    const auto run = [&](size_t i, const std::vector<Step>& steps) {
+        auto& split = splits[i];
+        auto& engine = *engines[i];
+        const u64 serial = VideoCommon::Nx2FastDraw::Serial();
+        for (const Step& step : steps) {
+            engine.FrontCallMethod(f.system, split, step.method, step.argument, step.is_last);
+        }
+        // What the back holds in its method sink is state too (neutral, as FinishFrontMacro).
+        split.Defer([&engine, &f] { engine.ConsumeSink(f.system); },
+                    VideoCommon::GpuSplit::FastDrawNeutral);
+        split.Drain(VideoCommon::DrainSite::Other);
+        return Result{engine.regs.reg_array, engine.shadow_state.reg_array, engine.dirty.flags,
+                      VideoCommon::Nx2FastDraw::Serial() != serial,
+                      VideoCommon::Nx2FastDraw::g_last_break.load()};
+    };
+    std::vector<Step> setup{{MAXWELL3D_REG_INDEX(load_mme.instruction_ptr), 0, true}};
+    for (const u32 word : code) {
+        setup.push_back({MAXWELL3D_REG_INDEX(load_mme.instruction), word, true});
+    }
+    setup.push_back({MAXWELL3D_REG_INDEX(load_mme.start_address_ptr), 0, true});
+    setup.push_back({MAXWELL3D_REG_INDEX(load_mme.start_address), 0, true});
+    run(0, setup);
+    run(1, setup);
+    // The second engine's front was made without blocks; from now on its back takes the same
+    // fast paths as the first's (CallMethodFast attributes fast draw breaks differently).
+    f.slow.fast_maxwell3d = true;
+    constexpr u32 subsequent = 1u << 26;
+    std::mt19937 rng{7};
+    const auto random = [&rng](u32 range) { return static_cast<u32>(rng() % range); };
+    for (u32 round = 0; round < 400; ++round) {
+        CAPTURE(round);
+        std::vector<Step> steps;
+        for (u32 step = 0; step < 40; ++step) {
+            const u32 kind = rng() % 100;
+            if (kind < 50) {
+                const u32 method = f.state_methods[rng() % f.state_methods.size()];
+                steps.push_back({method, RandomArgument(rng, method, f.slow), true});
+            } else if (kind < 62) {
+                for (u32 p = 0; p < 3; ++p) {
+                    steps.push_back({0xe00 + (p != 0 ? 1U : 0U),
+                                     random(3) == 0 ? static_cast<u32>(rng()) : random(4), p == 2});
+                }
+            } else if (kind < 72) {
+                steps.push_back({DrawBegin, random(2) == 0 ? subsequent : 0, true});
+                steps.push_back({MAXWELL3D_REG_INDEX(vertex_buffer.first), random(4), true});
+                steps.push_back({MAXWELL3D_REG_INDEX(vertex_buffer.count), 3 + random(4), true});
+                steps.push_back({DrawEnd, 0, true});
+            } else if (kind < 85) {
+                const u32 method = executable_methods[rng() % executable_methods.size()];
+                steps.push_back({method, RandomArgument(rng, method, f.slow), true});
+            } else if (kind < 90) {
+                steps.push_back({CbData + random(16), static_cast<u32>(rng()), true});
+            } else {
+                // Track, track with filter, passthrough or replay.
+                steps.push_back({ShadowControl, random(4), true});
+            }
+        }
+        const Result blocks = run(0, steps);
+        const Result single = run(1, steps);
+        REQUIRE(blocks.regs == single.regs);
+        REQUIRE(blocks.shadow == single.shadow);
+        REQUIRE(blocks.dirty == single.dirty);
+        REQUIRE(blocks.broke == single.broke);
+        REQUIRE(blocks.last_break == single.last_break);
+        const auto& a = f.fast.draw_manager.draw_state;
+        const auto& b = f.slow.draw_manager.draw_state;
+        REQUIRE(a.draw_mode == b.draw_mode);
+        REQUIRE(a.instance_count == b.instance_count);
+        REQUIRE(a.drawn_instances == b.drawn_instances);
+        if (rng() % 4 == 0) {
+            for (auto* engine : engines) {
+                engine->dirty.flags.reset();
+            }
+        }
+    }
+}
+
+TEST_CASE("Unsplit draw reuse requires the sole GPU scheduler owner",
+          "[video_core][fast_draw][unsplit_fast_draw]") {
+    using Split = VideoCommon::GpuSplit;
+    using Access = VideoCommon::GpuSplitTestAccess;
+    auto& global = Split::Get();
+    REQUIRE_FALSE(global.BackRunning());
+    std::array<bool, 4> allowed{};
+    // Fresh thread-local state, so the test does not mark Catch's thread as a GPU owner.
+    std::jthread owner([&] {
+        allowed[0] = Split::CanReuseDrawState();
+        Split::MarkGpuThread();
+        allowed[1] = Split::CanReuseDrawState();
+        Access::SetBackRunning(global, true);
+        SCOPE_EXIT { Access::SetBackRunning(global, false); };
+        allowed[2] = Split::CanReuseDrawState();
+        Access::SetBackRunning(global, false);
+        allowed[3] = Split::CanReuseDrawState();
+    });
+    owner.join();
+    REQUIRE_FALSE(allowed[0]); // Unmarked service thread.
+    REQUIRE(allowed[1]);       // Sole GPU scheduler owner.
+    REQUIRE_FALSE(allowed[2]); // Front while a back thread owns the scheduler.
+    REQUIRE(allowed[3]);       // Sole GPU owner again after the back stops.
+    REQUIRE_FALSE(Split::CanReuseDrawState()); // No ownership leaked to this thread.
+}
+
+TEST_CASE("Draw reuse remains eligible on the actual split worker",
+          "[video_core][fast_draw][unsplit_fast_draw]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    bool on_back{};
+    bool allowed{};
+    Access::Start(split, f.system);
+    SCOPE_EXIT { split.Stop(); };
+    split.Defer([back = &on_back, result = &allowed] {
+        *back = VideoCommon::GpuSplit::OnBackThread();
+        *result = VideoCommon::GpuSplit::CanReuseDrawState();
+    });
+    split.Drain(VideoCommon::DrainSite::Other);
+    REQUIRE(on_back);
+    REQUIRE(allowed);
 }

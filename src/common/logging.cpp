@@ -272,6 +272,7 @@ struct FileBackend final : public Backend {
                 mode = FS::FileAccessMode::Append;
         }
         file.emplace(path, mode, FS::FileType::TextFile);
+        file_path = path;
         // Count what is already there so the size limit still applies when appending.
         if (mode == FS::FileAccessMode::Append)
             bytes_written = file->GetSize();
@@ -304,7 +305,7 @@ struct FileBackend final : public Backend {
 
         // Option to log each line rather than 4k buffers
         if (Settings::values.log_flush_line.GetValue())
-            file->Flush();
+            Flush();
 
         using namespace Common::Literals;
         // Prevent logs from exceeding a set maximum size in the event that log entries are spammed.
@@ -315,13 +316,22 @@ struct FileBackend final : public Backend {
             // Don't close the file so we can print a stacktrace if necessary
             if (write_limit_exceeded)
                 enabled = false;
-            file->Flush();
+            Flush();
         }
     }
 
     void Flush() noexcept override {
+        // A failed flush logs an Error, whose own flush would fail and log again without end.
+        static thread_local bool flushing = false;
+        if (flushing)
+            return;
+        flushing = true;
         file->Flush();
+        flushing = false;
     }
+
+    std::filesystem::path file_path;
+
 private:
     std::optional<FS::IOFile> file;
     std::size_t bytes_written = 0;
@@ -384,7 +394,7 @@ struct LogcatBackend : public Backend {
             }
         }();
         auto const df = GetDirectFormatArgs(entry);
-        __android_log_print(android_log_priority, "YuzuNative", "%s %s:%u:%s: %s", df.class_name, entry.filename, entry.line_num, entry.function, entry.message);
+        __android_log_print(android_log_priority, "LichiiNative", "%s %s:%u:%s: %s", df.class_name, entry.filename, entry.line_num, entry.function, entry.message);
     }
     void Flush() noexcept override {}
 };
@@ -424,6 +434,10 @@ struct Impl {
     LogcatBackend lc_backend{};
 #endif
     std::chrono::steady_clock::time_point time_origin{std::chrono::steady_clock::now()};
+#ifndef __OPENORBIS__
+    // Last, so it stops before the file backend it flushes is destroyed.
+    std::jthread file_flush_thread;
+#endif
 };
 } // Anonymous namespace
 
@@ -463,11 +477,34 @@ void Initialize() {
 }
 
 void Start() {
+#ifndef __OPENORBIS__
+    // Lines below Error wait in the file's buffer until it fills. Flushing it every second keeps a
+    // hang or a kill from losing more than the last second of the log.
+    if (!logging_instance || !logging_instance->file_backend || logging_instance->file_flush_thread.joinable())
+        return;
+    logging_instance->file_flush_thread = std::jthread([&backend = *logging_instance->file_backend](std::stop_token token) {
+        Common::SetCurrentThreadName("LogFlush");
+        while (Common::StoppableTimedWait(token, std::chrono::seconds{1}))
+            backend.Flush();
+    });
+#endif
 }
 
 void Stop() {
+    Flush();
+}
+
+void Flush() {
     if (logging_instance)
         logging_instance->ForEachBackend([](Backend& backend) { backend.Flush(); });
+}
+
+std::filesystem::path FilePath() {
+#ifndef __OPENORBIS__
+    if (logging_instance && logging_instance->file_backend)
+        return logging_instance->file_backend->file_path;
+#endif
+    return {};
 }
 
 void FmtCrashMessageImpl(const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args) noexcept {

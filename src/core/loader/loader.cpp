@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <memory>
@@ -198,6 +197,29 @@ bool IsBootableGameContainer(FileSys::VirtualFile file, FileType type, u64 progr
     return HasApplicationProgramContent(OpenContainerAsNsp(file, type, program_id, program_index));
 }
 
+bool IsMissingKeyStatus(ResultStatus status) {
+    return status == ResultStatus::ErrorMissingProductionKeyFile ||
+           status == ResultStatus::ErrorMissingHeaderKey ||
+           status == ResultStatus::ErrorMissingTitlekey ||
+           status == ResultStatus::ErrorMissingTitlekek ||
+           status == ResultStatus::ErrorMissingKeyAreaKey;
+}
+
+ResultStatus GetContainerProgramStatus(FileSys::VirtualFile file, FileType type) {
+    const auto nsp = OpenContainerAsNsp(file, type);
+    if (!nsp) {
+        const bool nsp_shaped = type == FileType::NSP || type == FileType::NSZ ||
+                                type == FileType::XCI || type == FileType::XCZ;
+        return nsp_shaped ? ResultStatus::ErrorBadPFSHeader : ResultStatus::Success;
+    }
+    // Without the header key the title id is unreadable. With it, an update or add-on is no game.
+    const auto status = nsp->GetProgramStatus();
+    if (status != ResultStatus::ErrorMissingHeaderKey && (nsp->GetProgramTitleID() & 0x1800) != 0) {
+        return ResultStatus::ErrorNSPMissingProgramNCA;
+    }
+    return status;
+}
+
 FileType GuessFromFilename(const std::string& name) {
     if (name == "main")
         return FileType::DeconstructedRomDirectory;
@@ -284,9 +306,11 @@ constexpr std::array<const char*, 70> RESULT_MESSAGES{
     "Support for NCA0-type NCAs is not implemented.",
     "The title key for this game is missing. Add it to title.keys, or use a dump that includes "
     "its ticket.",
-    "The titlekek for this game's key generation is missing from prod.keys.",
+    "The titlekek for this game's key generation is missing from prod.keys. Your keys are older "
+    "than this game.",
     "The Rights ID in the header is invalid.",
-    "The key area key for this game's key generation is missing from prod.keys.",
+    "The key area key for this game's key generation is missing from prod.keys. Your keys are "
+    "older than this game.",
     "The key area key is incorrect or the section header is invalid.",
     "The titlekey and/or titlekek is incorrect or the section header is invalid.",
     "The XCI file is missing a Program-type NCA.",

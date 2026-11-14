@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -174,10 +173,27 @@ struct CooperativeHmmaTypes {
 class EmitContext final : public Sirit::Module {
 public:
     explicit EmitContext(const Profile& profile, const RuntimeInfo& runtime_info,
-                         IR::Program& program, Bindings& binding);
+                         IR::Program& program, Bindings& binding, bool vulkan_memory_model);
     ~EmitContext();
 
     [[nodiscard]] Id Def(const IR::Value& value);
+
+    /// Workgroup memory loads and stores. GLSL450 keeps workgroup memory coherent within the
+    /// workgroup. Under the Vulkan memory model a plain access is private, so each one is
+    /// non-private and makes itself visible or available to the workgroup, as glslang does for
+    /// GLSL's shared variables.
+    [[nodiscard]] Id LoadShared(Id result_type, Id pointer);
+    void StoreShared(Id pointer, Id object);
+    /// The memory operands LoadShared and StoreShared use under the Vulkan memory model.
+    [[nodiscard]] std::array<Sirit::MemoryAccessLiteral, 2> SharedMemoryAccess(
+        spv::MemoryAccessMask availability);
+    /// Barrier semantics. Under the Vulkan memory model a barrier also makes the writes before it
+    /// available and the writes it orders visible.
+    [[nodiscard]] Id BarrierSemantics(spv::MemorySemanticsMask semantics);
+    /// Workgroup memory semantics of a guest barrier.
+    [[nodiscard]] Id GuestBarrierSemantics();
+    /// The shared word ConditionalBarrierPass counts branch conditions in.
+    [[nodiscard]] Id BarrierVoteWord(Id offset);
 
     [[nodiscard]] Id BitOffset8(const IR::Value& offset);
     [[nodiscard]] Id BitOffset16(const IR::Value& offset);
@@ -231,6 +247,8 @@ public:
     const RuntimeInfo& runtime_info;
     const bool requires_coherent_global_memory;
     const bool requires_coherent_image_memory;
+    /// Set when HMMA lowers to cooperative matrices, which need the Vulkan memory model.
+    const bool vulkan_memory_model;
     Stage stage{};
 
     Id void_id{};
@@ -342,6 +360,8 @@ public:
     Id shared_store_u8_func{};
     Id shared_store_u16_func{};
     Id increment_cas_shared{};
+    Id barrier_vote_func{};
+    Id voted_barrier_func{};
     Id increment_cas_ssbo{};
     Id decrement_cas_shared{};
     Id decrement_cas_ssbo{};
@@ -392,6 +412,9 @@ public:
     /// memory from this word (A, B and C/D tiles of 16x16 fp16, 128 words each).
     std::optional<u32> tensor_scratch_word;
     Id tensor_subgroup_id{};
+    /// The software matrix functions round to fp16 with a native conversion, which needs the
+    /// entry point's fp16 round-to-nearest-even and denorm preserve modes.
+    bool native_half_rounding{};
     std::vector<Id> interfaces;
     std::vector<std::pair<u32, spv::Op>> opcode_rewrites;
 
@@ -431,6 +454,8 @@ public:
     Id mesh_task_offsets_buffer{};
     Id mesh_task_args_buffer{};
     Id mesh_group_index{};
+    /// NumWorkgroups of a native mesh program (Profile::has_broken_mesh_user_sgprs only).
+    Id mesh_num_workgroups{};
 
     Id load_const_func_u8{};
     Id load_const_func_u16{};
@@ -469,6 +494,7 @@ private:
     void DefineLocalMemory(const IR::Program& program);
     void DefineSharedMemory(const IR::Program& program);
     void DefineSharedMemoryFunctions(const IR::Program& program);
+    void DefineBarrierVoteFunctions(const IR::Program& program);
     void DefineConstantBuffers(const Info& info, u32& binding);
     void DefineConstantBufferIndirectFunctions(const Info& info);
     void DefineStorageBuffers(const Info& info, u32& binding);

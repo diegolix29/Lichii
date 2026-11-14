@@ -11,8 +11,8 @@ scope for this pass.
   (C1041), so the build moved to a short path.
 - Toolchain: VS 2026 (MSVC 14.51) via `vcvars64.bat`, Ninja from VS, CMake 4.4.
 - Configure:
-  `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_INTERMEDIATE_DIR_STRATEGY=SHORT -DENABLE_QT=OFF -DYUZU_CMD=ON -DENABLE_WEB_SERVICE=OFF -DYUZU_ROOM=OFF -DYUZU_TESTS=OFF -DENABLE_WERROR=OFF -DENABLE_UPDATE_CHECKER=OFF`
-- Build: `cmake --build build --target yuzu-cmd` -> `build/bin/eden-cli.exe`.
+  `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_INTERMEDIATE_DIR_STRATEGY=SHORT -DENABLE_QT=OFF -DLICHII_CMD=ON -DENABLE_WEB_SERVICE=OFF -DLICHII_ROOM=OFF -DLICHII_TESTS=OFF -DENABLE_WERROR=OFF -DENABLE_UPDATE_CHECKER=OFF`
+- Build: `cmake --build build --target lichii-cmd` -> `build/bin/eden-cli.exe`.
 - Run (portable mode, `build/bin/user/` holds config/logs; no keys or firmware installed):
   `eden-cli.exe -g "<title>\exefs\main"`
 - Debug helpers:

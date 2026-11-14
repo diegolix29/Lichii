@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -363,8 +362,16 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
         return true;
     default:
         return DrawManager::IsInstanceLoopMethod(method) || IsFastDrawDeltaMethod(method) ||
-               IsFastDrawVertexBuffer(method);
+               IsFastDrawVertexBuffer(method) || IsFastDrawVertexFormat(method);
     }
+}
+
+bool Maxwell3D::IsFastDrawVertexFormat(u32 method) {
+    // With dynamic vertex input only each attribute's type class is in the pipeline key, which
+    // the reusable draw compares (TakeReusableDraw); the rest is recorded for every draw.
+    constexpr u32 formats = MAXWELL3D_REG_INDEX(vertex_attrib_format);
+    return VideoCommon::Nx2FastDraw::g_dynamic_vertex_input.load(std::memory_order_relaxed) &&
+           method >= formats && method < formats + Regs::NumVertexAttributes;
 }
 
 bool Maxwell3D::IsFastDrawVertexBuffer(u32 method) {
@@ -686,6 +693,161 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
     regs.const_buffer.offset += static_cast<u32>(bytes);
 }
 
+void Maxwell3D::WriteStateRegisters(Core::System& system, std::span<const u64, 4> flags,
+                                    std::span<const u64> writes, u32 last_break) {
+    ConsumeSink(system);
+    // The front sends only writes that change its copy of the register, which is the back's but
+    // for registers the back changes itself: each normally changes the register here too, and is
+    // then all CallMethod would do for it. Otherwise, and where CallMethod takes other paths,
+    // the writes go one by one.
+    bool changes = fast_maxwell3d && executing_macro == 0 && !perf_verify &&
+                   SkipSameValueWrites() &&
+                   shadow_state.shadow_ram_control != Regs::ShadowRamControl::Replay &&
+                   !draw_manager.HasDeferredDraw();
+    for (size_t i = 0; changes && i < writes.size(); ++i) {
+        changes = regs.reg_array[static_cast<u32>(writes[i])] != static_cast<u32>(writes[i] >> 32);
+    }
+    if (reg_block_verify) {
+        return VerifyStateRegisters(system, flags, writes, last_break, changes);
+    }
+    if (!changes) {
+        for (const u64 write : writes) {
+            CallMethod(system, static_cast<u32>(write), static_cast<u32>(write >> 32), true);
+        }
+        return;
+    }
+    StoreStateRegisters(flags, writes);
+    if (last_break != NoBreak && VideoCommon::Nx2FastDraw::Enabled()) {
+        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, last_break);
+    }
+}
+
+void Maxwell3D::StoreStateRegisters(std::span<const u64, 4> flags, std::span<const u64> writes) {
+    const auto control = shadow_state.shadow_ram_control;
+    const bool tracked =
+        control == Regs::ShadowRamControl::Track || control == Regs::ShadowRamControl::TrackWithFilter;
+    for (const u64 write : writes) {
+        const u32 method = static_cast<u32>(write);
+        const u32 value = static_cast<u32>(write >> 32);
+        regs.reg_array[method] = value;
+        if (tracked) {
+            shadow_state.reg_array[method] = value;
+        }
+    }
+    for (size_t word = 0; word < flags.size(); ++word) {
+        for (u64 bits = flags[word]; bits != 0; bits &= bits - 1) {
+            dirty.flags[word * 64 + static_cast<size_t>(std::countr_zero(bits))] = true;
+        }
+    }
+}
+
+void Maxwell3D::VerifyStateRegisters(Core::System& system, std::span<const u64, 4> flags,
+                                     std::span<const u64> writes, u32 last_break, bool changes) {
+    namespace FastDraw = VideoCommon::Nx2FastDraw;
+    static u64 blocks{};
+    static u64 block_writes{};
+    static u64 by_write{};
+    static u64 differences{};
+    static u64 total_differences{};
+    static u64 hidden_breaks{};
+    static auto last_report = std::chrono::steady_clock::now();
+    const auto one_by_one = [&] {
+        for (const u64 write : writes) {
+            CallMethod(system, static_cast<u32>(write), static_cast<u32>(write >> 32), true);
+        }
+    };
+    const auto method_at = [&writes](size_t i) { return static_cast<u32>(writes[i]); };
+    if (!changes) {
+        ++by_write;
+        one_by_one();
+    } else {
+        // The block's stores and flags, then (from the same state) each write as CallMethod,
+        // which stays.
+        ++blocks;
+        block_writes += writes.size();
+        std::vector<u32> before(writes.size() * 2);
+        for (size_t i = 0; i < writes.size(); ++i) {
+            before[i * 2] = regs.reg_array[method_at(i)];
+            before[i * 2 + 1] = shadow_state.reg_array[method_at(i)];
+        }
+        const DirtyState::Flags flags_before = dirty.flags;
+        StoreStateRegisters(flags, writes);
+        std::vector<u32> stored(writes.size() * 2);
+        for (size_t i = 0; i < writes.size(); ++i) {
+            stored[i * 2] = regs.reg_array[method_at(i)];
+            stored[i * 2 + 1] = shadow_state.reg_array[method_at(i)];
+        }
+        const DirtyState::Flags stored_flags = dirty.flags;
+        for (size_t i = writes.size(); i-- > 0;) {
+            regs.reg_array[method_at(i)] = before[i * 2];
+            shadow_state.reg_array[method_at(i)] = before[i * 2 + 1];
+        }
+        dirty.flags = flags_before;
+        // Other threads break fast draws too (fences, maps), into the same serial and last
+        // break: mark the last break, and judge only a register break this thread left there or
+        // the mark left alone. Restored when untouched. The mark is a register break of no
+        // register, so a draw that reads it meanwhile counts it in range.
+        constexpr u32 unset = static_cast<u32>(FastDraw::Reason::Register) | 0xffffff00u;
+        const u32 previous = FastDraw::g_last_break.exchange(unset, std::memory_order_relaxed);
+        one_by_one();
+        u32 last = unset;
+        FastDraw::g_last_break.compare_exchange_strong(last, previous, std::memory_order_relaxed);
+        const bool expected_break = last_break != NoBreak && FastDraw::Enabled();
+        const u32 expected_last =
+            static_cast<u32>(FastDraw::Reason::Register) | (expected_break ? last_break << 8 : 0);
+        const bool own_break = (last & 0xff) == static_cast<u32>(FastDraw::Reason::Register);
+        if (last != unset && !own_break) {
+            ++hidden_breaks;
+        }
+        const bool break_differs = last == unset ? expected_break : own_break && last != expected_last;
+        std::string register_differences;
+        for (size_t i = 0; i < writes.size(); ++i) {
+            const u32 method = method_at(i);
+            if (stored[i * 2] != regs.reg_array[method] ||
+                stored[i * 2 + 1] != shadow_state.reg_array[method]) {
+                register_differences += fmt::format(" {:#x}={:#x}/{:#x} (one by one {:#x}/{:#x})",
+                                                    method, stored[i * 2], stored[i * 2 + 1],
+                                                    regs.reg_array[method],
+                                                    shadow_state.reg_array[method]);
+            }
+        }
+        const DirtyState::Flags flag_differences = stored_flags ^ dirty.flags;
+        if (!register_differences.empty() || flag_differences.any() || break_differs) {
+            ++differences;
+            if (++total_differences <= 16) {
+                std::string flag_list;
+                for (size_t i = 0; i < flag_differences.size(); ++i) {
+                    if (flag_differences[i]) {
+                        flag_list += fmt::format(" {}={}", i, stored_flags[i] ? 1 : 0);
+                    }
+                }
+                LOG_ERROR(HW_GPU,
+                          "Register block verify: a block of {} writes differs from them one by one: "
+                          "registers (block/shadow){}, block dirty flags{}, fast draw break {} "
+                          "{:#x} against {} {:#x}",
+                          writes.size(), register_differences, flag_list, expected_break ? 1 : 0,
+                          expected_last, last != unset ? 1 : 0, last != unset ? last : 0);
+            }
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - last_report).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    last_report = now;
+    LOG_INFO(HW_GPU,
+             "Register block verify (EDEN_NX2_REG_BLOCK_VERIFY) in {:.1f} s: {} blocks of {} writes "
+             "compared with the writes one by one, {} differ ({} in all), {} breaks not judged as "
+             "another thread's break came last; {} blocks written one by one",
+             seconds, blocks, block_writes, differences, total_differences, hidden_breaks, by_write);
+    blocks = 0;
+    block_writes = 0;
+    by_write = 0;
+    differences = 0;
+    hidden_breaks = 0;
+}
+
 void Maxwell3D::CallMethodSlow(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
     // Every word of a macro register run is a parameter of the macro it started, whichever macro
     // register it writes (as on the split front, FrontCallMethod). Only a write to an ordinary
@@ -998,6 +1160,11 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
         VideoCommon::Nx2FastDraw::NoteBind(stage_index, bind_data.shader_slot);
     }
     buffer.enabled = bind_data.valid.Value() != 0;
+    if (VideoCommon::ListMacroTrace::g_enabled && buffer.enabled) {
+        VideoCommon::ListMacroTrace::NoteConstBufferBind(
+            static_cast<u32>(stage_index), bind_data.shader_slot, regs.const_buffer.Address(),
+            regs.const_buffer.size);
+    }
     buffer.address = regs.const_buffer.Address();
     buffer.size = regs.const_buffer.size;
 
@@ -1206,6 +1373,9 @@ struct Maxwell3D::FrontState {
     bool sink_pending{};
     u32 split_start{}; ///< GpuSplit::Starts() when this copy was made
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
+    /// State writes go to the back in blocks (GpuSplit::StateWrite): skip_same, fast_maxwell3d
+    /// and not EDEN_NX2_PERF_VERIFY, read once.
+    bool state_blocks{};
     /// The back's draw manager is in an instance loop (DrawMode::Instance): draw.end does nothing.
     bool instance_loop{};
 
@@ -1404,6 +1574,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         std::memcpy(front->shadow.data(), shadow_state.reg_array.data(), sizeof(front->shadow));
         front->control = shadow_state.shadow_ram_control;
         front->skip_same = SkipSameValueWrites() && FrontSkipSame();
+        front->state_blocks = front->skip_same && fast_maxwell3d && !perf_verify;
         front->split_start = split.Starts();
         front->executing_macro = executing_macro;
         front->parameters = std::move(macro_params);
@@ -1438,7 +1609,8 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     // As ProcessShadowRam does on the back. A register a macro the back ran may have written is
     // the front's again, and its write is sent even if the front's copies hold the value.
     u32 value = argument;
-    bool shadow_kept = !(fs.back_owned[method] && FrontTakeOver(split, fs, method));
+    const bool back_owned = fs.back_owned[method];
+    bool shadow_kept = !(back_owned && FrontTakeOver(split, fs, method));
     if (fs.control == Regs::ShadowRamControl::Track ||
         fs.control == Regs::ShadowRamControl::TrackWithFilter) {
         shadow_kept = shadow_kept && fs.shadow[method] == argument;
@@ -1469,6 +1641,14 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             return;
         }
         fs.regs[method] = value;
+        // Sent with the state writes around it. A register a macro the back ran may have
+        // written, and replays, which store the shadow RAM's entry, keep their own entries.
+        if (fs.state_blocks && !back_owned && fs.control != Regs::ShadowRamControl::Replay) {
+            split.StateWrite(this, method, value, {dirty.tables[0][method], dirty.tables[1][method]},
+                             !IsFastDrawParameter(method), fs.draw_pending);
+            fs.sink_pending = false;
+            return;
+        }
     } else {
         fs.regs[method] = value;
         constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
@@ -1676,7 +1856,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         ListTrace::g_enabled
             ? ListTrace::BeginCall(ListTrace::Engine::Maxwell3D, static_cast<EngineInterface*>(this),
                                    method, engine.native_code, engine.native_code_generation, start,
-                                   fs.parameters, native_data_ram)
+                                   fs.parameters, native_data_ram, fs.regs)
             : nullptr;
     const bool on_back = FrontRunOnBack(system, split, fs, engine, start);
     if (!on_back) {
@@ -1707,8 +1887,12 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             engine.native_jit = std::make_shared<TuringMacroJit>();
         }
         engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
-        const auto result = engine.native_jit->Execute(
-            start, fs.parameters, std::span<u32>{native_data_ram}, read, emit);
+        const auto result =
+            trace != nullptr && trace->data_ram
+                ? engine.native_interpreter.Execute(engine.native_code, start, fs.parameters, read,
+                                                    emit)
+                : engine.native_jit->Execute(start, fs.parameters,
+                                             std::span<u32>{native_data_ram}, read, emit);
 #else
         const auto result =
             engine.native_interpreter.Execute(engine.native_code, start, fs.parameters, read, emit);
@@ -1720,7 +1904,8 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         }
     }
     if (trace != nullptr) {
-        ListTrace::EndCall(*trace, on_back);
+        ListTrace::EndCall(*trace, on_back, engine.native_interpreter.data_ram_reads,
+                           engine.native_interpreter.data_ram_writes);
     }
     fs.parameters.clear();
     if (fs.draw_pending) {

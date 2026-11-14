@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
@@ -144,6 +143,15 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
                     .pipelineStatistics = 0,
                 });
                 trace_work_items.resize(TraceMaxWork);
+                trace_site_pool = device.GetLogical().CreateQueryPool({
+                    .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                    .queryCount = TraceMaxSites + 1,
+                    .pipelineStatistics = 0,
+                });
+                trace_site_items.resize(TraceMaxSites + 1);
             }
         } catch (const vk::Exception& error) {
             LOG_WARNING(Render_Vulkan, "DKB gpu_timestamp unavailable: {}", error.what());
@@ -766,6 +774,127 @@ void Scheduler::ReportWorkTimes() {
              trace_sample_frame, count, total_ms, slowest);
 }
 
+void Scheduler::RecordSiteMarker(std::source_location location) {
+    auto marker = [this, file = location.file_name(),
+                   line = static_cast<u32>(location.line())](vk::CommandBuffer cmdbuf,
+                                                             vk::CommandBuffer) {
+        TraceSite(cmdbuf, file, line);
+    };
+    if (!chunk->Record(marker)) {
+        DispatchWork();
+        (void)chunk->Record(marker);
+    }
+}
+
+void Scheduler::TraceSite(vk::CommandBuffer cmdbuf, const char* file, u32 line) {
+    if (!trace_gpu_recording || !trace_site_pool || trace_site_count > TraceMaxSites) {
+        return;
+    }
+    // One query past the sites marks where commands stop having markers (file nullptr), so
+    // every traced site keeps only its own time.
+    if (trace_site_count == TraceMaxSites) {
+        file = nullptr;
+        line = 0;
+    }
+    trace_site_items[trace_site_count] = {file, line, trace_gpu_count};
+    cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_site_pool,
+                          trace_site_count);
+    ++trace_site_count;
+}
+
+void Scheduler::ReportSiteTimes(const std::vector<u64>& submission_begin,
+                                const std::vector<u64>& submission_end) {
+    const u32 count = trace_site_count;
+    if (count == 0 || submission_begin.empty()) {
+        return;
+    }
+    struct Result {
+        u64 timestamp;
+        u64 available;
+    };
+    std::vector<Result> results(count);
+    const auto result = device.GetLogical().GetQueryResults(
+        *trace_site_pool, 0, count, results.size() * sizeof(Result), results.data(),
+        sizeof(Result), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if (result != VK_SUCCESS) {
+        return;
+    }
+    const auto to_ms = [this](u64 begin, u64 end) {
+        return static_cast<double>(
+                   Common::DkbFrameTrace::TimestampDelta(begin, end, trace_timestamp_bits)) *
+               trace_timestamp_period / 1e6;
+    };
+    struct Totals {
+        double ms{};
+        double max_ms{};
+        u32 count{};
+    };
+    // Keyed by file name and line: file_name() is static storage, but one header compiled in
+    // several translation units has a pointer per unit. Line 0 is the submission start entry.
+    using SiteKey = std::pair<std::string_view, u32>;
+    std::map<SiteKey, Totals> by_site;
+    const auto add = [&by_site](const SiteKey& site, double ms) {
+        Totals& totals = by_site[site];
+        totals.ms += ms;
+        totals.max_ms = std::max(totals.max_ms, ms);
+        ++totals.count;
+    };
+    const auto site_key = [](const SiteTrace& site) {
+        std::string_view file{site.file};
+        if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+            file.remove_prefix(slash + 1);
+        }
+        return SiteKey{file, site.line};
+    };
+    double total_ms{};
+    u32 previous_submission = ~0U;
+    for (u32 i = 0; i < count; ++i) {
+        const SiteTrace& site = trace_site_items[i];
+        if (site.submission >= submission_end.size() || results[i].available == 0) {
+            continue;
+        }
+        if (site.submission != previous_submission) {
+            // Upload command buffer and anything before the first marker of the submission.
+            const double ms = to_ms(submission_begin[site.submission], results[i].timestamp);
+            add(SiteKey{"(submission start/uploads)", 0}, ms);
+            total_ms += ms;
+            previous_submission = site.submission;
+        }
+        const bool next_in_submission = i + 1 < count &&
+                                        trace_site_items[i + 1].submission == site.submission &&
+                                        results[i + 1].available != 0;
+        const u64 end = next_in_submission ? results[i + 1].timestamp
+                                           : submission_end[site.submission];
+        const double ms = to_ms(results[i].timestamp, end);
+        add(site.file == nullptr ? SiteKey{"(after the marker limit)", 0} : site_key(site), ms);
+        total_ms += ms;
+    }
+    // Submissions after the one that ran out of markers have none: all of their time goes to the
+    // same entry.
+    if (count > TraceMaxSites) {
+        for (u32 s = trace_site_items[TraceMaxSites].submission + 1; s < submission_end.size();
+             ++s) {
+            const double ms = to_ms(submission_begin[s], submission_end[s]);
+            add(SiteKey{"(after the marker limit)", 0}, ms);
+            total_ms += ms;
+        }
+    }
+    std::vector<std::pair<SiteKey, Totals>> sorted(by_site.begin(), by_site.end());
+    std::ranges::sort(sorted, std::greater<>{},
+                      [](const auto& entry) { return entry.second.ms; });
+    LOG_INFO(Render_Vulkan,
+             "DKB gpu_sites renderer_frame={} markers={}{} attributed_ms={:.3f} sites={}",
+             trace_sample_frame, count, count > TraceMaxSites ? " (full)" : "", total_ms,
+             sorted.size());
+    for (size_t i = 0; i < sorted.size() && i < 25; ++i) {
+        const auto& [site, totals] = sorted[i];
+        const auto& [file, line] = site;
+        LOG_INFO(Render_Vulkan, "DKB gpu_site {:.3f}ms {}x max {:.3f}ms {}", totals.ms,
+                 totals.count, totals.max_ms,
+                 line == 0 ? std::string{file} : fmt::format("{}:{}", file, line));
+    }
+}
+
 void Scheduler::TraceGpuSubmission() {
     if (trace_gpu_pending) {
         master_semaphore->Refresh();
@@ -863,6 +992,16 @@ void Scheduler::TraceGpuSubmission() {
                      work.dispatch_attempts, shaders, work.untracked_uses);
         }
         ReportWorkTimes();
+        if (trace_gpu_skipped == 0) {
+            std::vector<u64> submission_begin(trace_gpu_count);
+            std::vector<u64> submission_end(trace_gpu_count);
+            for (u32 i = 0; i < trace_gpu_count; ++i) {
+                submission_begin[i] = results[i * 2].timestamp;
+                submission_end[i] = results[i * 2 + 1].timestamp;
+            }
+            ReportSiteTimes(submission_begin, submission_end);
+        }
+        trace_site_count = 0;
         trace_gpu_tick = 0;
         trace_gpu_count = 0;
         trace_gpu_skipped = 0;
@@ -876,6 +1015,10 @@ void Scheduler::TraceGpuSubmission() {
     if (trace_gpu_count == 0 && trace_work_pool) {
         // Draws are timed inside render passes, where queries cannot be reset.
         current_upload_cmdbuf.ResetQueryPool(*trace_work_pool, 0, TraceMaxWork * 2);
+    }
+    if (trace_gpu_count == 0 && trace_site_pool) {
+        current_upload_cmdbuf.ResetQueryPool(*trace_site_pool, 0, TraceMaxSites + 1);
+        trace_site_count = 0;
     }
     current_upload_cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, *trace_query_pool,
                                         trace_gpu_count * 2);

@@ -11,6 +11,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "common/common_funcs.h"
 #include "common/common_types.h"
@@ -30,6 +32,12 @@ struct RendererDeviceInfo {
     std::string model;
     std::string driver;
     std::string api;
+    /// Vulkan only, for bug reports: the API version, device-local memory, the device's
+    /// extensions and the features Lichii checks.
+    std::string api_version;
+    u64 device_local_memory{};
+    std::vector<std::string> extensions;
+    std::vector<std::pair<std::string, bool>> features;
 };
 
 enum class FrameGenState : u8 {
@@ -40,6 +48,7 @@ enum class FrameGenState : u8 {
     UnsupportedGpu,
     UnsupportedSurface,
     MissingLosslessDll,
+    NvidiaFrameGen,
 };
 
 struct FrameGenStatus {
@@ -66,8 +75,8 @@ struct RendererSettings {
 
 class RendererBase {
 public:
-    YUZU_NON_COPYABLE(RendererBase);
-    YUZU_NON_MOVEABLE(RendererBase);
+    LICHII_NON_COPYABLE(RendererBase);
+    LICHII_NON_MOVEABLE(RendererBase);
 
     explicit RendererBase(Core::Frontend::EmuWindow& window,
                           std::unique_ptr<Core::Frontend::GraphicsContext> context);

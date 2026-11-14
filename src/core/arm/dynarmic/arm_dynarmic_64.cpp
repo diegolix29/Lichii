@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
@@ -65,12 +64,12 @@ Dynarmic::A64::Vector DynarmicCallbacks64::MemoryRead128(u64 vaddr) {
 std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     if (!m_memory.IsValidVirtualAddressRange(vaddr, sizeof(u32)))
         return std::nullopt;
-    auto const aligned_vaddr = vaddr & ~Core::Memory::YUZU_PAGEMASK;
+    auto const aligned_vaddr = vaddr & ~Core::Memory::LICHII_PAGEMASK;
     if (last_code_addr != aligned_vaddr) {
         m_memory.ReadBlock(aligned_vaddr, &cached_code_page, sizeof(cached_code_page));
         last_code_addr = aligned_vaddr;
     }
-    const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
+    const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::LICHII_PAGEMASK) / sizeof(u32)];
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
         if (!m_window_trace) {
             m_window_trace = WindowTrace::sessions.Find(m_process);
@@ -477,6 +476,46 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     if (Kernel::Nx2ThreadStats::g_enabled && m_core_index < g_jit_counters.size()) {
         config.counters = &g_jit_counters[m_core_index];
     }
+#if defined(ARCHITECTURE_x86_64)
+    // x86-64 host code generation options; Paranoid keeps dynarmic's defaults.
+    if (Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid) {
+        // The JIT spilled ~9% of its instructions to stack slots in Ocarina of Time's hot code
+        // while callee-saved GPRs sat empty: evictions go to a free callee-saved GPR first, and an
+        // operand that is overwritten but still needed is copied to a free register instead.
+        config.spill_to_free_gpr = true;
+        config.scratch_copy_to_free_reg = true;
+        // W-register writes and zero-extends of values a 32-bit instruction produced skip the
+        // second `mov r32, r32`.
+        config.elide_redundant_zext = true;
+        // ldr/str [xN, #imm]: the immediate goes into the fastmem addressing mode instead of a
+        // separate LEA (and often a register copy).
+        config.fold_address_offsets = true;
+        // The per-block %rbp frame is three instructions per block that nothing reads.
+        config.omit_block_frame = true;
+        // Fast dispatch table of 2^16 entries, 4-way set associative: 1 MiB per core instead of
+        // the 16 MiB direct-mapped 2^20 table.
+        config.fast_dispatch_table_bits = 16;
+        config.fast_dispatch_set_associative = true;
+        // A 32-entry return stack buffer: returns from deeper call chains skip the dispatcher.
+        config.rsb_size = 32;
+        // Unlinked exits jump to one shared stub per target: 5/6-byte patch sites instead of
+        // 22/23 bytes plus an inline exit stub.
+        config.compact_block_exits = true;
+        // Fault/abort paths, atomic fallbacks and exit stubs go to a cold region at the end of
+        // the code cache, so hot blocks sit densely.
+        config.far_code = true;
+        // Branches, CSEL and CBZ/TBZ read the host flags left by the instruction before them
+        // instead of reloading NZCV from the guest state.
+        config.reuse_host_flags = !config.enable_cycle_counting;
+        // Halt checks on links to lower PCs and on indirect branches instead of every linked
+        // branch (multicore only: dynarmic counts no cycles there).
+        config.halt_check_on_back_edges = !config.enable_cycle_counting;
+        // BL/BLR as host calls and RET as a host return checked against the guest return
+        // address: the CPU's return predictor predicts guest returns instead of one shared
+        // indirect jump through the return stack buffer (multicore only, no cycle counter).
+        config.host_call_return = !config.enable_cycle_counting;
+    }
+#endif
     m_jit.emplace(config);
 }
 

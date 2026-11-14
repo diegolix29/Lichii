@@ -28,7 +28,7 @@
 #include "common/nextendo.h"
 #include "common/settings.h"
 
-#ifdef YUZU_BUNDLED_OPENSSL
+#ifdef LICHII_BUNDLED_OPENSSL
 #include <openssl/cert.h>
 #endif
 
@@ -131,7 +131,7 @@ void ConfigureClient(httplib::Client& client, time_t timeout_seconds) {
     client.set_read_timeout(timeout_seconds);
     client.set_write_timeout(timeout_seconds);
     client.set_follow_location(true);
-#ifdef YUZU_BUNDLED_OPENSSL
+#ifdef LICHII_BUNDLED_OPENSSL
     client.load_ca_cert_store(kCert, sizeof(kCert));
 #endif
 }
@@ -499,7 +499,9 @@ SignInResult SignIn(std::string_view client_id,
 #endif
     });
     server.Get("/callback", [&](const httplib::Request& request, httplib::Response& response) {
-        Callback parsed = ParseCallback(request.params, *state);
+        const std::multimap<std::string, std::string> params(request.params.begin(),
+                                                             request.params.end());
+        Callback parsed = ParseCallback(params, *state);
         if (!parsed.matched) {
             response.status = 400;
             response.set_content(parsed.error, "text/plain; charset=utf-8");

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -33,6 +32,10 @@ namespace VideoCommon {
 class GpuSplit;
 }
 
+namespace VideoCommon::GpuTrace {
+struct StateAccess;
+}
+
 namespace Tegra {
 class MemoryManager;
 }
@@ -59,6 +62,8 @@ extern std::atomic<u32> g_nx2_trace_draws_after_upscale;
     (offsetof(Tegra::Engines::KeplerCompute::LaunchParams, field_name) / sizeof(u32))
 
 class KeplerCompute final : public EngineInterface {
+    friend struct ::VideoCommon::GpuTrace::StateAccess;
+
 public:
     explicit KeplerCompute(MemoryManager& memory_manager);
     ~KeplerCompute();
@@ -284,6 +289,7 @@ private:
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
 
     bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
+    bool BypassOotBaseNetwork();
     void ProcessNativeReportSemaphore(u32 argument);
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
     /// Texture descriptor that the handle at `offset` in constant buffer 0 selects.
@@ -298,6 +304,8 @@ private:
     void CaptureFireEmblemJitter();
     bool FinishDlssEvaluation();
     void CheckDlssNetwork();
+    /// Whether the network failed its checks for the rest of the session: its passes are skipped.
+    [[nodiscard]] bool DlssNetworkDroppedForGood() const;
     [[nodiscard]] VideoCore::GameDlssReason GameDlssBlocker() const;
     void UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReason blocker);
     std::pair<std::vector<u32>, std::vector<u32>> NativeImageHandles(GPUVAddr program);
@@ -314,14 +322,17 @@ private:
         u32 clean_evaluations{};
         bool native{};
         /// Health checks of the network's output against its input (CheckDlssNetwork): whether
-        /// this backend has them, good and bad results in a row, and why the network failed them
-        /// (None while it hasn't; then the replacement upscale draws the output for the session).
+        /// this backend has them, good and bad results in a row, why the network failed them
+        /// (None while it hasn't; then the replacement upscale draws the output) and how often it
+        /// was dropped for mismatched output (it is shown again once its output checks out, up
+        /// to DLSS_NETWORK_MAX_DROPS times).
         bool checked{};
         u32 good_checks{};
         u32 bad_checks{};
         VideoCore::GameDlssReason failure{};
-        /// Programs of evaluations that reached their output pass; they are skipped only after
-        /// the network fails its health checks.
+        u32 drops{};
+        /// Programs of evaluations that reached their output pass; they are skipped only once
+        /// the network is dropped for good (DlssNetworkDroppedForGood).
         std::unordered_set<u64> programs;
         /// This evaluation's programs and dispatches so far. Its programs join `programs` only
         /// at its output pass, so compute work after a look-alike first pass keeps running.

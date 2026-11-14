@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -268,6 +267,9 @@ struct FixedPipelineState {
     /// vertex program does not read (vertex input is dynamic), blend equations and factors of
     /// attachments without blending, and attachments past the last colour target.
     void CanonicalizeNative(u32 generic_read_mask) noexcept;
+    /// attribute_types as the registers give it: with VK_EXT_vertex_input_dynamic_state, all that
+    /// the vertex attribute formats put in the key.
+    [[nodiscard]] static u64 DynamicAttributeTypes(const Maxwell& regs) noexcept;
 
     size_t Hash() const noexcept;
 

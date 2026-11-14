@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -159,25 +158,6 @@ static std::shared_ptr<NSP> OpenContainerAsNsp(const VirtualFile& file, Loader::
     }
 
     return nullptr;
-}
-
-// Checks that every .ncz entry in the container is NCZBLOCK. Solid NCZ has no random access,
-// and the whole point of this build is to reject it at scan time so such files never appear
-// in the game list. Containers without any .ncz (plain NSP/XCI) pass through.
-static bool ContainerIsFullyBlockCompressed(const std::shared_ptr<NSP>& nsp) {
-    if (!nsp) {
-        return false;
-    }
-    for (const auto& entry : nsp->GetFiles()) {
-        const auto name = entry->GetName();
-        if (name.size() < 4 || name.substr(name.size() - 4) != ".ncz") {
-            continue;
-        }
-        if (!Core::Crypto::IsBlockCompressedNCZ(entry)) {
-            return false; // solid NCZ -> reject the whole container
-        }
-    }
-    return true; // no .ncz at all, or all block-compressed
 }
 
 template <typename Callback>
@@ -652,7 +632,7 @@ std::optional<NcaID> RegisteredCache::GetNcaIDFromMetadata(u64 title_id,
     if (type == ContentRecordType::Meta && meta_id.find(title_id) != meta_id.end())
         return meta_id.at(title_id);
 
-    const auto res1 = CheckMapForContentRecord(yuzu_meta, title_id, type);
+    const auto res1 = CheckMapForContentRecord(raw_meta, title_id, type);
     if (res1)
         return res1;
     return CheckMapForContentRecord(meta, title_id, type);
@@ -719,7 +699,7 @@ void RegisteredCache::ProcessFiles(const std::vector<NcaID>& ids) {
     }
 }
 
-void RegisteredCache::AccumulateYuzuMeta() {
+void RegisteredCache::AccumulateRawMeta() {
     const auto meta_dir = dir->GetSubdirectory("yuzu_meta");
     if (meta_dir == nullptr) {
         return;
@@ -731,7 +711,7 @@ void RegisteredCache::AccumulateYuzuMeta() {
         }
 
         CNMT cnmt(file);
-        yuzu_meta.insert_or_assign(cnmt.GetTitleID(), std::move(cnmt));
+        raw_meta.insert_or_assign(cnmt.GetTitleID(), std::move(cnmt));
     }
 }
 
@@ -742,7 +722,7 @@ void RegisteredCache::Refresh() {
 
     const auto ids = AccumulateFiles();
     ProcessFiles(ids);
-    AccumulateYuzuMeta();
+    AccumulateRawMeta();
 }
 
 RegisteredCache::RegisteredCache(VirtualDir dir_, ContentProviderParsingFunction parsing_function)
@@ -767,9 +747,9 @@ std::optional<u32> RegisteredCache::GetEntryVersion(u64 title_id) const {
         return meta_iter->second.GetTitleVersion();
     }
 
-    const auto yuzu_meta_iter = yuzu_meta.find(title_id);
-    if (yuzu_meta_iter != yuzu_meta.cend()) {
-        return yuzu_meta_iter->second.GetTitleVersion();
+    const auto raw_meta_iter = raw_meta.find(title_id);
+    if (raw_meta_iter != raw_meta.cend()) {
+        return raw_meta_iter->second.GetTitleVersion();
     }
 
     return std::nullopt;
@@ -801,7 +781,7 @@ void RegisteredCache::IterateAllMetadata(
             }
         }
     }
-    for (const auto& kv : yuzu_meta) {
+    for (const auto& kv : raw_meta) {
         const auto& cnmt = kv.second;
         for (const auto& rec : cnmt.GetContentRecords()) {
             if (GetFileAtID(rec.nca_id) != nullptr && filter(cnmt, rec)) {
@@ -833,14 +813,7 @@ std::vector<ContentProviderEntry> RegisteredCache::ListEntriesFilter(
 }
 
 static std::shared_ptr<NCA> GetNCAFromNSPForID(const NSP& nsp, const NcaID& id) {
-    const auto id_string = Common::HexToString(id, false);
-    auto file = nsp.GetFile(fmt::format("{}.nca", id_string));
-    if (file == nullptr) {
-        if (auto ncz_file = nsp.GetFile(fmt::format("{}.ncz", id_string))) {
-            file = Core::Crypto::DecompressNCZForInstall(
-                ncz_file, fmt::format("{}.nca", id_string));
-        }
-    }
+    auto file = nsp.GetNCAFileById(id);
     if (file == nullptr) {
         return nullptr;
     }
@@ -962,7 +935,7 @@ InstallResult RegisteredCache::InstallEntry(const NCA& nca, TitleType type,
 
     std::memcpy(&c_rec.nca_id, &c_rec.hash, 16);
     const CNMT new_cnmt(header, opt_header, {c_rec}, {});
-    if (!RawInstallYuzuMeta(new_cnmt)) {
+    if (!RawInstallMeta(new_cnmt)) {
         return InstallResult::ErrorMetaFailed;
     }
     return RawInstallNCA(nca, copy, overwrite_if_exists, c_rec.nca_id);
@@ -987,7 +960,7 @@ InstallResult RegisteredCache::InstallEntry(const NCA& nca, const CNMTHeader& ba
     };
     const OptionalHeader opt_header{0, 0};
     const CNMT new_cnmt(header, opt_header, {base_record}, {});
-    if (!RawInstallYuzuMeta(new_cnmt)) {
+    if (!RawInstallMeta(new_cnmt)) {
         return InstallResult::ErrorMetaFailed;
     }
     return RawInstallNCA(nca, copy, overwrite_if_exists, base_record.nca_id);
@@ -1043,7 +1016,7 @@ bool RegisteredCache::RemoveExistingEntry(u64 title_id) const {
                          deleted_html || deleted_legal);
     }
 
-    // If patch entries for any program exist in yuzu meta, remove them
+    // If patch entries for any program exist in the yuzu_meta directory, remove them
     for (u8 i = 0; i < 0x10; i++) {
         const auto meta_dir = dir->CreateDirectoryRelative("yuzu_meta");
         const auto filename = GetCNMTName(TitleType::Update, title_id + i);
@@ -1113,11 +1086,19 @@ InstallResult RegisteredCache::RawInstallNCA(const NCA& nca, const VfsCopyFuncti
     if (out == nullptr) {
         return InstallResult::ErrorCopyFailed;
     }
-    return copy(in, out, VFS_RC_LARGE_COPY_BLOCK) ? InstallResult::Success
-                                                  : InstallResult::ErrorCopyFailed;
+    if (!copy(in, out, VFS_RC_LARGE_COPY_BLOCK)) {
+        const auto parent = out->GetContainingDirectory();
+        out->Resize(0);
+        out.reset();
+        if (parent) {
+            parent->DeleteFile(Common::FS::GetFilename(path));
+        }
+        return InstallResult::ErrorCopyFailed;
+    }
+    return InstallResult::Success;
 }
 
-bool RegisteredCache::RawInstallYuzuMeta(const CNMT& cnmt) {
+bool RegisteredCache::RawInstallMeta(const CNMT& cnmt) {
     // Reasoning behind this method can be found in the comment for InstallEntry, NCA overload.
     const auto meta_dir = dir->CreateDirectoryRelative("yuzu_meta");
     const auto filename = GetCNMTName(cnmt.GetType(), cnmt.GetTitleID());
@@ -1138,9 +1119,9 @@ bool RegisteredCache::RawInstallYuzuMeta(const CNMT& cnmt) {
         }
     }
     Refresh();
-    return std::find_if(yuzu_meta.begin(), yuzu_meta.end(), [&cnmt](const std::pair<u64, CNMT>& kv) {
+    return std::find_if(raw_meta.begin(), raw_meta.end(), [&cnmt](const std::pair<u64, CNMT>& kv) {
         return kv.second.GetType() == cnmt.GetType() && kv.second.GetTitleID() == cnmt.GetTitleID();
-    }) != yuzu_meta.end();
+    }) != raw_meta.end();
 }
 
 ContentProviderUnion::~ContentProviderUnion() = default;
@@ -1338,12 +1319,6 @@ bool ManualContentProvider::AddEntriesFromContainer(VirtualFile file, bool only_
         return false;
     }
 
-    // Reject solid NCZ (.nsz without -B): only block-compressed NCZ is supported.
-    if (!ContainerIsFullyBlockCompressed(nsp)) {
-        LOG_DEBUG(Service_FS, "Skipping solid-compressed container: {}", file->GetName());
-        return false;
-    }
-
     return ForEachContainerEntry(
         nsp, only_content, base_program_id,
         [this](TitleType title_type, ContentRecordType content_type, u64 title_id,
@@ -1503,12 +1478,6 @@ void ExternalContentProvider::ScanDirectory(const VirtualDir& dir) {
 void ExternalContentProvider::ProcessNSP(const VirtualFile& file) {
     const auto nsp = OpenContainerAsNsp(file, Loader::FileType::NSP);
     if (!nsp) {
-        return;
-    }
-
-    // Reject solid NCZ (.nsz without -B): Eden only supports block-compressed NCZ.
-    if (!ContainerIsFullyBlockCompressed(nsp)) {
-        LOG_DEBUG(Service_FS, "Skipping solid-compressed container: {}", file->GetName());
         return;
     }
 

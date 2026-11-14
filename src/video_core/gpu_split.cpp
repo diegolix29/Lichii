@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <optional>
 #include <thread>
+#include <utility>
 
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -15,6 +16,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
+#ifdef __GLIBC__
+#include <execinfo.h>
 #endif
 #include <cstring>
 #include <string>
@@ -117,7 +121,27 @@ void GpuSplit::CheckOwner(const char* where) {
     LOG_ERROR(HW_GPU, "GPU split owner check: {} on thread {} while the back runs; stack:{}",
               where, thread, stack);
 #else
-    (void)where;
+    // Also while the back is idle: its idle hook submits (Scheduler::FlushDeferred).
+    if (on_back_thread || !instance.back_running.load(std::memory_order_acquire)) {
+        return;
+    }
+    static std::atomic<u32> reports{};
+    if (reports.fetch_add(1) >= 12) {
+        return;
+    }
+    std::string stack;
+#ifdef __GLIBC__
+    void* frames[40];
+    const int count = backtrace(frames, 40);
+    if (char** const symbols = backtrace_symbols(frames, count)) {
+        for (int i = 1; i < count; ++i) {
+            stack += fmt::format("\n  {}", symbols[i]);
+        }
+        std::free(symbols);
+    }
+#endif
+    LOG_ERROR(HW_GPU, "GPU split owner check: {} on a thread other than the back; stack:{}", where,
+              stack);
 #endif
 }
 
@@ -192,6 +216,11 @@ void GpuSplit::Stop() {
     consumed_cache = 0;
     publish_every = PublishEvery;
     front_engine = nullptr;
+    state_engine = nullptr;
+    state_count = 0;
+    state_breaks = false;
+    state_anywhere = false;
+    state_flags.fill(0);
     back_engine = nullptr;
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
@@ -238,6 +267,7 @@ void GpuSplit::WaitForSpace(size_t words) {
 }
 
 void GpuSplit::Publish() {
+    FlushState();
     if (published_local == write_position) {
         return;
     }
@@ -251,6 +281,7 @@ void GpuSplit::Publish() {
 }
 
 void GpuSplit::Drain(DrainSite site) {
+    FlushState();
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position && BackQuiet()) {
         return;
@@ -299,8 +330,8 @@ void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known) {
     if (semaphore_writes.size() >= semaphore_writes_limit) {
         // The words of releases the back ran hold their values in memory.
         const u64 done = consumed.load(std::memory_order_acquire);
-        std::erase_if(semaphore_writes,
-                      [done](const auto& entry) { return entry.second.position <= done; });
+        boost::unordered::erase_if(
+            semaphore_writes, [done](const auto& entry) { return entry.second.position <= done; });
         semaphore_writes_limit = std::max<size_t>(1024, semaphore_writes.size() * 2);
     }
     semaphore_writes.insert_or_assign(device_address & ~u64{3},
@@ -375,6 +406,7 @@ u64 GpuSplit::DeviceWritesTarget(DAddr address, u64 size) const {
 }
 
 bool GpuSplit::WaitForWrites(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) {
+    FlushState(); // A block that may issue a deferred draw notes its write anywhere.
     return WaitFor(std::min(WritesTarget(memory, address, size), write_position),
                    DrainSite::MacroDmaWrites);
 }
@@ -384,6 +416,7 @@ bool GpuSplit::WaitForSyncedWriters() {
 }
 
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
+    FlushState();
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache >= target) {
         return false;
@@ -422,6 +455,25 @@ void GpuSplit::Backoff(u32 spins, u64 target) {
         front_wake.wait(seen, std::memory_order_seq_cst);
     }
     front_waiting.store(false, std::memory_order_relaxed);
+}
+
+void GpuSplit::FlushStateSlow() {
+    // Cleared first: the entry's own SelectEngine, Reserve and Commit flush again.
+    const u32 count = std::exchange(state_count, 0);
+    SelectEngine(state_engine);
+    const size_t size = 1 + StateFlagWords + count;
+    u64* const entry = Reserve(size);
+    entry[0] = static_cast<u64>(Kind::State) | (state_breaks ? HasBreak : 0) |
+               (u64{state_break & 0xffff} << 8) | (u64{count} << 32);
+    std::memcpy(entry + 1, state_flags.data(), sizeof(state_flags));
+    std::memcpy(entry + 1 + StateFlagWords, state_writes.data(), size_t{count} * sizeof(u64));
+    Commit(size);
+    if (state_anywhere) {
+        NoteAnyWrite();
+    }
+    state_breaks = false;
+    state_anywhere = false;
+    state_flags.fill(0);
 }
 
 void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
@@ -564,6 +616,15 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         engine->CallMultiMethod(*system, method, reinterpret_cast<const u32*>(entry + data),
                                 amount, static_cast<u32>(entry[1]));
         return data + (amount + 1) / 2;
+    }
+    case Kind::State: {
+        const u32 count = static_cast<u32>(head >> 32);
+        const u32 last_break = (head & HasBreak) != 0 ? static_cast<u32>((head >> 8) & 0xffff)
+                                                      : Tegra::Engines::Maxwell3D::NoBreak;
+        static_cast<Tegra::Engines::Maxwell3D*>(back_engine)
+            ->WriteStateRegisters(*system, std::span<const u64, StateFlagWords>{entry + 1, StateFlagWords},
+                                  std::span<const u64>{entry + 1 + StateFlagWords, count}, last_break);
+        return 1 + StateFlagWords + count;
     }
     case Kind::Call: {
         if ((head & FastDrawNeutral) == 0) {

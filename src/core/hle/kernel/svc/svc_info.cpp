@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
@@ -111,7 +110,7 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
         case InfoType::Nx2VammSize:
             // A page granule: the SDK checks module addresses/sizes against (value - 1) and
             // VAMM maps one granule up front. 4 KiB matches what Switch 1 kernels use.
-            *result = Core::Memory::YUZU_PAGESIZE;
+            *result = Core::Memory::LICHII_PAGESIZE;
             LOG_WARNING(Kernel_SVC, "(STUBBED) Switch 2 InfoType 33, returning {:#x}", *result);
             R_SUCCEED();
         case InfoType::AslrRegionAddress:

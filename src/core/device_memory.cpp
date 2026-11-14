@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #ifdef _WIN32
@@ -37,7 +36,9 @@ DeviceMemory::~DeviceMemory() = default;
 #ifdef _WIN32
 // Windows can't punch holes in the guest memory section, so pages holding only zeros (games clear
 // their heaps while booting: Ocarina leaves ~7 GB) stay resident until they leave the working set.
-// A pass comes every 5 s while they keep turning up, backing off to once a minute.
+// A pass comes every 5 s while they keep turning up, backing off to once every 5 minutes: after
+// boot most passes trim 1-2 MiB for about a second of work. It waits out bulk mapping (loads,
+// spawns), whose map calls stalled 10-14 ms while a pass ran.
 void DeviceMemory::TrimZeroPages(std::stop_token stop) {
     using namespace std::chrono_literals;
     Common::SetCurrentThreadName("ZeroTrim");
@@ -53,6 +54,21 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         }
         if (stop.stop_requested()) {
             return;
+        }
+        // Busy: over 32 MiB mapped, unmapped or protected in the last half second. At most 10
+        // waits (5 s), then the pass runs anyway.
+        for (int wait = 0; wait < 10; ++wait) {
+            const u64 before = Common::HostMemory::MappedBytes();
+            {
+                std::unique_lock lock{mutex};
+                wake.wait_for(lock, stop, 500ms, [] { return false; });
+            }
+            if (stop.stop_requested()) {
+                return;
+            }
+            if (Common::HostMemory::MappedBytes() - before < (u64{32} << 20)) {
+                break;
+            }
         }
         const auto start = std::chrono::steady_clock::now();
         std::pair<size_t, size_t> result;
@@ -75,7 +91,7 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
                             std::chrono::steady_clock::now() - start)
                             .count();
         if (trimmed < Busy) {
-            interval = (std::min)(interval * 2, std::chrono::seconds{60});
+            interval = (std::min)(interval * 2, std::chrono::seconds{300});
             continue;
         }
         interval = 5s;

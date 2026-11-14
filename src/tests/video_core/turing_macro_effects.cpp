@@ -187,6 +187,16 @@ TEST_CASE("List macro verify: which calls only forward their GPU-written words",
     CHECK(CheckForwarding(brancher, 0, std::vector<u32>{0, 5, 6}, std::vector<u32>{0, 1, 2}, {},
                           Writes{{0x301, 5}, {0x302, 6}}, data_ram)
               .result == Forwarding::Steers);
+
+    // A loop on the parameter, writing r0 - 1 to 0x5f8 until it is 0: a tag loops until its run
+    // writes more than the real one.
+    const Mme decrement{.op = {2, 0}, .dst = {0, 24}, .src_a = {0, 24}, .src_b = {25, 24},
+                        .imm = {1, 0x5f8}, .out_method = {6, 0}, .out_emit = {1, 0}};
+    const Mme again{.op = {29, 0}, .src_a = {0, 24}, .imm = {0x1fff, 0}};
+    const auto looper = Code(std::vector<Mme>{load, decrement, again, Mme{.end = true}, Mme{}});
+    CHECK(CheckForwarding(looper, 0, std::vector<u32>{2}, std::vector<u32>{0}, {},
+                          Writes{{0x5f8, 1}, {0x5f8, 0}}, data_ram)
+              .result == Forwarding::Steers);
 }
 
 TEST_CASE("Turing macro effects cover every write Execute makes on random code",

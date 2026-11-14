@@ -612,7 +612,7 @@ struct AppLoader_NX::Impl {
         // Built on first use: listing the game needs only its metadata.
         tree_romfs_dir = root->GetSubdirectory("romfs");
         LoadNacp(selected);
-        tree_executable = std::make_unique<AppLoader_DeconstructedRomDirectory>(exefs, true);
+        tree_executable = std::make_unique<AppLoader_DeconstructedRomDirectory>(exefs, true, false);
         tree = true;
         status = ResultStatus::Success;
     }

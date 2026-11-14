@@ -8,6 +8,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "video_core/engines/puller.h"
 #include "video_core/nx2.h"
 
 using Tegra::Nx2SemaphoreWaiters;
@@ -202,4 +203,19 @@ TEST_CASE("Latching writes wake the GPU thread", "[video_core][nx2_waiters]") {
     waiters.OnWrite(0x1000, 5);
     CHECK(wake.Poll(std::chrono::steady_clock::now()));
     waiters.Remove(&owner);
+}
+
+TEST_CASE("A puller torn down while it waits leaves the semaphore waiters", "[video_core][nx2_waiters]") {
+    // The waiters outlive an emulation session: a channel stopped mid-wait must not leave its
+    // slot, whose word points into the session's freed guest memory, to the next GPU thread.
+    auto& waiters = Nx2SemaphoreWaiters::Get();
+    u32 word = 3;
+    {
+        Tegra::Engines::Puller puller;
+        REQUIRE(waiters.Add(&puller, 0x1000, 5, Nx2SemaphoreWaiters::AcquireGequal, &word));
+        word = 4;
+        CHECK(waiters.WordStored());
+    }
+    word = 5;
+    CHECK_FALSE(waiters.WordStored());
 }

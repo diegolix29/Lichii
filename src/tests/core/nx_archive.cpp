@@ -351,15 +351,16 @@ TEST_CASE("NX: a native base supports external updates and version disabling",
             REQUIRE(provider.AddEntriesFromContainer(OpenFixture("external_update.nsp")));
             const FileSys::PatchManager patches{ApplicationId, system.GetFileSystemController(),
                                                 system.GetContentProvider()};
-            const auto build_byte = [&] {
-                const auto exefs = patches.PatchExeFS(base->GetExeFS());
+            const auto build_byte = [&](bool apply_update) {
+                const auto exefs = patches.PatchExeFS(base->GetExeFS(), apply_update);
                 REQUIRE(exefs != nullptr);
                 const auto main = exefs->GetFile("main");
                 REQUIRE(main != nullptr);
                 return main->ReadByte(64);
             };
             CHECK(data() == std::vector<u8>(4096, 0x33));
-            CHECK(build_byte() == 0x33);
+            CHECK(build_byte(true) == 0x33);
+            CHECK(build_byte(false) == 0x11);
             const auto previous = Settings::values.disabled_addons[ApplicationId];
             SCOPE_EXIT {
                 Settings::values.disabled_addons[ApplicationId] = previous;
@@ -368,7 +369,7 @@ TEST_CASE("NX: a native base supports external updates and version disabling",
             CHECK(data() ==
                   std::vector<u8>(
                       4096, std::string_view(archive) == "native_external_base.nx" ? 0x11 : 0x22));
-            CHECK(build_byte() ==
+            CHECK(build_byte(true) ==
                   (std::string_view(archive) == "native_external_base.nx" ? 0x11 : 0x22));
         }
     }

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <bit>
@@ -444,7 +443,7 @@ void KScheduler::ScheduleImplFiber(KernelCore& kernel) {
             // The next thread is nullptr!
 
             // Switch to the idle thread. Note: HOS treats idling as a special case for
-            // performance. This is not *required* for yuzu's purposes, and for singlecore
+            // performance. This is not *required* for Lichii's purposes, and for singlecore
             // compatibility, we can just move the logic that would go here into the execution
             // of the idle thread. If we ever remove singlecore, we should implement this
             // accurately to HOS.

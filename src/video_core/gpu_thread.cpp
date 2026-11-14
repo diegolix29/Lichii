@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
@@ -21,10 +20,12 @@
 #include "video_core/control/scheduler.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_trace/recorder.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_back_idle_trace.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
@@ -180,11 +181,26 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             if (stop_token.stop_requested()) {
                 break;
             }
+            if (VideoCommon::GpuTrace::g_requested.load(std::memory_order_relaxed) ||
+                VideoCommon::GpuTrace::g_file_trigger) {
+                const auto* const submit = std::get_if<SubmitListCommand>(&next.data);
+                VideoCommon::GpuTrace::OnCommand(
+                    system, scheduler.HasPendingChannels(), submit ? &submit->entries : nullptr,
+                    submit ? submit->channel : -1, std::holds_alternative<GPUTickCommand>(next.data));
+            }
             if (split.Active()) {
                 // Only command lists are parsed here; everything else runs on the back thread
                 // in order, and so does the signal that the command ran.
                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
+                if (!std::holds_alternative<SubmitListCommand>(next.data)) {
+                    // Maps and flushes may change what the snapshot copier reads.
+                    Tegra::DmaPusher::WaitForSnapshotCopies();
+                }
                 if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                    // The guest may have written pages the caches don't watch since the lists
+                    // before it: uniform keeps end here, in order on the back.
+                    split.Defer([] { VideoCommon::Nx2FastDraw::NoteSync(); },
+                                VideoCommon::GpuSplit::FastDrawNeutral);
                     Profile::Scope scope{Profile::Zone::Push};
                     scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
@@ -217,7 +233,14 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 last_progress = std::chrono::steady_clock::now();
                 continue;
             }
+            // Match split Call boundaries before callbacks, flushes and invalidations, and
+            // conservatively end reuse at each submitted list, including channel changes.
+            VideoCommon::Nx2FastDraw::BreakUnsplit(VideoCommon::Nx2FastDraw::Reason::Call);
+            if (!std::holds_alternative<SubmitListCommand>(next.data)) {
+                Tegra::DmaPusher::WaitForSnapshotCopies();
+            }
             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                VideoCommon::Nx2FastDraw::NoteSync();
                 Profile::Scope scope{Profile::Zone::Push};
                 scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
             } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
@@ -303,6 +326,8 @@ void ThreadManager::NotifyShutdown() {
         thread.request_stop();
         thread.join();
     }
+    // Queued snapshot copies read the channels' memory managers, which services free next.
+    Tegra::DmaPusher::WaitForSnapshotCopies();
     VideoCommon::GpuSplit::Get().Stop();
 }
 
