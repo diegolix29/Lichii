@@ -333,7 +333,9 @@ struct Memory::Impl {
     /// host range, nullptr otherwise. Every page of such a range stores the same offset; block ids
     /// can't prove it, since equal ids at the ends say nothing about a page remapped in between.
     [[nodiscard]] u8* GetSpan(const VAddr addr, const std::size_t size) const noexcept {
-        if (!AddressSpaceContains(*current_page_table, addr, size)) {
+        // An empty span at the exclusive end of the address space has no page-table entry.
+        if (!AddressSpaceContains(*current_page_table, addr, size) ||
+            addr >= (u64{1} << current_page_table->GetAddressSpaceBits())) {
             return nullptr;
         }
         const u64 first_page = addr >> LICHII_PAGEBITS;

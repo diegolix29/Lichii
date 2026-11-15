@@ -166,7 +166,7 @@ add_library(
     cpu_features.cpp
     cpu_features.h
     httplib.h
-    net/net.h net/net.cpp
+    net/ca_store.h net/net.h net/net.cpp
     nextendo.cpp
     nextendo.h
     container/unordered_map.h container/unordered_set.h)

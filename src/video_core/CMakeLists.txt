@@ -17,6 +17,7 @@ add_library(video_core STATIC
     buffer_cache/buffer_cache_base.h
     buffer_cache/buffer_cache.cpp
     buffer_cache/buffer_cache.h
+    buffer_cache/compute_write_grid.h
     buffer_cache/indirect_buffer.h
     buffer_cache/memory_tracker_base.h
     buffer_cache/usage_tracker.h
@@ -102,6 +103,7 @@ add_library(video_core STATIC
     macro_turing.h
     fence_manager.h
     frame_gen_choice.h
+    front_qmd.h
     gpu.cpp
     gpu.h
     gpu_timestamp.h
@@ -143,6 +145,9 @@ add_library(video_core STATIC
     nx2_debug_control.h
     nx2_fast_draw.cpp
     nx2_fast_draw.h
+    nx2_list_indirect.h
+    nx2_list_indirect_stats.h
+    nx2_owed_words.h
     nx2_profile.h
     nx2_stutter_trace.cpp
     nx2_stutter_trace.h
@@ -150,6 +155,7 @@ add_library(video_core STATIC
     nx2_async_readback.h
     nx2_backx.h
     nx2_download_trace.h
+    nx2_drain_check.h
     pending_maps.h
     present.h
     pte_kind.h
@@ -202,6 +208,8 @@ add_library(video_core STATIC
     renderer_vulkan/framebuffer_limits.h
     renderer_vulkan/maxwell_to_vk.cpp
     renderer_vulkan/maxwell_to_vk.h
+    renderer_vulkan/nx2_list_slots.cpp
+    renderer_vulkan/nx2_list_slots.h
     renderer_vulkan/pipeline_build.h
     renderer_vulkan/pipeline_build_failure.cpp
     renderer_vulkan/pipeline_build_failure.h

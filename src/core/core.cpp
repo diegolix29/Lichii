@@ -1282,6 +1282,9 @@ void System::RegisterApplicationChangedCallback(ApplicationChangedCallback&& cal
 void System::NotifyApplicationChanged(u64 program_id) {
     //LOG_DEBUG(Core, "Running application changed to {:016X}", program_id);
 
+    if (impl->gpu_core) {
+        impl->gpu_core->NotifyApplicationChanged(program_id);
+    }
     if (impl->application_changed_callback) {
         impl->application_changed_callback(program_id);
     }

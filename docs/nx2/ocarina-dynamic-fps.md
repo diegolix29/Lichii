@@ -214,6 +214,23 @@ speed; at 1 and above the routine runs the game's two instructions. The hook rec
 replaced instructions, so a user mod at either one skips the patch. Measured live at step 0.65 with
 the fix: 0.94 rad/s median while she walks on the ceiling, matching 0.75 to 1.1 rad/s at 60 fps.
 
+## FPS Unlock cloth and wind time step
+
+The cloth update (Havok cloth: clothes, hair, and `hclSimpleWindAction`, whose phase is
+`time += dt`) builds its time step as `T[0x168] * T[0x1C0] * (1/60)` (`T = *[main+0x4E94B20]`),
+without the frame step at `T+0x10`. Above 60 fps each frame still simulates 1/60 s, so cloth and
+wind run fast (twice as fast at 120 fps). Four sites load the 1/60 constant before the multiply:
+`0x14632C` (`ldr s0`), `0x2AB804` (`fmov s0, w8`), `0x2C207A4` (`ldr s0`) and `0x2C2208C` (`ldr s2`).
+
+`FPS Unlock (built-in)` replaces each with `bl` to 48 bytes at `0x3C46B00` (result in `s0`) or
+`0x3C46B30` (in `s2`), which return `min(T+0x18, 1/60)` (`T+0x18` is step / 60), or 1/60 when the
+step is not positive. At 60 fps and below the value is the original constant bit for bit. The
+routines use only x16 and x17. Live in Kakariko, breakpoints hit `0x2C2208C` and `0x2AB804` several
+times a frame (the other two sites did not run there); at about 86 fps, restoring the original bytes
+made clothes and hair visibly sway faster, and the patch brought them back to the 60 fps pace.
+The drifting dust fog (full-screen shader `3ddfb1d7a854c849`) needs no fix: its time, written at
+`0x478338`, already advances by wind speed / 120 times the frame step.
+
 ## Tests
 
 The `[patch_manager]` tests call production `PatchManager::PatchNSO` with

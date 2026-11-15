@@ -25,12 +25,22 @@ extern char** environ;
 #endif
 
 #include "common/common_types.h"
+
+// dynarmic's internal headers are written for dynarmic's own warning flags. This test pulls them
+// into a target built with the project's -Werror=shadow, which they do not pass on GCC.
+#ifdef __GNUC__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wshadow"
+#endif
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
 #include "dynarmic/frontend/A64/translate/a64_translate.h"
 #include "dynarmic/interface/A64/a64.h"
 #include "dynarmic/interface/exclusive_monitor.h"
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/opcodes.h"
+#ifdef __GNUC__
+#pragma GCC diagnostic pop
+#endif
 
 namespace {
 

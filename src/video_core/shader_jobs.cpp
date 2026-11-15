@@ -244,6 +244,19 @@ void ShaderJobScheduler::Cancel(const ShaderJobHandle& handle) {
     }
 }
 
+std::optional<ShaderJobStatus> ShaderJobScheduler::CancelQueued(const ShaderJobHandle& handle) {
+    ShaderJobState& job{*handle.state};
+    std::vector<ShaderJob> dead;
+    std::scoped_lock lock{mutex};
+    const ShaderJobStatus status{job.status.load()};
+    if (!IsQueued(status)) {
+        return std::nullopt;
+    }
+    job.stop = true;
+    Finish(job, ShaderJobStatus::Cancelled, dead);
+    return status;
+}
+
 void ShaderJobScheduler::Cancel(const ShaderJobBatch& batch) {
     std::vector<ShaderJob> dead;
     std::scoped_lock lock{mutex};

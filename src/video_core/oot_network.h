@@ -38,6 +38,9 @@ constexpr std::array BaseOutputPrograms{
     BaseOutputProgram{0x006b7919, 0x57a0, 0x1e49acb491d9fb59ULL},
     BaseOutputProgram{0x00397919, 0x6430, 0x2142429c43740683ULL},
     BaseOutputProgram{0x003c7919, 0x6690, 0xd01939a775921a6cULL},
+    BaseOutputProgram{0x00017919, 0x6430, 0x33c278200d771cd9ULL},
+    BaseOutputProgram{0x003c7919, 0x66f0, 0x83deec1743ddee73ULL},
+    BaseOutputProgram{0x00017919, 0x6250, 0x58bdd5733e364169ULL},
 };
 
 /// Constant buffer 0 offset of the output pass's texture handle for the B10G11R11 image it writes

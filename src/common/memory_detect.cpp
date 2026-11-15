@@ -35,6 +35,19 @@
 
 namespace Common {
 
+#ifdef __MINGW32__
+namespace {
+// MinGW's psapi.h does not declare PROCESS_MEMORY_COUNTERS_EX2 (Windows 10 1809 and later):
+// the Windows SDK's layout, spelled out.
+struct PROCESS_MEMORY_COUNTERS_EX2 : PROCESS_MEMORY_COUNTERS_EX {
+    SIZE_T PrivateWorkingSetSize;
+    ULONG64 SharedCommitUsage;
+};
+static_assert(sizeof(PROCESS_MEMORY_COUNTERS_EX2) ==
+              sizeof(PROCESS_MEMORY_COUNTERS_EX) + sizeof(SIZE_T) + sizeof(ULONG64));
+} // Anonymous namespace
+#endif
+
 // Detects the RAM and Swapfile sizes
 static MemoryInfo Detect() {
     MemoryInfo mem_info{};

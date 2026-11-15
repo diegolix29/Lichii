@@ -30,9 +30,10 @@ output shaders use the same constant-buffer handle offsets as the update.
 - On 1.1.1, `ShaderCache::ComputeShader` calls `KeplerCompute::BypassOotNetwork`. The output
   pass uses a same-size point copy. The prepass and network are skipped while the replacement works.
 - On 1.0.0, `KeplerCompute::BypassOotBaseNetwork` recognizes the known output programs from
-  `DispatchNativeCompute` before translation, which can reject their per-tap gathers. It uses a
-  bilinear copy that can scale the tonemap up to the output resolution. The base game's other
-  compute passes still run.
+  `DispatchNativeCompute` before translation, which can reject their per-tap gathers. The game
+  selects different programs as the internal resolution changes. Match the full native key for
+  each candidate that shares the first word. The replacement uses a bilinear copy that can scale
+  the tonemap up to the output resolution. The base game's other compute passes still run.
 - Both paths use `AccelerateSurfaceCopy` and get the output format, size and block-linear layout
   from the output pass's texture descriptor at cb0+0xd0.
 

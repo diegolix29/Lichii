@@ -48,6 +48,11 @@ public:
         return static_cast<u64>(due);
     }
 
+    // The pts of the frame the client acquired last.
+    u64 LastAcquiredPts() const {
+        return last_acquired_pts;
+    }
+
 private:
     std::optional<s64> offset; ///< Host time minus pts of the frame the clock started from
     s64 last_acquire{};

@@ -38,9 +38,9 @@ TEST_CASE("NCZ discovery accepts solid headers without decoding payloads", "[ncz
     class CountingFile final : public FileSys::VectorVfsFile {
     public:
         using FileSys::VectorVfsFile::VectorVfsFile;
-        std::size_t Read(u8* data, std::size_t length, std::size_t offset) const override {
+        std::size_t Read(u8* buffer, std::size_t length, std::size_t offset) const override {
             bytes_read += length;
-            return FileSys::VectorVfsFile::Read(data, length, offset);
+            return FileSys::VectorVfsFile::Read(buffer, length, offset);
         }
         mutable std::size_t bytes_read{};
     };
@@ -384,9 +384,9 @@ TEST_CASE("A released solid NCZ reader resumes with identical bytes", "[ncz][res
     class StartCountingFile final : public FileSys::VectorVfsFile {
     public:
         using FileSys::VectorVfsFile::VectorVfsFile;
-        std::size_t Read(u8* data, std::size_t length, std::size_t offset) const override {
+        std::size_t Read(u8* buffer, std::size_t length, std::size_t offset) const override {
             starts += offset == Payload + 64;
-            return FileSys::VectorVfsFile::Read(data, length, offset);
+            return FileSys::VectorVfsFile::Read(buffer, length, offset);
         }
         mutable std::size_t starts{};
     };

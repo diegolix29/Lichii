@@ -46,4 +46,11 @@ TEST_CASE("Memory spans need every page backed by one linear host range", "[core
     map(12, Common::PageTable::PageEntryData::INVALID_BLOCK_ID, backing + 0x30000);
     map(13, 5, backing + 0x31000);
     REQUIRE(memory.GetSpan(0xC000, 0x2000) == backing + 0x30000);
+
+    // The address-space end is exclusive, even when the requested range is empty.
+    const u64 end = u64{1} << table.GetAddressSpaceBits();
+    REQUIRE(memory.GetSpan(end, 0) == nullptr);
+    REQUIRE(memory.GetSpan(end, 1) == nullptr);
+    // A zero-length lookup inside a mapped page retains the old behavior.
+    REQUIRE(memory.GetSpan(0xC000, 0) == backing + 0x30000);
 }

@@ -504,7 +504,7 @@ TEST_CASE("NCA opens a section only when it is used", "[core][file_sys]") {
 
     class FarthestRead final : public VectorVfsFile {
     public:
-        explicit FarthestRead(std::vector<u8> data) : VectorVfsFile(std::move(data), "test.nca") {}
+        explicit FarthestRead(std::vector<u8> raw) : VectorVfsFile(std::move(raw), "test.nca") {}
         std::size_t Read(u8* out, std::size_t size, std::size_t offset) const override {
             farthest = std::max(farthest, offset + size);
             return VectorVfsFile::Read(out, size, offset);

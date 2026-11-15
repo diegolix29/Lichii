@@ -9,8 +9,10 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <thread>
 #include <vector>
@@ -24,11 +26,14 @@
 #include "core/hle/kernel/kernel.h"
 #include "core/memory.h"
 #include "tests/core/system_test_context.h"
+#include "shader_recompiler/storage_write_extent.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/compute_write_grid.h"
 #include "video_core/buffer_cache/indirect_buffer.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2_owed_words.h"
 #include "video_core/renderer_null/null_rasterizer.h"
 
 namespace {
@@ -262,6 +267,77 @@ struct KeepPolicy : Policy {
 
 using KeepCache = VideoCommon::BufferCache<KeepPolicy>;
 
+struct OwedBuffer : Buffer {
+    using Buffer::Buffer;
+    Buffer* Handle() {
+        return this;
+    }
+};
+
+/// Owed GPU-written list words (Nx2ListIndirect) as BufferCacheRuntime keeps them, each with the
+/// word its slot holds on the host GPU.
+struct OwedRuntime : Runtime {
+    using Word = Tegra::Nx2ListIndirect::OwedWords::Word;
+    using OwedReader = Tegra::Nx2ListIndirect::OwedReader;
+
+    void Owe(DAddr address, u32 placeholder, u32 real) {
+        owed.Note(address, placeholder, 1);
+        reals[address] = real;
+    }
+    bool Nx2Owes(DAddr address, u64 size) const {
+        return owed.Overlaps(address, size);
+    }
+    void Nx2ForgetOwed(DAddr address, u64 size) {
+        std::vector<Word> taken;
+        owed.Take(address, size, taken);
+    }
+    std::optional<std::pair<DAddr, DAddr>> Nx2OwedSpan(DAddr address, u64 size) const {
+        return owed.Span(address, size);
+    }
+    template <typename Read>
+    bool Nx2PatchOwed(DAddr address, u32 size, Buffer* dst, u64 offset, Read&& read, OwedReader) {
+        bool patched = false;
+        std::vector<Word> dropped;
+        owed.ForEach(
+            address, size,
+            [&](const Word& word) {
+                if (read(word.address) != word.value) {
+                    return false;
+                }
+                const DAddr first = (std::max)(word.address, address);
+                const DAddr last = (std::min)(word.address + 4, address + size);
+                if (first < last) {
+                    const u32 real = reals.at(word.address);
+                    std::memcpy(dst->bytes.data() + offset + (first - address),
+                                reinterpret_cast<const u8*>(&real) + (first - word.address),
+                                last - first);
+                    patched = true;
+                }
+                return true;
+            },
+            dropped);
+        return patched;
+    }
+    template <typename Land>
+    void Nx2LandOwed(DAddr address, u64 size, OwedReader, Land&& land) {
+        std::vector<Word> taken;
+        owed.Take(address, size, taken);
+        for (const Word& word : taken) {
+            REQUIRE(land(word.address, word.value, reals.at(word.address)));
+        }
+    }
+
+    Tegra::Nx2ListIndirect::OwedWords owed;
+    std::map<DAddr, u32> reals;
+};
+
+struct OwedPolicy : Policy {
+    using Runtime = ::OwedRuntime;
+    using Buffer = ::OwedBuffer;
+};
+
+using OwedCache = VideoCommon::BufferCache<OwedPolicy>;
+
 } // namespace
 
 namespace VideoCommon {
@@ -318,7 +394,8 @@ struct BufferCacheTestAccess {
         entry.draw_written = true;
         ++entry.writes;
     }
-    static void Download(Cache& cache, std::span<const std::pair<DAddr, u64>> ranges) {
+    template <class C>
+    static void Download(C& cache, std::span<const std::pair<DAddr, u64>> ranges) {
         cache.DownloadRangesMemory(ranges);
     }
     /// A draw or dispatch binds [address, address + size) of buffer `id`: its CPU-modified bytes
@@ -341,6 +418,13 @@ struct BufferCacheTestAccess {
         cache.gpu_memory = &channel.gpu_memory;
         channel.uniform_buffers[0][0] = {.device_addr = address, .size = size, .buffer_id = id};
         cache.BindHostGraphicsUniformBuffer(0, 0, 0, true);
+    }
+    /// Engines (DMACopy) run on `channel`.
+    template <class C>
+    static void UseChannel(C& cache, BufferCacheChannelInfo& channel) {
+        cache.channel_state = &channel;
+        cache.maxwell3d = &channel.maxwell3d;
+        cache.gpu_memory = &channel.gpu_memory;
     }
     static void NextFrame(Cache& cache) {
         cache.native_indirect_uniforms_this_frame.clear();
@@ -372,11 +456,21 @@ struct BufferCacheTestAccess {
     static void GpuWrite(KeepCache& cache, BufferId id, DAddr address, u32 size) {
         cache.MarkWrittenBuffer(id, address, size);
     }
-    static void MarkWritten(Cache& cache, BufferId id, DAddr address, u32 size) {
+    template <class C>
+    static void MarkWritten(C& cache, BufferId id, DAddr address, u32 size) {
         cache.MarkWrittenBuffer(id, address, size);
     }
     static size_t ReadDownloads(Cache& cache) {
         return cache.read_downloads.size();
+    }
+    static u32 MaxUnreadWrites() {
+        return Cache::MaxUnreadWrites;
+    }
+    static u32 MaxPendingEarlyDownloads() {
+        return Cache::MaxPendingEarlyDownloads;
+    }
+    static u64 EarlyBytesPerFrame() {
+        return Cache::EarlyBytesPerFrame;
     }
     /// Every read download compared with a synchronous flush (EDEN_NX2_READ_CHECK=1).
     static void CheckEveryRead(Cache& cache) {
@@ -1250,6 +1344,119 @@ TEST_CASE("Indirect dispatch arguments remain GPU modified across a neighboring 
     REQUIRE(f.bytes[0x40] == 0x73);
 }
 
+namespace {
+struct GridDimension {
+    u32 value;
+    u32 Value() const {
+        return value;
+    }
+};
+struct GridEngine {
+    struct {
+        GridDimension grid_dim_x, grid_dim_y, grid_dim_z;
+    } launch_description;
+    bool indirect{};
+    bool slot{};
+    std::optional<GPUVAddr> GetIndirectComputeAddress() const {
+        return indirect ? std::optional<GPUVAddr>{0x1000} : std::nullopt;
+    }
+    std::optional<u32> GetIndirectListSlot() const {
+        return slot ? std::optional<u32>{1} : std::nullopt;
+    }
+};
+} // Anonymous namespace
+
+TEST_CASE("List-slot group counts cannot narrow GPU write tracking",
+          "[video_core][buffer_ports]") {
+    GridEngine engine{{{1}, {20}, {1}}, false, false};
+    const Shader::StorageWriteExtent extent{
+        .bounded = true, .const_end = 4, .group_stride = {0, 4, 0}};
+    const std::array<u32, 3> block{1, 1, 1};
+    auto grid = VideoCommon::ComputeWriteGrid(engine);
+    REQUIRE(grid.has_value());
+    REQUIRE((*grid)[1] == 20);
+    REQUIRE(Shader::ResolveStorageWriteExtent(extent, block, grid) == u64{80});
+    engine.indirect = true;
+    REQUIRE_FALSE(VideoCommon::ComputeWriteGrid(engine));
+    engine.indirect = false;
+    engine.slot = true;
+    // Slot 1's placeholders: y is 5 after the QMD's low 16 bits, while the real GPU-written y
+    // can be 20. Taking 5 as the grid would mark too little of this 80-byte output.
+    engine.launch_description = {{0xf1a90004}, {5}, {6}};
+    grid = VideoCommon::ComputeWriteGrid(engine);
+    REQUIRE_FALSE(grid);
+    REQUIRE_FALSE(Shader::ResolveStorageWriteExtent(extent, block, grid));
+    auto local_extent = extent;
+    local_extent.group_stride = {};
+    REQUIRE(Shader::ResolveStorageWriteExtent(local_extent, block, grid) == u64{4});
+}
+
+namespace {
+/// One buffer over device 0x10000-0x20000 (GPU 0x100000), on a channel for engines.
+struct OwedFixture : BasicFixture<OwedRuntime, OwedCache> {
+    OwedFixture() {
+        state.memory_manager = &*memory;
+        state.payload.emplace(system, *memory, state);
+        channel.emplace(state);
+        Access::UseChannel(*cache, *channel);
+        id = Access::Add(*cache, 0x10000, 0x10000);
+    }
+    /// An inline upload wrote `placeholder` at `address`, guest memory and buffer alike, and the
+    /// slot it names holds `real`.
+    void Owe(DAddr address, u32 placeholder, u32 real) {
+        std::memcpy(bytes + (address - 0x10000), &placeholder, sizeof(placeholder));
+        std::memcpy(Access::Get(*cache, id).bytes.data() + (address - 0x10000), &placeholder,
+                    sizeof(placeholder));
+        runtime.Owe(address, placeholder, real);
+    }
+    u32 Guest(DAddr address) const {
+        u32 word;
+        std::memcpy(&word, bytes + (address - 0x10000), sizeof(word));
+        return word;
+    }
+    u32 Host(DAddr address) {
+        u32 word;
+        std::memcpy(&word, Access::Get(*cache, id).bytes.data() + (address - 0x10000),
+                    sizeof(word));
+        return word;
+    }
+
+    Tegra::Control::ChannelState state{0};
+    std::optional<VideoCommon::BufferCacheChannelInfo> channel;
+    VideoCommon::BufferId id;
+};
+} // Anonymous namespace
+
+TEST_CASE("List words: a DMA copy gets owed words as the host GPU has them",
+          "[video_core][buffer_ports]") {
+    OwedFixture f;
+    constexpr u32 real = 0x12345678;
+    f.Owe(0x10100, 0xf1a90004, real);
+    REQUIRE(f.cache->DMACopy(0x100100, 0x100200, 4));
+    CHECK(f.Guest(0x10200) == real);
+    CHECK(f.Host(0x10200) == real);
+    // A copy over half of an owed word: the other half is its slot word's.
+    f.Owe(0x10300, 0xf1a90005, 0x9abcdef0);
+    REQUIRE(f.cache->DMACopy(0x100100, 0x100300, 2));
+    CHECK(f.Guest(0x10300) == 0x9abc5678);
+    CHECK(f.Host(0x10300) == 0x9abc5678);
+    CHECK_FALSE(f.runtime.Nx2Owes(0x10000, 0x10000));
+}
+
+TEST_CASE("List words: a host GPU write over part of an owed word downloads all of it",
+          "[video_core][buffer_ports]") {
+    OwedFixture f;
+    f.Owe(0x10100, 0xf1a90004, 0x12345678);
+    Access::MarkWritten(*f.cache, f.id, 0x10100, 2);
+    // The shader writes the low half.
+    Access::Get(*f.cache, f.id).bytes[0x100] = 0xaa;
+    Access::Get(*f.cache, f.id).bytes[0x101] = 0xbb;
+    const std::array<std::pair<DAddr, u64>, 1> ranges{{{0x10100, 4}}};
+    Access::Download(*f.cache, ranges);
+    CHECK(f.Guest(0x10100) == 0x1234bbaa);
+    CHECK_FALSE(f.runtime.Nx2Owes(0x10100, 4));
+}
+
 TEST_CASE("Newer bytes that guest memory doesn't hold yet land the read downloads under them first",
           "[buffer_ports]") {
     Fixture f;
@@ -1650,16 +1857,17 @@ TEST_CASE("Early downloads keep CPU writes, and stop for pages no longer read", 
     REQUIRE(f.bytes[0x10020] == 0xee);
     REQUIRE(f.bytes[0x1002f] == 0xee);
     REQUIRE(f.bytes[0x10030] == 3);
-    // Not read any more: a few more writes get early downloads, then none.
+    // Not read any more: MaxUnreadWrites more writes get early downloads, then none.
     const u32 queued = f.runtime.queued_host_reads;
-    for (u8 frame = 4; frame < 12; ++frame) {
-        WriteByDispatch(f, id, 0x20000, 0x100, frame);
+    const u32 writes = Access::MaxUnreadWrites() + 4;
+    for (u32 write = 0; write < writes; ++write) {
+        WriteByDispatch(f, id, 0x20000, 0x100, static_cast<u8>(4 + write));
         f.runtime.Complete(f.runtime.submitted_tick);
     }
-    REQUIRE(f.runtime.queued_host_reads - queued == 4);
+    REQUIRE(f.runtime.queued_host_reads - queued == Access::MaxUnreadWrites());
     const auto area = ReadWord(f, 0x20010);
     REQUIRE_FALSE(area.preemtive);
-    REQUIRE(f.bytes[0x10010] == 11);
+    REQUIRE(f.bytes[0x10010] == static_cast<u8>(4 + writes - 1));
     REQUIRE(Access::ReadDownloads(*f.cache) == 0);
     REQUIRE_FALSE(Access::Pending(*f.cache, 0x20000, 0x1000));
 }
@@ -1834,33 +2042,42 @@ TEST_CASE("Finished early downloads land a few draws later, or at the next dispa
     REQUIRE(ReadWord(f, 0x20010).preemtive);
 }
 
-TEST_CASE("Early downloads stop at 32 on their way", "[buffer_ports]") {
+TEST_CASE("Early downloads stop at MaxPendingEarlyDownloads on their way", "[buffer_ports]") {
     Fixture f;
     const Nx2TitleScope nx2_title;
     const auto id = Access::Add(*f.cache, 0x20000, 0x30000);
-    // 33 pages, each read after two writes.
+    // 9 pages, each read after two writes.
     for (u8 frame = 1; frame <= 2; ++frame) {
-        for (DAddr page = 0x20000; page < 0x41000; page += 0x1000) {
+        for (DAddr page = 0x20000; page < 0x29000; page += 0x1000) {
             WriteByDispatch(f, id, page, 0x100, frame);
             ReadWord(f, page);
         }
     }
-    // Their next writes before the host GPU ran any copy: the 33rd page's read flushes.
-    for (DAddr page = 0x20000; page < 0x41000; page += 0x1000) {
-        WriteByDispatch(f, id, page, 0x100, 3);
+    // Writes to the first 8 before the host GPU ran any copy, as many as may be on their way.
+    const u32 max_pending = Access::MaxPendingEarlyDownloads();
+    const u32 rounds = max_pending / 8;
+    REQUIRE(rounds * 8 == max_pending);
+    REQUIRE(rounds <= Access::MaxUnreadWrites());
+    REQUIRE(max_pending * u64{0x1000} < Access::EarlyBytesPerFrame());
+    for (u32 round = 0; round < rounds; ++round) {
+        for (DAddr page = 0x20000; page < 0x28000; page += 0x1000) {
+            WriteByDispatch(f, id, page, 0x100, static_cast<u8>(3 + round));
+        }
     }
-    REQUIRE(f.runtime.queued_host_reads == 32);
-    REQUIRE(Access::ReadDownloads(*f.cache) == 32);
-    const auto last = ReadWord(f, 0x40010);
+    // The 9th page's write gets none: its read flushes.
+    WriteByDispatch(f, id, 0x28000, 0x100, static_cast<u8>(3 + rounds));
+    REQUIRE(f.runtime.queued_host_reads == max_pending);
+    REQUIRE(Access::ReadDownloads(*f.cache) == max_pending);
+    const auto last = ReadWord(f, 0x28010);
     REQUIRE_FALSE(last.preemtive);
     REQUIRE_FALSE(last.in_flight);
-    REQUIRE(f.bytes[0x30010] == 3);
-    REQUIRE(f.bytes[0x10010] == 3);
+    REQUIRE(f.bytes[0x18010] == static_cast<u8>(3 + rounds));
+    REQUIRE(f.bytes[0x10010] == static_cast<u8>(3 + rounds - 1));
     REQUIRE(Access::ReadDownloads(*f.cache) == 0);
     REQUIRE_FALSE(Access::Pending(*f.cache, 0x20000, 0x21000));
 }
 
-TEST_CASE("Early downloads stop at 1 MiB a frame", "[buffer_ports]") {
+TEST_CASE("Early downloads stop at EarlyBytesPerFrame a frame", "[buffer_ports]") {
     Fixture f;
     const Nx2TitleScope nx2_title;
     const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
@@ -1868,16 +2085,17 @@ TEST_CASE("Early downloads stop at 1 MiB a frame", "[buffer_ports]") {
         WriteByDispatch(f, id, 0x20000, 0x1000, frame);
         ReadWord(f, 0x20010);
     }
-    // A whole page each, read once the host GPU ran it: 256 make 1 MiB.
-    for (u32 write = 0; write < 256; ++write) {
+    // A whole page each, read once the host GPU ran it, up to the frame's bytes.
+    const u32 writes = static_cast<u32>(Access::EarlyBytesPerFrame() / 0x1000);
+    for (u32 write = 0; write < writes; ++write) {
         WriteByDispatch(f, id, 0x20000, 0x1000, static_cast<u8>(write));
         f.runtime.Complete(f.runtime.submitted_tick);
         REQUIRE(ReadWord(f, 0x20010).preemtive);
     }
-    REQUIRE(f.runtime.queued_host_reads == 256);
+    REQUIRE(f.runtime.queued_host_reads == writes);
     // The frame's later writes leave their reads to flush.
     WriteByDispatch(f, id, 0x20000, 0x1000, 0xab);
-    REQUIRE(f.runtime.queued_host_reads == 256);
+    REQUIRE(f.runtime.queued_host_reads == writes);
     const auto area = ReadWord(f, 0x20010);
     REQUIRE_FALSE(area.preemtive);
     REQUIRE_FALSE(area.in_flight);

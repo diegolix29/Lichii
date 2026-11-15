@@ -207,7 +207,8 @@ std::pair<ZoneTicks, ZoneTicks> SnapshotZones(u64 now) {
             if (sequence.load(std::memory_order_relaxed) != begin) {
                 continue;
             }
-            if (open < ZoneSlots && now > since) {
+            // since is 0 for a thread never named (its open zone is zero-initialized, not none)
+            if (open < ZoneSlots && since != 0 && now > since) {
                 ticks[thread][open] += now - since;
             }
             break;
@@ -284,7 +285,8 @@ ThreadTicks Snapshot(u64 now) {
             if (sequence.load(std::memory_order_relaxed) != begin) {
                 continue;
             }
-            if (open < CategoryCount && now > since) {
+            // since is 0 for a thread never named (open is zero-initialized: GraphicsMiss, not None)
+            if (open < CategoryCount && since != 0 && now > since) {
                 ticks[thread][open] += now - since;
             }
             break;

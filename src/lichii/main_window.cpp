@@ -3139,6 +3139,14 @@ void MainWindow::OnGameListDumpRomFS(u64 program_id, const std::string& game_pat
             failed();
             return;
         }
+    } else if (loader->GetFileType() == Loader::FileType::NUP) {
+        // A NUP is never installed either: its loader gives the RomFS with the newest update
+        // already merged over the base.
+        title_id = program_id;
+        if (loader->ReadRomFS(romfs) != Loader::ResultStatus::Success || romfs == nullptr) {
+            failed();
+            return;
+        }
     } else {
         FileSys::VirtualFile packed_update_raw{};
         loader->ReadUpdateRaw(packed_update_raw);

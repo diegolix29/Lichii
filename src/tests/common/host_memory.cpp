@@ -306,4 +306,44 @@ TEST_CASE("HostMemory: Trim zero pages keeps contents", "[common]") {
     REQUIRE(all(view + 3 * Page, 0));
     REQUIRE(all(backing + 0x400000, 0));
 }
+
+TEST_CASE("HostMemory: Protect within a view, across views and over a gap", "[common]") {
+    constexpr size_t Page = 0x1000;
+    HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
+    REQUIRE(mem.BackingBasePointer() != nullptr);
+    // Two views next to each other, then a gap, then a third view.
+    mem.Map(0x20000, 0x100000, 2 * Page, PERMS, HEAP);
+    mem.Map(0x22000, 0x200000, 2 * Page, PERMS, HEAP);
+    mem.Map(0x26000, 0x300000, Page, PERMS, HEAP);
+    u8* const base = mem.VirtualBasePointer();
+    const auto protection = [base](size_t offset) {
+        MEMORY_BASIC_INFORMATION info{};
+        REQUIRE(VirtualQuery(base + offset, &info, sizeof(info)) == sizeof(info));
+        return info.Protect;
+    };
+
+    // Inside one view.
+    mem.Protect(0x20000, Page, Common::MemoryPermission::Read);
+    REQUIRE(protection(0x20000) == PAGE_READONLY);
+    REQUIRE(protection(0x21000) == PAGE_READWRITE);
+
+    // Across two views: VirtualProtect refuses the range whole, each view is protected.
+    mem.Protect(0x21000, 2 * Page, Common::MemoryPermission{});
+    REQUIRE(protection(0x21000) == PAGE_NOACCESS);
+    REQUIRE(protection(0x22000) == PAGE_NOACCESS);
+    REQUIRE(protection(0x23000) == PAGE_READWRITE);
+
+    // Over the unmapped gap: the mapped pages around it are protected.
+    mem.Protect(0x23000, 4 * Page, Common::MemoryPermission::Read);
+    REQUIRE(protection(0x23000) == PAGE_READONLY);
+    REQUIRE(protection(0x26000) == PAGE_READONLY);
+
+    // Back to read-write across all of it.
+    mem.Protect(0x20000, 7 * Page, PERMS);
+    for (size_t offset : {0x20000, 0x21000, 0x22000, 0x23000, 0x26000}) {
+        REQUIRE(protection(offset) == PAGE_READWRITE);
+    }
+    base[0x22000] = 7;
+    REQUIRE(mem.BackingBasePointer()[0x200000] == 7);
+}
 #endif
