@@ -447,9 +447,10 @@ void CountPrecompiledReason(const char* reason) {
     ++precompiled_reasons[reason];
 }
 
-// NX2INFO3: storage buffer descriptors keep their write extent. A file of another version is
+// NX2INFO4: texture descriptors keep is_descriptor_array and handle_is_pointer_word, and the
+// infos the conditional barrier and unmapped pointer word flags. A file of another version is
 // prepared again.
-constexpr std::string_view PrecompiledInfosMagic{"NX2INFO3"};
+constexpr std::string_view PrecompiledInfosMagic{"NX2INFO4"};
 
 /// EDEN_NX2_PRECOMPILED_FAST=0: precompiled pipelines are translated on the GPU thread like the
 /// others (their kept infos and SPIR-V unused), to compare.

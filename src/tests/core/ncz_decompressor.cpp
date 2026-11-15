@@ -115,7 +115,7 @@ Fixture MakeSolid(std::size_t size, u64 crypto) {
         plain[i] = Pattern(i);
     }
     std::vector<u8> bytes(Payload, 0);
-    std::fill_n(bytes.begin(), Header, 0xa5);
+    std::fill_n(bytes.begin(), Header, u8{0xa5});
     const std::array<u8, 8> magic{'N', 'C', 'Z', 'S', 'E', 'C', 'T', 'N'};
     std::copy(magic.begin(), magic.end(), bytes.begin() + Header);
     Put(bytes, Header + 8, 1);

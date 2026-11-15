@@ -1272,11 +1272,11 @@ void FileEnvironment::Deserialize(std::istream& file, std::streampos end) {
         // An older build read every empty descriptor as 1D (issue #846), whatever its index, or
         // the game binds a real 1D texture there: the record can't tell. Drop every 1D type, so
         // that the pipeline is built again from the game (LacksRecordedValue).
-        for (auto it{texture_types.begin()}; it != texture_types.end();) {
-            if (it->second == Shader::TextureType::Color1D) {
-                it = texture_types.erase(it);
+        for (auto type{texture_types.begin()}; type != texture_types.end();) {
+            if (type->second == Shader::TextureType::Color1D) {
+                type = texture_types.erase(type);
             } else {
-                ++it;
+                ++type;
             }
         }
     }

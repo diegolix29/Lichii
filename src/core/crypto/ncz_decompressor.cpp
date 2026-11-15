@@ -574,7 +574,7 @@ private:
                 Key128 iv{};
                 SetIv(iv, section.counter, frontier);
                 cipher.SetIV(iv);
-                std::fill_n(output.get(), prefix, 0);
+                std::fill_n(output.get(), prefix, u8{0});
                 cipher.Transcode(output.get(), prefix + produced, output.get(), Op::Encrypt);
             }
             if (!cache->Write(std::span{output.get() + prefix, produced}, frontier)) {
