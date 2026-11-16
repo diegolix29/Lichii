@@ -4318,7 +4318,7 @@ bool PipelineCache::TranslateGraphicsStages(
         if (primitive_reason) {
             LOG_WARNING(Render_Vulkan, "Mesh emulation skipped for pipeline {:016x}: {}", hash,
                         primitive_reason);
-            return nullptr;
+            return false;
         }
         // Task and mesh share the compute stage, including the fallback's storage buffers.
         // Shrink their arrays before counting resources and assigning auxiliary bindings.
