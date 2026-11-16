@@ -23,6 +23,7 @@
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/nso.h"
+#include "core/memory/cheat_engine.h"
 
 namespace {
 
@@ -77,15 +78,15 @@ constexpr u32 DynamicCallInstruction = 0x94D57D4F;
 constexpr u32 DynamicOriginalInstruction = 0x1E201828;
 constexpr size_t TurnSpeedHookOffset = sizeof(Loader::NSOHeader) + 0x261EB18;
 constexpr u32 TurnSpeedOriginalInstruction = 0x1E210801;
-constexpr u32 TurnSpeedHookInstruction = 0x14589FCA;
+constexpr u32 TurnSpeedHookInstruction = 0x1458A021;
 // The second instruction the routine replaces; the hook guards it and leaves it in place.
 constexpr u32 TurnSpeedSecondInstruction = 0x1E280800;
-constexpr size_t TurnSpeedRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46A40;
+constexpr size_t TurnSpeedRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46B9C;
 constexpr size_t TurnSpeedRoutineSize = 40;
 constexpr size_t MovieFramesHookOffset = sizeof(Loader::NSOHeader) + 0x3B5C7C8;
 constexpr u32 MovieFramesOriginalInstruction = 0x11000508; // add w8, w8, #1
-constexpr u32 MovieFramesHookInstruction = 0x1403A8AA;     // b main+0x3C46A70
-constexpr size_t MovieFramesRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46A70;
+constexpr u32 MovieFramesHookInstruction = 0x1403A8FF;     // b main+0x3C46BC4
+constexpr size_t MovieFramesRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46BC4;
 constexpr size_t MovieFramesRoutineSize = 56;
 constexpr u32 ScarecrowCutOriginalInstruction = 0x1E390008; // fcvtzu w8, s0
 constexpr size_t ScarecrowRecordHookOffset = sizeof(Loader::NSOHeader) + 0x3296B08;
@@ -114,7 +115,11 @@ constexpr std::string_view ClothDtRoutineHead =
     "D0810090104A44F9100240F9111A40B9101191521091A772310600513F02106B3132901A31060011";
 
 constexpr size_t StepRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46900;
-constexpr size_t StepStateSize = 0x1C0;
+constexpr size_t AmbientRoutineOffset = sizeof(Loader::NSOHeader) + 0x3C46B60;
+constexpr size_t AmbientRoutineSize = 60;
+constexpr size_t UnlockStateSize = 0xA8;
+constexpr size_t StepStateOffset = sizeof(Loader::NSOHeader) + 0x4E9EE00;
+constexpr size_t StepStateSize = 0x110;
 constexpr size_t HudHookOffset = sizeof(Loader::NSOHeader) + 0xA68300;
 constexpr u32 HudOriginalInstruction = 0x1E38000C;
 constexpr u32 HudHookInstruction = 0x14C77980;
@@ -126,7 +131,7 @@ constexpr u32 HitstopOriginalInstruction = 0x5EA1B900;
 constexpr u32 HitstopHookInstruction = 0x1433CDBA;
 constexpr size_t AmbientHookOffset = sizeof(Loader::NSOHeader) + 0x53F914;
 constexpr u32 AmbientOriginalInstruction = 0x1100077A;
-constexpr u32 AmbientHookInstruction = 0x14DC1C3B;
+constexpr u32 AmbientHookInstruction = 0x14DC1C93;
 
 constexpr std::array<std::pair<Common::FS::EdenPath, const char*>, 4> TestDirectories{{
     {Common::FS::EdenPath::NANDDir, "nand"},
@@ -316,7 +321,7 @@ constexpr std::array<std::pair<size_t, u32>, 3> GroundVelocityBranches{{
 
 std::vector<u8> MakeDynamicMain() {
     auto nso = MakeMain(OcarinaBuildId, TbzInstruction);
-    nso.resize(DynamicStateOffset + StepStateSize);
+    nso.resize(DynamicStateOffset + UnlockStateSize);
     Loader::NSOHeader header;
     std::memcpy(&header, nso.data(), sizeof(header));
     header.segments[0].size = 63201744;
@@ -422,13 +427,13 @@ TEST_CASE("Built-in FPS Unlock defaults on and replaces Dynamic FPS", "[patch_ma
     REQUIRE(WordAt(patched, TurnSpeedHookOffset + 4) == TurnSpeedSecondInstruction);
     REQUIRE(Common::HexToString(
                 std::span{patched}.subspan(TurnSpeedRoutineOffset, TurnSpeedRoutineSize)) ==
-            "01102E1E0021211E8A0000540018281E0140211E3360A717E10F40BD0108211E0008281E"
-            "2F60A717");
+            "01102E1E0021211E8A0000540018281E0140211EDC5FA717E10F40BD0108211E0008281E"
+            "D85FA717");
     REQUIRE(WordAt(patched, MovieFramesHookOffset) == MovieFramesHookInstruction);
     REQUIRE(Common::HexToString(
                 std::span{patched}.subspan(MovieFramesRoutineOffset, MovieFramesRoutineSize)) ==
-            "ED3BBDA9EF4301A9FE1300F98DE20B91CE810090CE4944F9CE0140F9C01140BDBCFFFF97"
-            "08010D0BFE1340F9EF4341A9ED3BC3A84A57FC17");
+            "ED3BBDA9EF4301A9FE1300F98DE20B91CE810090CE4944F9CE0140F9C01140BD67FFFF97"
+            "08010D0BFE1340F9EF4341A9ED3BC3A8F556FC17");
     REQUIRE(WordAt(patched, ScarecrowRecordHookOffset) == ScarecrowRecordHookInstruction);
     REQUIRE(Common::HexToString(std::span{patched}.subspan(ScarecrowRecordRoutineOffset,
                                                            ScarecrowRoutineSize)) ==
@@ -551,13 +556,14 @@ TEST_CASE("Built-in FPS Unlock applies all step counters", "[patch_manager]") {
             "ED3BBDA9EF4301A9FE1300F90D6302910041201E07000094E9030D2AFE1340F9EF4341A9"
             "ED3BC3A80A9B40B94632CC17");
     REQUIRE(Common::HexToString(std::span{patched}.subspan(StepRoutineOffset + 128, 128)) ==
-            "E007BFADCE9200B0CE013B910F028052D00140F91F020DEB40020054700100B4CE410091"
+            "E007BFADCE920090CE4138910F028052D00140F91F020DEB40020054700100B4CE410091"
             "EF05007141FFFF54CE4104D1D00140B90F060011EF0D0012CF0100B9CE410091CE11108B"
             "CD0100F9DF0900B90D00381EBF050071ADA59F1A07000014C10940BD0028211E01C0251E"
             "0038211EC00900BD2D00381EE007C1ACC0035FD6");
-    REQUIRE(Common::HexToString(std::span{patched}.subspan(StepRoutineOffset + 256, 60)) ==
-            "ED3BBDA9EF4301A9FE1300F98D0B018BCE810090CE4944F9CE0140F9C01140BDD8FFFF97"
-            "7A030D0B001840BDFE1340F9EF4341A9ED3BC3A8B8E32317");
+    REQUIRE(Common::HexToString(std::span{patched}.subspan(AmbientRoutineOffset,
+                                                           AmbientRoutineSize)) ==
+            "ED3BBDA9EF4301A9FE1300F98D0B018BCE810090CE4944F9CE0140F9C01140BD80FFFF97"
+            "7A030D0B001840BDFE1340F9EF4341A9ED3BC3A860E32317");
     // The remaining instructions in the 44-byte hitstop record are guarded but unchanged.
     REQUIRE(std::equal(nso.begin() + HitstopHookOffset + sizeof(u32),
                        nso.begin() + HitstopHookOffset + 44,
@@ -577,7 +583,10 @@ TEST_CASE("Built-in Dynamic FPS leaves all step counters untouched", "[patch_man
     REQUIRE(std::equal(nso.begin() + HitstopHookOffset, nso.begin() + HitstopHookOffset + 44,
                        patched.begin() + HitstopHookOffset));
     REQUIRE(std::all_of(patched.begin() + StepRoutineOffset,
-                        patched.begin() + StepRoutineOffset + 0x13C,
+                        patched.begin() + StepRoutineOffset + 0x100,
+                        [](u8 byte) { return byte == 0; }));
+    REQUIRE(std::all_of(patched.begin() + AmbientRoutineOffset,
+                        patched.begin() + AmbientRoutineOffset + AmbientRoutineSize,
                         [](u8 byte) { return byte == 0; }));
 }
 
@@ -605,22 +614,24 @@ TEST_CASE("Built-in FPS Unlock validates all step records before writing", "[pat
         nso[StepRoutineOffset + 79] = 1;
     }
     SECTION("Nonzero ambient cave") {
-        nso[StepRoutineOffset + 0x13B] = 1;
+        nso[AmbientRoutineOffset + AmbientRoutineSize - 1] = 1;
     }
     SECTION("Nonzero helper cave") {
         nso[StepRoutineOffset + 239] = 1;
     }
     SECTION("Nonzero step state") {
-        nso[DynamicStateOffset + StepStateSize - 1] = 1;
+        nso[StepStateOffset + StepStateSize - 1] = 1;
     }
-    SECTION("Truncated step state") {
-        nso.resize(DynamicStateOffset + StepStateSize - 1);
+    SECTION("Truncated sound state") {
+        nso.resize(DynamicStateOffset + UnlockStateSize - 1);
     }
     SECTION("Step state outside BSS") {
         Loader::NSOHeader header;
         std::memcpy(&header, nso.data(), sizeof(header));
-        header.segments[2].bss_size =
-            0x4E9FE00 + StepStateSize - 1 - header.segments[2].location - header.segments[2].size;
+        const u32 bss_end = header.segments[2].location + header.segments[2].size +
+                            header.segments[2].bss_size;
+        header.segments[2].size = 0x4E9EE01 - header.segments[2].location;
+        header.segments[2].bss_size = bss_end - 0x4E9EE01;
         std::memcpy(nso.data(), &header, sizeof(header));
     }
     REQUIRE(context.Manager().PatchNSO(nso, "main") == nso);
@@ -648,7 +659,7 @@ TEST_CASE("Built-in FPS Unlock defers transactionally to mods in step records", 
         offset = StepRoutineOffset + 80;
     }
     SECTION("Ambient stub") {
-        offset = StepRoutineOffset + 256;
+        offset = AmbientRoutineOffset;
     }
     SECTION("Skipped hitstop instruction") {
         offset = HitstopHookOffset + 40;
@@ -657,7 +668,7 @@ TEST_CASE("Built-in FPS Unlock defers transactionally to mods in step records", 
         offset = StepRoutineOffset + 128;
     }
     SECTION("Step state") {
-        offset = DynamicStateOffset + StepStateSize - sizeof(u32);
+        offset = StepStateOffset + StepStateSize - sizeof(u32);
     }
     constexpr u32 mod_word = 0x11223344;
     PatchManagerTestContext context{mod_word, offset};
@@ -1012,4 +1023,148 @@ TEST_CASE("Built-in DLSS render scale follows the NVIDIA DLSS quality", "[patch_
     for (const auto& patch : context.Manager().GetPatches()) {
         CHECK(patch.name.find("render scale") == std::string::npos);
     }
+}
+
+namespace {
+
+std::vector<FileSys::BuiltinCheatOverlap> CheatOverlaps(
+    std::string_view cheats, std::initializer_list<std::string_view> applied) {
+    const std::vector<std::string_view> names{applied};
+    return FileSys::FindBuiltinCheatOverlaps(OcarinaTitleId, names,
+                                             Core::Memory::TextCheatParser{}.Parse(cheats));
+}
+
+// A cheat that stores a word at every 4 bytes of [begin, end) of main.
+std::string StoresCheat(std::string_view name, u64 begin, u64 end) {
+    std::string cheat = fmt::format("[{}]\n", name);
+    for (u64 offset = begin; offset < end; offset += sizeof(u32)) {
+        cheat += fmt::format("04000000 {:08X} D503201F\n", offset);
+    }
+    return cheat;
+}
+
+} // Anonymous namespace
+
+TEST_CASE("Built-in patch overlap check names the cheat, the patch and both ranges",
+          "[patch_manager]") {
+    constexpr std::string_view Cheats = "[HUD stub]\n"
+                                        "04000000 03C46900 D503201F\n"
+                                        "04000000 03C46904 D503201F\n"
+                                        "[Step slot]\n"
+                                        "04000000 04E9EE08 00000001\n"
+                                        "[Heap at the same offset]\n"
+                                        "04100000 03C46900 00000000\n"
+                                        "[Elsewhere in main]\n"
+                                        "04000000 00100000 00000000\n"
+                                        "[On ZL]\n"
+                                        "80000100\n"
+                                        "04000000 03C46B60 D503201F\n"
+                                        "20000000\n"
+                                        "[Offset from a loaded register]\n"
+                                        "40000000 00000000 00000010\n"
+                                        "04000000 03C46900 00000000\n";
+
+    const auto overlaps = CheatOverlaps(Cheats, {FpsUnlock});
+    REQUIRE(overlaps.size() == 4);
+    CHECK(overlaps[0].cheat == "HUD stub");
+    CHECK(overlaps[0].patch == FpsUnlock);
+    CHECK_FALSE(overlaps[0].state);
+    CHECK(overlaps[0].cheat_begin == 0x3C46900);
+    CHECK(overlaps[0].cheat_end == 0x3C46908);
+    CHECK(overlaps[0].patch_begin == 0x3C46900);
+    CHECK(overlaps[0].patch_end == 0x3C46928);
+    CHECK(overlaps[1].cheat == "Step slot");
+    CHECK(overlaps[1].state);
+    CHECK(overlaps[1].cheat_begin == 0x4E9EE08);
+    CHECK(overlaps[1].cheat_end == 0x4E9EE0C);
+    CHECK(overlaps[1].patch_begin == 0x4E9EE00);
+    CHECK(overlaps[1].patch_end == 0x4E9EF10);
+    CHECK(overlaps[2].cheat == "On ZL");
+    CHECK_FALSE(overlaps[2].state);
+    CHECK(overlaps[2].cheat_begin == 0x3C46B60);
+    CHECK(overlaps[2].patch_begin == 0x3C46B60);
+    CHECK(overlaps[2].patch_end == 0x3C46B9C);
+    CHECK(overlaps[3].cheat == "Offset from a loaded register");
+    CHECK(overlaps[3].cheat_begin == 0x3C46910);
+    CHECK(overlaps[3].cheat_end == 0x3C46914);
+    CHECK(overlaps[3].patch_begin == 0x3C46900);
+
+    // Only applied built-ins count: Dynamic FPS has neither range, and nothing applied has none.
+    CHECK(CheatOverlaps(Cheats, {DynamicFps}).empty());
+    CHECK(CheatOverlaps(Cheats, {}).empty());
+}
+
+TEST_CASE("Built-in patch overlap check follows registers from earlier cheats",
+          "[patch_manager]") {
+    // The enabled cheats run as one program, so the register the first loads offsets the
+    // second's store to main+0x3C46B60.
+    constexpr std::string_view Cheats = "[Load offset]\n"
+                                        "40000000 00000000 00000160\n"
+                                        "[Store]\n"
+                                        "04000000 03C46A00 D503201F\n";
+    const auto overlaps = CheatOverlaps(Cheats, {FpsUnlock});
+    REQUIRE(overlaps.size() == 1);
+    CHECK(overlaps[0].cheat == "Store");
+    CHECK(overlaps[0].cheat_begin == 0x3C46B60);
+    CHECK(overlaps[0].cheat_end == 0x3C46B64);
+    CHECK(overlaps[0].patch_begin == 0x3C46B60);
+
+    // Without the load the store stays at 0x3C46A00, which nothing built-in uses now. A load on
+    // a key press may or may not run, so the store's address is unknown and it is left out.
+    CHECK(CheatOverlaps("[Store]\n04000000 03C46A00 D503201F\n", {FpsUnlock}).empty());
+    CHECK(CheatOverlaps("[Load on ZL]\n"
+                        "80000100\n"
+                        "40000000 00000000 00000160\n"
+                        "20000000\n"
+                        "[Store]\n"
+                        "04000000 03C46A00 D503201F\n",
+                        {FpsUnlock})
+              .empty());
+}
+
+TEST_CASE("Built-in patches stay clear of the known code-patching cheats (#1873)",
+          "[patch_manager]") {
+    // tomvita's MyNXCheats for this build: "No damage" as players use it, and the main ranges
+    // its other cheats write (code caves, their hooks and their flags in BSS).
+    std::string cheats = "[No damage]\n"
+                         "04000000 04E9FF88 00000000\n"
+                         "04000000 04E9FF88 00000001\n"
+                         "04000000 03C46A00 1A8B13EC\n"
+                         "04000000 03C46A04 A9BF3FEE\n"
+                         "04000000 03C46A08 B00092CE\n"
+                         "04000000 03C46A0C B94F89CE\n"
+                         "04000000 03C46A10 340000EE\n"
+                         "04000000 03C46A14 B9400D0E\n"
+                         "04000000 03C46A18 528AB00F\n"
+                         "04000000 03C46A1C 72A6356F\n"
+                         "04000000 03C46A20 6B0F01DF\n"
+                         "04000000 03C46A24 54000041\n"
+                         "04000000 03C46A28 2A0A03EC\n"
+                         "04000000 03C46A2C A8C13FEE\n"
+                         "04000000 03C46A30 17215CB1\n"
+                         "04000000 0049DCF0 14DEA344\n";
+    cheats += StoresCheat("Refill hearts, Max hearts 20", 0x3C46A40, 0x3C46AAC);
+    cheats += StoresCheat("Moon jump", 0x3C46CC0, 0x3C46DB0);
+    cheats += StoresCheat("Hook A", 0x163B20, 0x163B24) + StoresCheat("Hook B", 0x4D6EE4, 0x4D6EE8);
+    cheats += StoresCheat("Flags A", 0x4E9FF80, 0x4E9FF94);
+    cheats += StoresCheat("Flags B", 0x4E9FFA0, 0x4E9FFB0);
+    REQUIRE(Core::Memory::TextCheatParser{}.Parse(cheats).size() == 8);
+
+    const auto all = {MaxResolution, std::string_view{"Texture Pool x2 (built-in)"}, FpsUnlock,
+                      std::string_view{"DLSS Balanced render scale (built-in)"}};
+    CHECK(CheatOverlaps(cheats, all).empty());
+    CHECK(CheatOverlaps(cheats, {DynamicFps}).empty());
+}
+
+TEST_CASE("Built-in FPS Unlock still applies beside a cheat that writes its cave",
+          "[patch_manager]") {
+    PatchManagerTestContext context;
+    const auto cheats_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::LoadDir) /
+                            fmt::format("{:016X}", OcarinaTitleId) / "Cheats" / "cheats";
+    std::filesystem::create_directories(cheats_dir);
+    std::ofstream{cheats_dir / "E0F3CCFAF50065AE.txt"} << StoresCheat("HUD stub", 0x3C46900,
+                                                                      0x3C46904);
+    const auto patched = context.Manager().PatchNSO(MakeDynamicMain(), "main");
+    REQUIRE(WordAt(patched, HudHookOffset) == HudHookInstruction);
+    REQUIRE(WordAt(patched, AmbientHookOffset) == AmbientHookInstruction);
 }

@@ -1275,10 +1275,11 @@ private:
         u32 copy_begin{};  ///< Bytes of the page the copy holds (a buffer can end inside it)
         u32 copy_end{};
         /// Written outside a compute dispatch or a DMA copy (a draw's storage writes) at least
-        /// once: the front can't tell from what it sent which draws write the page, so it reads
-        /// no copy. A draw's writes reach a pushbuffer fetch only after a host-level wait, so
-        /// the page's lists read guest memory once the back ran the work before the last such
-        /// wait and no write came since the front flushed the page (Nx2ReadListCopy).
+        /// once: the front can't tell from what it sent which draws write the page. A draw's
+        /// writes reach a pushbuffer fetch only after a host-level wait, so the page's lists are
+        /// read once the back ran the work before the last such wait: from guest memory if no
+        /// write came since the front flushed the page, else from a copy made after the last
+        /// write (Nx2ReadListCopy).
         bool draw_written{};
         std::optional<Nx2Staging> copy;
     };

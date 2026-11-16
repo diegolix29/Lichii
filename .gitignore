@@ -67,4 +67,7 @@ vulkansdk*.exe
 
 # Build-time generated external sources
 externals/generated
+
+# Python bytecode
+__pycache__/
 /docs/nx2/precompile-port.md

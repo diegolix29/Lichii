@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <filesystem>
@@ -17,6 +18,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/internal_network/local_redirect.h"
+#include "core/internal_network/network.h"
 
 namespace Network::LocalRedirect {
 namespace {
@@ -107,12 +109,14 @@ std::shared_ptr<const Config> Get() {
 }
 
 bool IsLoopback(const SockAddrIn& address) {
+    if (address.family == Domain::INET6) {
+        static constexpr IPv6Address loopback{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+        static constexpr std::array<u8, 12> v4_mapped{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+        return address.ip6 == loopback ||
+               (std::equal(v4_mapped.begin(), v4_mapped.end(), address.ip6.begin()) &&
+                address.ip6[12] == 127);
+    }
     return address.ip[0] == 127;
-}
-
-std::string AddressToString(const SockAddrIn& address) {
-    return fmt::format("{}.{}.{}.{}:{}", address.ip[0], address.ip[1], address.ip[2],
-                       address.ip[3], address.portno);
 }
 
 } // Anonymous namespace
@@ -144,7 +148,7 @@ void Configure() {
                  "Host redirect on: {} (and subdomains) -> 127.0.0.1; TCP 127.0.0.1:443 -> {}; "
                  "loopback only {}; extra CA certificate {} bytes",
                  config->hosts.empty() ? "no host names" : fmt::format("{}", fmt::join(config->hosts, ", ")),
-                 config->server ? AddressToString(*config->server) : "unchanged",
+                 config->server ? SockAddrToString(*config->server) : "unchanged",
                  config->loopback_only, config->test_ca.size());
     }
     std::scoped_lock lock{config_mutex};
@@ -193,7 +197,7 @@ SockAddrIn ConnectTarget(const SockAddrIn& address) {
     if (!config->server || address.ip != IPv4Address{127, 0, 0, 1} || address.portno != 443) {
         return address;
     }
-    LOG_DEBUG(Network, "Host redirect: 127.0.0.1:443 -> {}", AddressToString(*config->server));
+    LOG_DEBUG(Network, "Host redirect: 127.0.0.1:443 -> {}", SockAddrToString(*config->server));
     return *config->server;
 }
 

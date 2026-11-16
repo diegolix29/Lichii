@@ -16,11 +16,13 @@
 
 #include "common/hex_util.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "common/uuid.h"
 #include "core/core.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/hle/service/acc/nextendo_id_token.h"
+#include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/hle_ipc.h"
 
 namespace Service::Account::Nextendo {
@@ -97,11 +99,17 @@ bool NeedsAppId(u64 program_id) {
 
 } // namespace
 
-std::optional<Common::Nextendo::Account> LinkedAccount() {
+Common::UUID CurrentProfile(const Core::System& system) {
+    return system.GetProfileManager()
+        .GetUser(static_cast<std::size_t>(Settings::values.current_user.GetValue()))
+        .value_or(Common::InvalidUUID);
+}
+
+std::optional<Common::Nextendo::Account> LinkedAccount(const Common::UUID& profile) {
     if (!Common::Nextendo::OnlinePlayActive()) {
         return std::nullopt;
     }
-    return Common::Nextendo::LoadAccount();
+    return Common::Nextendo::LoadAccount(profile);
 }
 
 std::string BuildIdToken(Core::System& system, const Common::Nextendo::Account& account) {

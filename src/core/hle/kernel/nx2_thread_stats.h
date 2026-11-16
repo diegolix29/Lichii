@@ -19,7 +19,13 @@ class KThread;
 // (CoreTiming::GetClockTicks) until the report converts them.
 namespace Kernel::Nx2ThreadStats {
 
-inline const bool g_enabled = std::getenv("EDEN_NX2_GUEST_THREAD_STATS") != nullptr;
+inline bool g_enabled = std::getenv("EDEN_NX2_GUEST_THREAD_STATS") != nullptr;
+
+/// Called before the kernel starts: static initialization runs before the frontend loads
+/// nx2_switches.txt, so a switch set only there takes effect from that point on.
+inline void ReadSwitch() {
+    g_enabled = std::getenv("EDEN_NX2_GUEST_THREAD_STATS") != nullptr;
+}
 
 enum class Wait : u8 { Ipc, SyncObjects, Arbiter, CondVar, Lock, Sleep, Other, Count };
 inline constexpr size_t Waits = static_cast<size_t>(Wait::Count);

@@ -146,9 +146,17 @@ class DescriptorLayoutBuilder {
 public:
     DescriptorLayoutBuilder(const Device& device_) : device{&device_} {}
 
+    /// Whether the layout exceeds the core descriptor limits, which only sets from an
+    /// update-after-bind pool may do: they count against the larger limits of such pools.
+    bool UsesUpdateAfterBindPool() const {
+        return device->UpdateAfterBindSampledLimits() &&
+               ExceedsSampledDescriptorLimits(std::span(bindings.data(), bindings.size()),
+                                              device->CoreSampledLimits());
+    }
+
     bool CanUsePushDescriptor() const noexcept {
         if (!device->IsKhrPushDescriptorSupported() ||
-            num_descriptors > device->MaxPushDescriptors()) {
+            num_descriptors > device->MaxPushDescriptors() || UsesUpdateAfterBindPool()) {
             return false;
         }
         return !device->IsExtDescriptorBufferSupported() ||
@@ -158,7 +166,7 @@ public:
     bool CanUseDescriptorBuffer() const noexcept {
         const auto& props = device->DescriptorBufferProperties();
         if (!device->IsExtDescriptorBufferSupported() || bindings.empty() ||
-            !props.combinedImageSamplerDescriptorSingleArray) {
+            !props.combinedImageSamplerDescriptorSingleArray || UsesUpdateAfterBindPool()) {
             return false;
         }
         return !props.bufferlessPushDescriptors || !CanUsePushDescriptor();
@@ -194,6 +202,9 @@ public:
         }
         if (use_descriptor_buffer) {
             flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+        }
+        if (!use_push_descriptor && !use_descriptor_buffer && UsesUpdateAfterBindPool()) {
+            flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
         }
         boost::container::small_vector<VkDescriptorBindingFlags, 32> binding_flags;
         VkDescriptorSetLayoutBindingFlagsCreateInfo binding_flags_ci{};

@@ -284,6 +284,51 @@ bool IsPrimitiveRestartSupported(const Device& device, VkPrimitiveTopology topol
              device.IsPatchListPrimitiveRestartSupported()));
 }
 
+/// Polygon offset the game enabled for the primitive type of the draw
+bool PolygonOffsetEnabled(const Maxwell& regs, Maxwell::PrimitiveTopology topology) {
+    constexpr size_t POINT = 0;
+    constexpr size_t LINE = 1;
+    constexpr size_t POLYGON = 2;
+    static constexpr std::array POLYGON_OFFSET_ENABLE_LUT = {
+        POINT,   // Points
+        LINE,    // Lines
+        LINE,    // LineLoop
+        LINE,    // LineStrip
+        POLYGON, // Triangles
+        POLYGON, // TriangleStrip
+        POLYGON, // TriangleFan
+        POLYGON, // Quads
+        POLYGON, // QuadStrip
+        POLYGON, // Polygon
+        LINE,    // LinesAdjacency
+        LINE,    // LineStripAdjacency
+        POLYGON, // TrianglesAdjacency
+        POLYGON, // TriangleStripAdjacency
+        POLYGON, // Patches
+    };
+    const std::array enabled_lut{
+        regs.polygon_offset_point_enable,
+        regs.polygon_offset_line_enable,
+        regs.polygon_offset_fill_enable,
+    };
+    return enabled_lut[POLYGON_OFFSET_ENABLE_LUT[static_cast<u32>(topology)]] != 0;
+}
+
+/// Viewport 0 passes position z and w through unswizzled
+bool ViewportKeepsDepth(const Maxwell& regs) {
+    const auto& swizzle = regs.viewport_transform[0].swizzle;
+    return swizzle.z == Maxwell::ViewportSwizzle::PositiveZ &&
+           swizzle.w == Maxwell::ViewportSwizzle::PositiveW;
+}
+
+/// Depth bias, in units of the depth format, that pushes far plane draws past the far value so
+/// that depth clamping puts them exactly on it. A vertex shader that stores one value to position
+/// z and w puts every vertex on the far plane, the usual way to draw a sky. NVIDIA fills such a
+/// triangle with exactly the far value; AMD's rasterizer lands some pixels a step short, so two
+/// sky meshes fight and a dome tested EQUAL or LEQUAL against an earlier one loses in blocks
+/// (Mario Kart 8 Deluxe's Sky-High Sundae, #1905).
+constexpr float FAR_PLANE_DEPTH_BIAS = 16.0f;
+
 /// Earlier writes must be visible to a dispatch, including its indirect arguments.
 void RecordDispatchBarrier(vk::CommandBuffer cmdbuf) {
     static constexpr VkMemoryBarrier READ_BARRIER{
@@ -1039,7 +1084,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         return;
     }
     if (VideoCommon::OotNetwork::BypassEnabled(Settings::GetCurrentProgramID())) {
-        TrackOotTonemappedImage(*pipeline);
+        TrackOotTonemappedImage();
     }
     // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
     mesh_draw = pipeline->IsMeshPipeline();
@@ -1838,21 +1883,21 @@ VideoCommon::OotNetwork::BypassState* RasterizerVulkan::OotNetworkBypass() {
     return &oot_network_bypass;
 }
 
-void RasterizerVulkan::TrackOotTonemappedImage(const GraphicsPipeline& pipeline) {
-    const auto& hashes = pipeline.ShaderHashes();
-    if (std::none_of(hashes.begin(), hashes.end(), VideoCommon::OotNetwork::IsTonemapShader)) {
-        return;
-    }
+void RasterizerVulkan::TrackOotTonemappedImage() {
     const auto& target = maxwell3d->regs.rt[0];
-    if (target.Address() == 0) {
+    auto& bypass = oot_network_bypass;
+    constexpr auto relaxed = std::memory_order_relaxed;
+    // The scene draws repeat one target; only a change of target takes the lock.
+    if (target.format != Tegra::RenderTargetFormat::B10G11R11_FLOAT ||
+        target.tile_mode.is_pitch_linear || bypass.latest_address.load(relaxed) == target.Address() ||
+        !VideoCommon::OotNetwork::IsTonemapCandidate(
+            target.Address(), target.width, target.height, bypass.input_width.load(relaxed),
+            bypass.input_height.load(relaxed), bypass.output_address.load(relaxed))) {
         return;
     }
-    std::scoped_lock lock{oot_network_bypass.mutex};
-    if (oot_network_bypass.tonemapped.Address() != target.Address()) {
-        LOG_INFO(Render_Vulkan, "Ocarina of Time: tonemapped image at {:#x} {}x{}", target.Address(),
-                 target.width, target.height);
-    }
-    oot_network_bypass.tonemapped = target;
+    std::scoped_lock lock{bypass.mutex};
+    bypass.latest_draw = target;
+    bypass.latest_address.store(target.Address(), relaxed);
 }
 
 void RasterizerVulkan::TraceDrawFailure(std::string_view reason) {
@@ -2373,7 +2418,10 @@ void RasterizerVulkan::DispatchCompute() {
     }
 
     u64 native_key{};
-    ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline(native_key)};
+    ComputePipeline* const pipeline{[&] {
+        VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PipelineLookup};
+        return pipeline_cache.CurrentComputePipeline(native_key);
+    }()};
     if (!pipeline) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
         return;
@@ -2390,8 +2438,11 @@ void RasterizerVulkan::DispatchCompute() {
     const auto indirect_address = kepler_compute->GetIndirectComputeAddress();
     const auto list_slot = kepler_compute->GetIndirectListSlot();
     // The full-size 1080p pass is replaced only by FSR (native AA); DLAA through it is untested.
-    const bool can_replace = OcarinaTemporalEnabled() && pipeline->CanReplaceOcarinaUpscale() &&
-                             (pipeline->ShaderHash() != ComputePipeline::OcarinaFullSizeShader ||
+    const auto oot_pass = VideoCommon::FindOcarinaUpscalePass(native_key, pipeline->ShaderHash());
+    const bool can_replace = OcarinaTemporalEnabled() &&
+                             oot_pass != VideoCommon::OcarinaUpscalePass::None &&
+                             pipeline->CanReplaceOcarinaUpscale() &&
+                             (oot_pass != VideoCommon::OcarinaUpscalePass::FullSize ||
                               oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr) &&
                              !indirect_address && !list_slot && !frame_dump.Capturing();
     // Until a dispatch overwrites the scene, each direct one binds only after the effects are
@@ -2494,10 +2545,13 @@ void RasterizerVulkan::DispatchCompute() {
         if (Tegra::Nx2ListIndirect::Stats::g_check) {
             slots.CheckDispatch(*list_slot);
         }
-        buffer_cache.NoteWorkRecorded(true);
-        SubmitNx2ListCopies();
+        {
+            VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::ComputeDownloads};
+            buffer_cache.NoteWorkRecorded(true);
+            SubmitNx2ListCopies();
+        }
         publish_collision_map();
-        TryOcarinaUpscale(*pipeline, false);
+        TryOcarinaUpscale(*pipeline, native_key, false);
         return;
     }
     if (indirect_address) {
@@ -2517,8 +2571,11 @@ void RasterizerVulkan::DispatchCompute() {
                 cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
             });
         });
-        buffer_cache.NoteWorkRecorded(true);
-        SubmitNx2ListCopies();
+        {
+            VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::ComputeDownloads};
+            buffer_cache.NoteWorkRecorded(true);
+            SubmitNx2ListCopies();
+        }
         publish_collision_map();
         return;
     }
@@ -2544,7 +2601,7 @@ void RasterizerVulkan::DispatchCompute() {
         }
     }
     const auto* const replacement =
-        can_replace && !byte_addressed_shadow && TryOcarinaUpscale(*pipeline, true)
+        can_replace && !byte_addressed_shadow && TryOcarinaUpscale(*pipeline, native_key, true)
             ? oot_live_dlss.get()
             : nullptr;
     if (!replacement) {
@@ -2580,12 +2637,15 @@ void RasterizerVulkan::DispatchCompute() {
         // The deferred native binding may follow DLSS's command buffer bindings.
         scheduler.InvalidateState();
     }
-    buffer_cache.NoteWorkRecorded(true);
-    SubmitNx2ListCopies();
+    {
+        VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::ComputeDownloads};
+        buffer_cache.NoteWorkRecorded(true);
+        SubmitNx2ListCopies();
+    }
     publish_collision_map();
 
     if (!can_replace) {
-        TryOcarinaUpscale(*pipeline, false);
+        TryOcarinaUpscale(*pipeline, native_key, false);
     }
 
     // Log compute dispatch
@@ -2631,9 +2691,10 @@ void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 in
 void RasterizerVulkan::FlushAll() {}
 
 void RasterizerVulkan::SubmitNx2ListCopies() {
-    // Submitted at once: ReadGpuWrittenCommands waits on these copies, so they can't sit out
-    // the longer DeferFlush interval (#161).
-    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
+    // Batched like fences (DeferFlush): one submission per dispatch was ~6,000 a second in Hyrule
+    // Warriors: Age of Imprisonment fights. A front that waits on a copy whose tick isn't
+    // submitted yet has the back submit it between entries (IsGpuTickDone, WaitSubmittedTick).
+    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) && !scheduler.DeferFlush()) {
         scheduler.Flush();
     }
 }
@@ -2964,7 +3025,7 @@ void RasterizerVulkan::InvalidateCachedWrites(
             texture_cache.WriteMemory(addr, size);
         }
     }
-    if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
+    if (Settings::SkipCpuInnerInvalidation()) {
         return;
     }
     // Constant buffer data only streamed uniform buffers read needs no buffer cache work: those
@@ -3550,10 +3611,10 @@ void RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
 }
 
 /// Track the scene depth on its reader dispatch, or try to replace a recognized upscale dispatch.
-bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace) {
-    constexpr u64 depth_reader = 0x1fc7a0423116281fULL;
-    const u64 upscale_hash = pipeline.ShaderHash();
-    if ((!replace && upscale_hash != depth_reader) || !OcarinaTemporalEnabled()) {
+bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, u64 native_key,
+                                         bool replace) {
+    if ((!replace && native_key != VideoCommon::OcarinaDepthReaderKey) ||
+        !OcarinaTemporalEnabled()) {
         return false;
     }
     const bool native_resolution =
@@ -3639,17 +3700,16 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     auto& target = texture_cache.GetImageView(written[0]);
     using VideoCore::Surface::PixelFormat;
     const auto extent = oot_motion.extent;
-    const bool native_size = upscale_hash == ComputePipeline::OcarinaFullSizeShader;
+    using enum VideoCommon::OcarinaUpscalePass;
+    const auto pass = VideoCommon::FindOcarinaUpscalePass(native_key, pipeline.ShaderHash());
+    const bool native_size = pass == FullSize;
     // At the DLSS Performance render scale (1920x1080) the game upscales to 2560x1440 with its
     // 3/4 pass instead (QuincyForbes' f7d0938b5b). The scale is the one the game started with,
     // whatever quality is chosen since.
-    const bool three_quarter_1440p = upscale_hash == ComputePipeline::OcarinaThreeQuarterShader &&
+    const bool three_quarter_1440p = pass == ThreeQuarter &&
                                      oot_performance_scale && target.size.width == 2560 &&
                                      target.size.height == 1440;
-    const bool pass_1440p = upscale_hash == ComputePipeline::Ocarina1440pShader ||
-                            upscale_hash == ComputePipeline::Ocarina1440pScaledShader ||
-                            upscale_hash == ComputePipeline::Ocarina1440pScaledFieldShader ||
-                            three_quarter_1440p;
+    const bool pass_1440p = pass == Pass1440p || three_quarter_1440p;
     const bool upscale_4k = pass_1440p && !native_resolution;
     // The 1440p pass takes any 16:9 scene up to 2560x1440: the DLSS render scales shrink it.
     const bool valid_extents =
@@ -4223,6 +4283,16 @@ void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
         flags[Dirty::DepthBiasEnable] = true;
         flags[Dirty::PrimitiveRestartEnable] = true;
     }
+    const bool far_plane = pipeline != nullptr && pipeline->OnFarPlane() &&
+                           !PolygonOffsetEnabled(regs, topology) && ViewportKeepsDepth(regs);
+    if (far_plane || far_plane != far_plane_draw) {
+        flags[Dirty::DepthBias] = true;
+    }
+    if (far_plane != far_plane_draw) {
+        far_plane_draw = far_plane;
+        flags[Dirty::DepthBiasEnable] = true;
+        flags[Dirty::DepthClampEnable] = true;
+    }
 
     UpdateViewportsState(regs);
     UpdateScissorsState(regs);
@@ -4473,9 +4543,17 @@ void RasterizerVulkan::UpdateDepthBias(Tegra::Engines::Maxwell3D::Regs& regs) {
             units = static_cast<float>(static_cast<double>(units) * rescale_factor);
         }
     }
+    float clamp = regs.depth_bias_clamp;
+    float factor = regs.slope_scale_depth_bias;
+    if (far_plane_draw) {
+        const bool reversed =
+            regs.viewport_scale_offset_enabled && regs.viewport_transform[0].scale_z < 0.0f;
+        units = reversed ? -FAR_PLANE_DEPTH_BIAS : FAR_PLANE_DEPTH_BIAS;
+        clamp = 0.0f;
+        factor = 0.0f;
+    }
 
-    scheduler.Record([constant = units, clamp = regs.depth_bias_clamp,
-                      factor = regs.slope_scale_depth_bias, this](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([constant = units, clamp, factor, this](vk::CommandBuffer cmdbuf) {
         if (device.IsExtDepthBiasControlSupported()) {
             static VkDepthBiasRepresentationInfoEXT bias_info{
                 .sType = VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT,
@@ -4772,34 +4850,9 @@ void RasterizerVulkan::UpdateDepthBiasEnable(Tegra::Engines::Maxwell3D::Regs& re
     if (!state_tracker.TouchDepthBiasEnable()) {
         return;
     }
-    constexpr size_t POINT = 0;
-    constexpr size_t LINE = 1;
-    constexpr size_t POLYGON = 2;
-    static constexpr std::array POLYGON_OFFSET_ENABLE_LUT = {
-        POINT,   // Points
-        LINE,    // Lines
-        LINE,    // LineLoop
-        LINE,    // LineStrip
-        POLYGON, // Triangles
-        POLYGON, // TriangleStrip
-        POLYGON, // TriangleFan
-        POLYGON, // Quads
-        POLYGON, // QuadStrip
-        POLYGON, // Polygon
-        LINE,    // LinesAdjacency
-        LINE,    // LineStripAdjacency
-        POLYGON, // TrianglesAdjacency
-        POLYGON, // TriangleStripAdjacency
-        POLYGON, // Patches
-    };
-    const std::array enabled_lut{
-        regs.polygon_offset_point_enable,
-        regs.polygon_offset_line_enable,
-        regs.polygon_offset_fill_enable,
-    };
-    const u32 topology_index = u32(maxwell3d->draw_manager.draw_state.topology);
-    const u32 enable = enabled_lut[POLYGON_OFFSET_ENABLE_LUT[topology_index]];
-    scheduler.Record([enable](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthBiasEnableEXT(enable != 0); });
+    const bool enable =
+        far_plane_draw || PolygonOffsetEnabled(regs, maxwell3d->draw_manager.draw_state.topology);
+    scheduler.Record([enable](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthBiasEnableEXT(enable); });
 }
 
 void RasterizerVulkan::UpdateLogicOpEnable(Tegra::Engines::Maxwell3D::Regs& regs) {
@@ -4821,7 +4874,8 @@ void RasterizerVulkan::UpdateDepthClampEnable(Tegra::Engines::Maxwell3D::Regs& r
     if (!device.SupportsDynamicState3DepthClampEnable()) {
         return;
     }
-    bool is_enabled = !(regs.viewport_clip_control.geometry_clip ==
+    bool is_enabled = far_plane_draw ||
+                      !(regs.viewport_clip_control.geometry_clip ==
                             Maxwell::ViewportClipControl::GeometryClip::Passthrough ||
                         regs.viewport_clip_control.geometry_clip ==
                             Maxwell::ViewportClipControl::GeometryClip::FrustumXYZ ||

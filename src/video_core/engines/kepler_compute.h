@@ -424,6 +424,7 @@ private:
         u32 copy_size;
         bool was_dirty;
     };
+    static constexpr size_t MaxPendingUploads = 4096;
     std::vector<UploadInfo> uploads;
     std::optional<GPUVAddr> indirect_compute{};
     std::optional<u32> indirect_list_slot{};

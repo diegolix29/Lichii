@@ -43,7 +43,8 @@ enum class DrainSite : u32 {
     Acquire,        ///< A semaphore acquire reads the value the back may release
     SemaphoreFlush, ///< The acquired semaphore is in the buffer cache
     FenceRelease,   ///< The puller's acquires release the pending fences
-    ListWriters,    ///< GPU-written command lists: the dispatches and copies sent before them
+    ListWriters,    ///< Command lists on pages no GPU work wrote: the writers the last sync orders
+    ListCopies,     ///< GPU-written command lists: the dispatches and copies sent before them
     ListSync,       ///< Command lists on draw-written pages: the work before the last host sync
     ListFlush,      ///< Command lists on GPU-written pages: drain and flush the pages
     MacroDmaRead,   ///< The front's macros read memory (MME DMA) the caches may still write
@@ -127,6 +128,11 @@ struct AcquireStats {
     /// The front's waits for its back (Drain, WaitFor, a full ring) and their time, by site
     std::array<std::atomic<u64>, static_cast<size_t>(DrainSite::Count)> site_drains{};
     std::array<std::atomic<u64>, static_cast<size_t>(DrainSite::Count)> site_drain_ns{};
+    /// Of the list waits: those after a sync met by a queued release (NoteSync), and their time
+    /// before and after the back ran that release
+    std::array<std::atomic<u64>, static_cast<size_t>(DrainSite::Count)> site_queued_waits{};
+    std::array<std::atomic<u64>, static_cast<size_t>(DrainSite::Count)> site_queued_before_ns{};
+    std::array<std::atomic<u64>, static_cast<size_t>(DrainSite::Count)> site_queued_after_ns{};
 };
 inline AcquireStats g_acquire_stats;
 /// Whether g_acquire_stats counts, as of the split's last start.
@@ -142,9 +148,9 @@ inline void Count(std::atomic<u64>& counter, u64 amount = 1) {
 
 inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
     "other",           "fetch drain",   "acquire",    "semaphore flush", "fence release",
-    "list writers",    "list sync",     "list flush", "macro dma read",  "macro dma writes",
-    "macro dma flush", "gp sync fence", "map",        "front start",     "front verify",
-    "ring full",       "back register", "back code",     "safe read",
+    "list writers",    "list copy writers", "list sync", "list flush", "macro dma read",
+    "macro dma writes", "macro dma flush", "gp sync fence", "map",     "front start",
+    "front verify",    "ring full",     "back register", "back code", "safe read",
 };
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -419,9 +425,12 @@ public:
     /// A host-level wait was just sent (a syncpoint acquire, a host WFI, a GP entry with its sync
     /// bit; semaphore acquires drain, or note it when a release still queued meets them): the
     /// guest's GPU work before it is complete before the commands after it are fetched.
-    void NoteSync() {
+    /// `queued_release`: the position the back runs the queued release that met an acquire by,
+    /// for the list waits' split (AcquireStats::site_queued_waits); 0 for any other sync.
+    void NoteSync(u64 queued_release = 0) {
         last_sync_position = write_position;
         synced_writer_position = last_writer_position;
+        queued_sync_release = queued_release;
     }
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
     /// of it was still queued.
@@ -746,6 +755,7 @@ private:
     u64 last_writer_position{};
     u64 last_sync_position{};
     u64 synced_writer_position{};
+    u64 queued_sync_release{}; ///< NoteSync: the queued release that met the last acquire
     u64 last_entry_start{}; ///< Where the last entry sent starts
     struct SemaphoreWrite {
         u64 position; ///< write_position once it was sent

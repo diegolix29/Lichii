@@ -156,20 +156,51 @@ slot returns `max(trunc(step), 1)`; reused addresses inherit the stored fraction
 More than 16 interleaved counters can therefore fall back to that minimum.
 
 The stubs occupy `0x3C46900` (40 bytes), `0x3C46928` (40 bytes), `0x3C46950`
-(48 bytes), `0x3C46A00` (60 bytes), `0x3C46AB0` and `0x3C46AD8` (40 bytes each); the
+(48 bytes), `0x3C46B60` (60 bytes), `0x3C46AB0` and `0x3C46AD8` (40 bytes each); the
 128-byte helper starts at `0x3C46980`. All are guarded zero-filled executable padding. The hitstop hook
 validates all 44 original bytes through `0x2F53294`, including the instructions
 the stub skips. Any changed hook, cave, state byte, or user mod in a record
 skips the entire FPS Unlock patch transactionally.
 
-The movie frame count stub at `0x3C46A70` (56 bytes) uses the same helper and slots.
+The movie frame count stub at `0x3C46BC4` (56 bytes) uses the same helper and slots.
 
-FPS Unlock reserves `0x1C0` bytes from `0x4E9FE00`. Its step state occupies
-`0x4E9FEB0..0x4E9FFC0` (end exclusive): a replacement index at `+0`, then 16
-slots of `{u64 counter address, f32 remainder, pad}` at `+0x10`. The range
-`0x4E9FE10..0x4E9FEB0` holds the water slots (state through `+0x98`, cave `0x3C46300`)
-and the sound gate (state through `+0xA8`, caves `0x3C46280` and `0x3C46800`), so the
-three patches share the timer state without overlapping.
+FPS Unlock keeps two state ranges. `0x4E9FE00..0x4E9FEA8` (end exclusive) is Dark's timer
+state, the water slots (through `+0x98`, cave `0x3C46300`) and the sound gate (`+0xA0..+0xA8`,
+caves `0x3C46280` and `0x3C46800`). The step state is `0x4E9EE00..0x4E9EF10`: a replacement
+index at `+0`, then 16 slots of `{u64 counter address, f32 remainder, pad}` at `+0x10`. Both
+must be zero-filled BSS, or the whole patch is skipped.
+
+## FPS Unlock and cheats
+
+Until build 228 the ambient, turn speed and movie stubs sat at `0x3C46A00..0x3C46AA8` and the
+step state at `0x4E9FEB0..0x4E9FFC0`. tomvita's MyNXCheats for this build (also used by the
+cheatvm mod) write their code to `0x3C46A00..0x3C46AAC` and `0x3C46CC0..0x3C46DB0` and keep
+flags at `0x4E9FF80..0x4E9FF94` and `0x4E9FFA0..0x4E9FFB0`, so "No damage" overwrote the
+ambient stub and the game crashed (#1873). Those three stubs now sit at `0x3C46B60..0x3C46BFC`
+and the step state at `0x4E9EE00`, clear of every cheat we found.
+
+The executable padding `0x3C461D0..0x3C47000` has no byte that no known mod uses: IPS and
+pchtxt mods (ultrawide, HUD, cheat menus, first person, co-op) cover all of it. That is safe
+for them, since a mod that changes any byte of a built-in's records makes the built-in step
+aside. Cheats write after the game loads, so the built-in can't tell. The new stubs take bytes
+that only mods already overlapping the cloth routines at `0x3C46B00` use, and stop before the
+ultrawide and save-profile caves at `0x3C46C00`. The KaeGae registry
+(Kabosune/oot-remake-modding, `registry/e0f3ccfa.toml`) lists `0x4E9A4C8..0x4EA0000` as BSS
+the game never references; the only claims below `0x4E9F000` are at `0x4E9A4D0..0x4E9A4E0`.
+
+When a built-in applies, the loader also reads the enabled cheats and logs a warning for each
+static store (opcode 0, region main) into one of its records or state ranges, naming the cheat,
+the patch and both ranges:
+
+```
+Cheat "No damage" writes main+0x3c46a00..0x3c46a34, which built-in patch "FPS Unlock (built-in)"
+uses for its code at main+0x3c46a00..0x3c46a3c. ...
+```
+
+The cheat still runs. The enabled cheats run as one program, so the scan reads them in that order
+and a register one cheat sets carries into the next. A store's offset register is followed
+through unconditional static loads (`40000000`). Stores whose offset register anything else may
+have changed, and stores inside loops, are not followed.
 
 ## FPS Unlock movie frame count
 
@@ -180,7 +211,7 @@ its end by it. The movie's picture and sound follow the clock, so at a step of 2
 come at half speed and at 0.5 (120 fps) at twice the speed, and they drift from the picture and the
 voices: the sages' lines play over each other (#1474, likely the post-credits in #1572).
 
-`FPS Unlock (built-in)` branches at `0x3B5C7C8` to 56 bytes at `0x3C46A70`, which adds the
+`FPS Unlock (built-in)` branches at `0x3B5C7C8` to 56 bytes at `0x3C46BC4`, which adds the
 shared step helper's whole ticks for the counter's address instead of one. At 30 fps that is 2 per
 update; at 120 fps it alternates 0 and 1; at 60 fps it stays at 1 apart from the odd 0 or 2 when
 the measured step drifts around 1.0. The movie start path's own `+1` at `0x3B5C90C` stays.
@@ -208,7 +239,7 @@ applied this frame times the frame step (`fmul` at `0x261EB18` and `0x261EB1C`).
 carries the step, so below a step of 1 the speed decays by step² every frame. At 150 fps Gohma then
 steered at 0.045 rad/s instead of about 1 rad/s and walked into the wall of her room.
 
-`FPS Unlock (built-in)` branches at `0x261EB18` to 40 bytes at `0x3C46A40`, in guarded zero-filled
+`FPS Unlock (built-in)` branches at `0x261EB18` to 40 bytes at `0x3C46B9C`, in guarded zero-filled
 executable padding. Below a step of 1 the bounds become ±(applied change / step), which keeps the
 speed; at 1 and above the routine runs the game's two instructions. The hook record checks both
 replaced instructions, so a user mod at either one skips the patch. Measured live at step 0.65 with

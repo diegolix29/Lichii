@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/gpu_split.h"
 #include "video_core/nx2_list_indirect.h"
 #include "video_core/nx2_list_indirect_stats.h"
 #include "video_core/nx2_owed_words.h"
@@ -83,8 +84,12 @@ class Nx2ListSlots {
         return !owed.Empty();
     }
 
-    /// Any thread: whether [device_addr, +size) holds an owed word.
+    /// Any thread: whether [device_addr, +size) holds an owed word. The back, about once per
+    /// uniform bind, asks without the lock.
     [[nodiscard]] bool Owes(DAddr device_addr, u64 size) const {
+        if (VideoCommon::GpuSplit::OnBackThread()) {
+            return owed.OverlapsOnBack(device_addr, size);
+        }
         return owed.Overlaps(device_addr, size);
     }
 

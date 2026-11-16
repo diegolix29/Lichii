@@ -36,6 +36,10 @@ inline constexpr std::array<const char*, static_cast<size_t>(OwedReader::Count)>
 /// word lands there, each with the host GPU tick after which the back can read its slot word.
 /// The back changes them, in tick order, and reads them without the lock. Any thread may ask
 /// whether a range holds one.
+///
+/// Only the back may change them. Its own reads (Span, Take, ForEach, OverlapsOnBack) skip the
+/// lock because no other thread writes: a change from any other thread must take the lock and
+/// make those reads take it too.
 class OwedWords {
   public:
     struct Word {
@@ -54,6 +58,15 @@ class OwedWords {
             return false;
         }
         std::scoped_lock lock{mutex};
+        const auto it = words.lower_bound(address >= 3 ? address - 3 : 0);
+        return it != words.end() && it->first < address + size;
+    }
+
+    /// The back: Overlaps without the lock (only the back changes the words).
+    [[nodiscard]] bool OverlapsOnBack(DAddr address, u64 size) const {
+        if (Empty()) {
+            return false;
+        }
         const auto it = words.lower_bound(address >= 3 ? address - 3 : 0);
         return it != words.end() && it->first < address + size;
     }

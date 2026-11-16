@@ -218,9 +218,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a Switch 2 game's own DLSS, "
               "instead of AMD FSR 3.1.\nNeeds NVIDIA's Streamline loader, and NVIDIA DLSS unless "
               "the NVIDIA app has downloaded it; Lichii does not ship NVIDIA's files. Use the "
-              "download button below.\nFire Emblem: Fortune's Weave also needs "
-              "EDEN_NX2_DLSS_REPLACEMENT=dlss. Without that override, its spatial workaround "
-              "remains active.\nIn The Legend of Zelda: Ocarina of Time it replaces the game's "
+              "download button below.\nIn Fire Emblem: Fortune's Weave it replaces the game's "
+              "DLSS while \"Use the game's own DLSS\" is off.\nIn The Legend of Zelda: Ocarina of Time it replaces the game's "
               "upscaler at 1x resolution scale.\nThe window adapting filter (the FSR 1, Bilinear "
               "and similar button in the status bar) is separate and runs after DLSS. While DLSS "
               "runs, the status bar shows DLSS, its mode and its preset. If DLSS fails, it stays "
@@ -467,6 +466,14 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
 
     INSERT(Settings, vertex_input_dynamic_state, tr("Vertex Input Dynamic State"),
            tr("Enables vertex input dynamic state feature for better quality and performance."));
+
+    INSERT(Settings, mesh_shaders, tr("Mesh Shaders"),
+           tr("How Switch 2 games' mesh shader geometry is drawn.\n"
+              "Native uses the GPU's mesh shaders. Compute Fallback emulates them with compute "
+              "shaders: it can be slower in scenes with a lot of foliage, and it can't draw every "
+              "kind of mesh program.\n"
+              "Automatic uses the compute fallback on AMD RDNA2 GPUs (RX 6000 series), where "
+              "native mesh shaders hang the GPU, and native mesh shaders everywhere else."));
 
     INSERT(
         Settings, sample_shading, tr("Sample Shading"),
@@ -917,6 +924,13 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(ExtendedDynamicState, EDS1, tr("ExtendedDynamicState 1")),
                               PAIR(ExtendedDynamicState, EDS2, tr("ExtendedDynamicState 2")),
                               PAIR(ExtendedDynamicState, EDS3, tr("ExtendedDynamicState 3")),
+                          }});
+
+    translations->insert({Settings::EnumMetadata<Settings::MeshShaderMode>::Index(),
+                          {
+                              PAIR(MeshShaderMode, Automatic, tr("Automatic")),
+                              PAIR(MeshShaderMode, Native, tr("Native")),
+                              PAIR(MeshShaderMode, Compute, tr("Compute Fallback")),
                           }});
 
     translations->insert({Settings::EnumMetadata<Settings::GameListMode>::Index(),

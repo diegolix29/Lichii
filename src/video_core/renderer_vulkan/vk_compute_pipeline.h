@@ -68,15 +68,7 @@ public:
                                  std::optional<ByteAddressedShadow>& shadow,
                                  BindCommand* deferred_bind = nullptr);
 
-    static constexpr u64 Ocarina1440pShader = 0x6bd913e1f34e83ebULL;
-    /// The same upscale to 2560x1440 from a scene the DLSS render scale shrank (ProfessorTee's
-    /// #903).
-    static constexpr u64 Ocarina1440pScaledShader = 0x4c1ae2fe58f30a97ULL;      // menus
-    static constexpr u64 Ocarina1440pScaledFieldShader = 0x9302bc0d6d1d9bc1ULL; // gameplay
-    /// The game's 3/4 upscale, which it runs to 2560x1440 at the DLSS Performance render scale.
-    static constexpr u64 OcarinaThreeQuarterShader = 0xe40f5efb5480e692ULL;
-    /// The same output pass at 1:1, run at 1920x1080 in handheld with the Max Resolution add-on.
-    static constexpr u64 OcarinaFullSizeShader = 0xc033c3ddc9f0897bULL;
+    /// Whether the bindings fit an Ocarina upscale pass: one written image, no other writes.
     [[nodiscard]] bool CanReplaceOcarinaUpscale() const;
 
     bool IsBound() const noexcept {

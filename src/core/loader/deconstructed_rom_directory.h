@@ -57,6 +57,7 @@ public:
     bool IsRomFSUpdatable() const override;
 
     ResultStatus ReadNSOModules(Modules& out_modules) override;
+    ResultStatus ReadMainBuildId(Core::System& system, std::array<u8, 0x20>& build_id) override;
 
 private:
     /// The loose RomFS next to the ExeFS, found (and built) on first use.

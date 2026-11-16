@@ -701,6 +701,21 @@ private:
             }
             auto backing = back_whole ? AllocateGpuOnlyBacking(size, true, false) : std::nullopt;
             std::scoped_lock lk{m_region_mutex};
+            // A title may create the same region again from the same start with a different size,
+            // without 215 (Mario Kart World walks 300 MB -> 600 MB -> 1 GB on the same address):
+            // the earlier region goes first, as 215 would drop it. Here, on the service thread:
+            // the blocks it left behind would otherwise be released by the GPU thread's back when
+            // it backs the new region, and the back must not wait for a guest thread's turn.
+            u64 old_size = 0;
+            if (const auto old = m_sparse_regions.find(start); old != m_sparse_regions.end()) {
+                old_size = old->second.size;
+            } else if (const auto whole = m_gpu_only_regions.find(start);
+                       whole != m_gpu_only_regions.end()) {
+                old_size = whole->second.size;
+            }
+            if (old_size != 0) {
+                DestroyRegion(start, start + old_size - 1);
+            }
             if ((w[7] & SparseRegionFlag) == 0) {
                 m_gpu_only_ranges[start] = size; // kept out of 216, however it is backed
             }
@@ -793,6 +808,17 @@ private:
         };
         std::scoped_lock lk{m_region_mutex};
         freed = TakeReleasedRegions();
+        DestroyRegion(first, last);
+        // Behind the unmaps above, outside m_region_mutex.
+        Nvidia::Devices::Nx2GpuMemoryRegistry::Defer([this, slot = w[8]] { SignalAfterGpu(slot); });
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    // Drops the region at first (215, or 214 creating it again), as SubDestroySparseRegion
+    // describes. Needs m_region_mutex and an open DeferScope, which holds the listener calls back
+    // until the lock is released.
+    void DestroyRegion(u64 first, u64 last) {
         if (m_gpu_only_ranges.erase(first) != 0 && last > first) {
             DropGpuOnlyTiles(first, last - first + 1, false);
             m_shared_regions.erase(first);
@@ -830,10 +856,6 @@ private:
                 region = m_gpu_only_regions.erase(region);
             }
         }
-        // Behind the unmaps above, outside m_region_mutex.
-        Nvidia::Devices::Nx2GpuMemoryRegistry::Defer([this, slot = w[8]] { SignalAfterGpu(slot); });
-        IPC::ResponseBuilder rb{ctx, 2};
-        rb.Push(ResultSuccess);
     }
 
     // Sub 216 (nn::gpu::sdk::ExecuteSparseMapRequests, behind nvnMemoryPoolMapVirtual and NvRm's
@@ -994,27 +1016,13 @@ private:
     }
 
     // Records a mapped backing for the region at gpu_address. Needs m_region_mutex.
+    // The GPU thread's back calls it (MapBlock), so it makes no registry calls: an entry already
+    // at gpu_address was an earlier region's, and 214 drops that region before making the new one.
+    // Overwriting an entry would leave its backing mapped and its pages lost (Mario Kart World's
+    // GPU-only total grew 250 MiB -> 6.5 GiB in one session that way).
     void RegisterGpuOnlyBacking(u64 gpu_address, MappedBacking&& backing) {
-        // A title may create the same region again from the same start with a different size
-        // (Mario Kart World walks 300 MB -> 600 MB -> 1 GB on the same address). Overwriting the
-        // entry used to drop the previous mapping without undoing it: the backing stayed mapped
-        // in the alias code region and its pages never went back to the pool, so the GPU-only
-        // total grew without bound (250 MiB -> 6.5 GiB in one session) until the process died.
-        // Release the old backing the same way 215 does, i.e. only once the GPU thread is past it.
-        if (const auto it = m_gpu_only_regions.find(gpu_address); it != m_gpu_only_regions.end()) {
-            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(gpu_address, it->second.size);
-            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().ReleaseBacking(it->second.cpu_address,
-                                                                        it->second.size);
-            auto done = std::make_shared<std::atomic<bool>>(false);
-            // Behind the release above (held back while a DeferScope is open).
-            Nvidia::Devices::Nx2GpuMemoryRegistry::Defer([this, done] {
-                system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
-            });
-            // Counted out by FreeBackings once its pages are freed.
-            m_gpu_only_bytes -= it->second.size;
-            m_released_regions.push_back({std::move(it->second), done});
-            m_gpu_only_regions.erase(it);
-        }
+        ASSERT_MSG(!m_gpu_only_regions.contains(gpu_address),
+                   "nx2:gpu GPU-only backing at {:#x} registered twice", gpu_address);
         m_gpu_only_regions[gpu_address] = {backing.address, backing.size, std::move(backing.pages),
                                            backing.reserved};
         m_gpu_only_bytes += backing.size;
@@ -2135,7 +2143,7 @@ private:
         m_previous_fence_id = ~w[22];
         m_previous_fence_value = w[24];
         const auto waited = std::chrono::steady_clock::now();
-        Composite(w[5], ~w[22], w[24], w[7]);
+        Composite(w[5], ~w[22], w[24], w[7], w[8]);
         const auto composited = std::chrono::steady_clock::now();
         PaceToVblank(w[12], ctx.GetThread().GetOwnerProcess());
         const auto paced = std::chrono::steady_clock::now();
@@ -2699,8 +2707,8 @@ private:
     // (syncpoint, value) to wait for (layout from changes.patch). The image is a block-linear
     // surface in the console's native GOB layout at GPU address == CPU address.
     // shown_size: the present's word 7, ((height - 1) << 16) | (width - 1) of the area the game drew
-    // into from the image's top-left corner (0 when it gives none).
-    void Composite(u32 image_id, u32 fence_id, u32 fence_value, u32 shown_size) {
+    // into from the image's top-left corner (0 when it gives none). flags: word 8.
+    void Composite(u32 image_id, u32 fence_id, u32 fence_value, u32 shown_size, u32 flags) {
         NotifyHdrChange();
         u64 address{};
         u32 parent{};
@@ -2815,7 +2823,9 @@ private:
                             : image_format == Nx2NativeImageFormat::Rgb10A2
                                 ? android::PixelFormat::Rgba1010102
                                 : android::PixelFormat::Rgba8888,
-            .transform_flags = android::BufferTransformFlags::Unset,
+            // Present flag bit 18 requests vertical inversion (Kirby's Switch 2 Edition program).
+            .transform_flags = (flags & (1U << 18)) != 0 ? android::BufferTransformFlags::FlipV
+                                                         : android::BufferTransformFlags::Unset,
             .crop_rect = {0, 0, static_cast<int>(crop_width), static_cast<int>(crop_height)},
             .blending = Tegra::BlendMode::Opaque,
             .native_tiling = true,
@@ -3559,6 +3569,17 @@ private:
     void ReleaseBuffer(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         Log(ctx, "release output");
+        {
+            std::scoped_lock lk{m_mutex};
+            const auto acquired = m_acquired_image;
+            const auto is_acquired = [&](const Output& output) { return output.image == acquired; };
+            if (acquired && *acquired != w[2] && m_registered.contains(*acquired) &&
+                std::ranges::find(m_free, *acquired) == m_free.end() &&
+                std::ranges::none_of(m_outputs, is_acquired)) {
+                m_clock.Released(HostTimeUs(),
+                                 Core::g_nx2_present_count.load(std::memory_order_relaxed));
+            }
+        }
         const auto handle = HandOut(w[2], Fence{~w[4], w[6]});
         TipcReplyWords(ctx, {handle[0], handle[1], handle[2], handle[3]});
     }
@@ -3597,6 +3618,7 @@ private:
             // queued), and until the last was in, its pictures came at 20-28 fps, so the video
             // started ~11 s behind its audio. End of stream is never refused.
             if (!m_inputs.Submit(std::move(input))) {
+                m_ready->room.store(false, std::memory_order_relaxed);
                 if (Nx2VideoTraceEnabled()) {
                     LOG_INFO(Service, "nx2:vdec trace refuse syncpoint={} pts={} queued={}",
                              m_syncpoint, pts, m_inputs.Size());
@@ -3609,8 +3631,7 @@ private:
             }
             m_stream_ended = false;
             m_end_queued |= end;
-            m_ready->room.store(!m_end_queued && m_inputs.BelowReadyWatermark(),
-                                std::memory_order_relaxed);
+            m_ready->room.store(!m_end_queued && m_inputs.HasRoom(), std::memory_order_relaxed);
             if (Nx2VideoTraceEnabled()) {
                 LOG_INFO(Service,
                          "nx2:vdec trace submit syncpoint={} input={} bytes={} pts={} eos={} queued={}",
@@ -3749,7 +3770,9 @@ private:
             if (!m_outputs.empty()) {
                 output = m_outputs.front();
                 m_outputs.pop_front();
-                m_clock.Acquired(HostTimeUs(), output->pts, PauseEndUs());
+                m_clock.Acquired(HostTimeUs(), output->pts, PauseEndUs(),
+                                 Core::g_nx2_present_count.load(std::memory_order_relaxed));
+                m_acquired_image = output->image;
             }
         }
         if (!output) {
@@ -3856,7 +3879,7 @@ private:
             }
             Input input = m_inputs.Pop();
             if (!m_stream_ended && !m_end_queued) {
-                m_ready->room.store(m_inputs.BelowReadyWatermark(), std::memory_order_relaxed);
+                m_ready->room.store(m_inputs.HasRoom(), std::memory_order_relaxed);
             }
             std::string codec = m_codec;
             if (codec.empty() && Tegra::Host1x::IsH264Stream(input.data)) {
@@ -4122,6 +4145,7 @@ private:
     std::deque<u32> m_free;            ///< Output images, in the order the client acquires them
     std::map<u32, Fence> m_release_fences;
     std::deque<Output> m_outputs;      ///< Finished, for 213
+    std::optional<u32> m_acquired_image; ///< The output image the client acquired last
     std::set<u32> m_registered;        ///< Output images the client has registered
     Output m_last_output{};
     bool m_stream_ended{};             ///< End-of-stream frame handed out, nothing submitted since
@@ -4164,6 +4188,9 @@ public:
              "CalculateDecoderImagePoolBuffer"},
             {901, &INx2GraphicsSystemSession::Stub, "VideoInitialize (guessed)"},
             {902, &INx2GraphicsSystemSession::OpenVideoSession, "OpenVideoDecoderSession (guessed)"},
+            // Sent after a movie's decoder session finalizes (Ocarina of Time's intro played to
+            // its end): the close of the 901 initialize.
+            {903, &INx2GraphicsSystemSession::Stub, "VideoFinalize (guessed)"},
             {905, &INx2GraphicsSystemSession::OpenVideoSession, "OpenVideoDecoderSessionWithFlag"},
             {906, &INx2GraphicsSystemSession::OpenVideoSession, "OpenVideoDecoderSessionWithVersion"},
             {1001, &INx2GraphicsSystemSession::Stub, "VideoInitialize2 (guessed)"},

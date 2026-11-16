@@ -263,6 +263,7 @@ private:
     std::vector<Readback> readbacks;
     size_t pending_bytes{};
     size_t recorded_bytes{};
+    size_t sampled_bytes{};
     size_t written_bytes{};
     u32 sequence{};
     u32 images{};

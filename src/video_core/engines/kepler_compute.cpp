@@ -530,6 +530,12 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
                         .exec_address = upload_state.ExecTargetAddress(),
                         .copy_size = upload_state.GetUploadSize(),
                         .was_dirty = upload_dirty};
+        // Only the register launch below reads and clears this list. Native (QMD) launches never
+        // do, so in Ocarina it grew by one entry per upload for the whole session (768 MiB after
+        // ~90 minutes). A launch only looks at uploads since the previous one: keep the newest.
+        if (uploads.size() >= MaxPendingUploads) {
+            uploads.erase(uploads.begin(), uploads.begin() + MaxPendingUploads / 2);
+        }
         uploads.push_back(info);
         upload_state.ProcessExec(regs.exec_upload.linear != 0);
         break;
@@ -586,6 +592,8 @@ void KeplerCompute::CallMultiMethod(Core::System& system, u32 method, const u32*
 /// Set up the compute registers from the native descriptor and submit the dispatch.
 /// Returns true if the dispatch was submitted, skipped, or replaced.
 bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor) {
+    // A native launch consumes the uploads made for it (the register launch does the same).
+    uploads.clear();
     // A grid of GPU-written list words (Nx2ListIndirect): one slot's three words, which the host
     // GPU dispatches from, or placeholders of several, whose words the back reads.
     NativeQmdScheduler::Descriptor resolved;
@@ -895,8 +903,12 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     if (dlss_chain.output_pass) {
         return replacement && !recheck_after_dispatch && FinishDlssEvaluation();
     }
-    return DlssNetworkDroppedForGood() && !passes->IsPrepass(native_key) &&
-           dlss_chain.programs.contains(native_key);
+    // While the network can't be shown at all (turned off or replaced on request, resolution
+    // scaling, no support), its own passes are skipped like a network dropped for good: the
+    // replacement draws over their result anyway, and a pass that can't run (tensor operations
+    // unavailable) would drop the prepass's jitter, motion vectors and depth the replacement needs.
+    return (blocker != VideoCore::GameDlssReason::None || DlssNetworkDroppedForGood()) &&
+           !passes->IsPrepass(native_key) && dlss_chain.programs.contains(native_key);
 }
 
 // The game's own DLSS network (its translated programs) is shown once every pass of an
@@ -1226,8 +1238,8 @@ bool KeplerCompute::BypassOotBaseNetwork() {
     return false;
 }
 
-/// Replace a known output pass with the latest tonemap, using scaling for the base game.
-/// The update's prepass and network may be skipped after a successful replacement.
+/// Replace a known output pass with a copy of the latest tonemapped image, using scaling for the
+/// base game. The update's network passes may be skipped after a successful replacement.
 bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     using namespace VideoCommon::OotNetwork;
     if (!BypassEnabled(program_id)) {
@@ -1237,42 +1249,95 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     if (!bypass) {
         return false;
     }
-    // The tonemap pass draws before the network every frame; until it has been seen (menus, the
-    // first frame) the network runs as usual. Its first passes are skipped only while the output
-    // pass is being replaced, so a failed replacement brings the whole network back next frame.
-    Maxwell3D::Regs::RenderTargetConfig tonemapped;
-    {
-        std::scoped_lock lock{bypass->mutex};
-        tonemapped = bypass->tonemapped;
+    // The first passes are skipped only while the output pass is being replaced, so a failed
+    // replacement brings the whole network back next frame. The game can also finish a frame with
+    // an output program this does not replace (#1688), which would read the skipped network's
+    // stale result every frame: a skip that no replacement followed brings the network back too.
+    if (native_key == PrepassProgramKey) {
+        if (bypass->output_pending.exchange(false, std::memory_order_relaxed) &&
+            bypass->output_replaced.exchange(false, std::memory_order_relaxed)) {
+            static bool logged = false;
+            if (!std::exchange(logged, true)) {
+                LOG_INFO(HW_GPU,
+                         "Ocarina of Time: the network's output pass was not replaced; running "
+                         "the network (first program after it: {:016x})",
+                         bypass->after_network.load(std::memory_order_relaxed));
+            }
+        }
+        const bool skip = bypass->output_replaced.load(std::memory_order_relaxed);
+        bypass->output_pending.store(skip, std::memory_order_relaxed);
+        return skip;
     }
-    if (tonemapped.Address() == 0) {
-        return false;
+    if (ShouldSkipUnusedDispatch(native_key,
+                                 bypass->output_replaced.load(std::memory_order_relaxed),
+                                 bypass->output_pending.load(std::memory_order_relaxed))) {
+        static bool logged = false;
+        if (!std::exchange(logged, true)) {
+            LOG_INFO(HW_GPU, "Skipping unused AA dispatch {:016x} after output replacement",
+                     native_key);
+        }
+        return true;
     }
-    if (native_key == PrepassProgramKey || native_key == NetworkProgramKey) {
+    if (native_key == NetworkProgramKey) {
+        bypass->after_network.store(0, std::memory_order_relaxed);
         return bypass->output_replaced.load(std::memory_order_relaxed);
     }
     const bool base_output = std::ranges::find(BaseOutputPrograms, native_key,
                                               &BaseOutputProgram::key) != BaseOutputPrograms.end();
     if (native_key != OutputProgramKey && !base_output) {
+        u64 none = 0;
+        bypass->after_network.compare_exchange_strong(none, native_key, std::memory_order_relaxed);
         return false;
     }
-    // The base game can run its tonemap at a lower resolution than the output.
+    // The update's output pass samples the HDR scene the tonemap pass reads (B10G11R11 memory
+    // through an E5B9G9R9 descriptor, see TryOcarinaUpscale), so copying it would skip the
+    // tonemap. The copy reads the latest draw of the input's size since the last output pass
+    // instead: that is the tonemap, drawn after the scene, whichever shader draws it.
+    const auto input = ConstBuffer0Image(InputImageHandleOffset);
     const auto output = ConstBuffer0Image(OutputImageHandleOffset);
-    if (!output || output->format != Texture::TextureFormat::B10G11R11 || output->Address() == 0 ||
-        output->Address() == tonemapped.Address() || !output->IsBlockLinear() ||
-        tonemapped.format != Tegra::RenderTargetFormat::B10G11R11_FLOAT ||
-        tonemapped.tile_mode.is_pitch_linear || tonemapped.width == 0 || tonemapped.height == 0 ||
+    const auto valid = [](const std::optional<Texture::TICEntry>& image) {
+        return image && image->Address() != 0 && image->IsBlockLinear() && image->Width() != 0 &&
+               image->Height() != 0;
+    };
+    Maxwell3D::Regs::RenderTargetConfig tonemapped{};
+    {
+        std::scoped_lock lock{bypass->mutex};
+        if (bypass->latest_address.exchange(0, std::memory_order_relaxed) != 0) {
+            tonemapped = bypass->latest_draw;
+        }
+    }
+    const Texture::TextureFormat input_format =
+        input ? input->format.Value() : Texture::TextureFormat{};
+    const bool images_valid = valid(input) && valid(output) &&
+                              (input_format == Texture::TextureFormat::B10G11R11 ||
+                               input_format == Texture::TextureFormat::E5B9G9R9) &&
+                              output->format == Texture::TextureFormat::B10G11R11;
+    // Draws are matched against the previous output pass's images, so the first one only learns
+    // them.
+    const bool learned = bypass->input_width.load(std::memory_order_relaxed) != 0;
+    if (images_valid) {
+        bypass->input_width.store(input->Width(), std::memory_order_relaxed);
+        bypass->input_height.store(input->Height(), std::memory_order_relaxed);
+        bypass->output_address.store(output->Address(), std::memory_order_relaxed);
+    }
+    // The base game can run its tonemap at a lower resolution than the output.
+    if (!images_valid || tonemapped.Address() == 0 || tonemapped.Address() == output->Address() ||
         (base_output ? tonemapped.width > output->Width() || tonemapped.height > output->Height()
-                     : tonemapped.width != output->Width() || tonemapped.height != output->Height())) {
+                     : tonemapped.width != output->Width() ||
+                           tonemapped.height != output->Height())) {
         bypass->output_replaced.store(false, std::memory_order_relaxed);
         static bool warned = false;
-        if (!std::exchange(warned, true)) {
+        if ((learned || !images_valid) && !std::exchange(warned, true)) {
+            const auto size = [](const std::optional<Texture::TICEntry>& image) {
+                return image ? fmt::format("{}x{} format {:#x}", image->Width(), image->Height(),
+                                           static_cast<u32>(image->format.Value()))
+                             : std::string{"unreadable"};
+            };
             LOG_WARNING(HW_GPU,
-                        "Ocarina of Time: unexpected network images; not replaced (tonemapped {}x{}, "
-                        "output {})",
-                        tonemapped.width, tonemapped.height,
-                        output ? fmt::format("{}x{}", output->Width(), output->Height())
-                               : std::string{"unreadable"});
+                        "Ocarina of Time: unexpected network images; not replaced (tonemapped "
+                        "{:#x} {}x{}, input {}, output {})",
+                        tonemapped.Address(), tonemapped.width, tonemapped.height, size(input),
+                        size(output));
         }
         return false;
     }
@@ -1312,13 +1377,15 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     };
     const bool copied = rasterizer->AccelerateSurfaceCopy(source, destination, config);
     bypass->output_replaced.store(copied, std::memory_order_relaxed);
+    bypass->output_pending.store(false, std::memory_order_relaxed);
     static bool logged = false;
     if (!std::exchange(logged, true)) {
         LOG_INFO(HW_GPU,
                  "Ocarina of Time: anti-aliasing network bypassed ({}): "
-                 "shader {:016x}, {:#x} {}x{} -> {:#x} {}x{}",
+                 "shader {:016x}, {:#x} {}x{} (input {:#x}) -> {:#x} {}x{}",
                  copied ? "copy of the tonemapped image" : "copy failed", native_key,
-                 tonemapped.Address(), source.width, source.height, output->Address(), width, height);
+                 tonemapped.Address(), source.width, source.height, input->Address(),
+                 output->Address(), width, height);
     }
     return copied;
 }
@@ -1573,22 +1640,23 @@ bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
 
 bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     using namespace VideoCommon::FireEmblemUpscale;
-    static const bool requested_history = [] {
+    // Temporal by default: a spatial upscale of the jittered input crawls from frame to frame.
+    // EDEN_NX2_DLSS_REPLACEMENT=spatial keeps the spatial de-jitter for comparisons.
+    static const bool spatial_requested = [] {
         const char* const option = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return option && (std::string_view{option} == "fsr" || std::string_view{option} == "dlss");
+        return option && std::string_view{option} == "spatial";
     }();
-    const bool use_history = allow_history && requested_history;
     const size_t game_index = dlss_chain.spatial_only ? 1 : 0;
     const char* const game = dlss_chain.spatial_only ? "Star Fox" : "Fire Emblem";
     const auto jitter = fe_upscale_jitter.Take();
     const auto motion = std::exchange(dlss_motion_vectors, std::nullopt);
     const auto depth = std::exchange(dlss_depth, std::nullopt);
-    if (!dlss_chain.render_region && (!jitter || (use_history && (!motion || !depth)))) {
+    if (!dlss_chain.render_region && !jitter) {
         static std::array<bool, 2> reported{};
         if (!reported[game_index]) {
             reported[game_index] = true;
-            LOG_WARNING(HW_GPU, "{} replacement lacks current inputs: jitter={} motion={} depth={} temporal={}; retaining native dispatch",
-                        game, jitter.has_value(), motion.has_value(), depth.has_value(), use_history);
+            LOG_WARNING(HW_GPU, "{} replacement lacks this frame's jitter; retaining native dispatch",
+                        game);
         }
         return false;
     }
@@ -1612,10 +1680,14 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
         return ScaleDlssRenderRegion(address, input, output, jitter, motion, depth);
     }
     if (!input || !output || !ValidPair(*input, *output, dlss_chain.spatial_only) ||
-        jitter->color != input->Address() || (use_history && dlss_motion_color != input->Address()) ||
-        jitter->width != input->Width() || jitter->height != input->Height()) {
+        jitter->color != input->Address() || jitter->width != input->Width() ||
+        jitter->height != input->Height()) {
         return false;
     }
+    // A frame without matching motion vectors and depth is scaled spatially, as is one the
+    // temporal upscale turns down; never left to the native pass.
+    bool use_history = allow_history && !spatial_requested && motion && depth &&
+                       dlss_motion_color == input->Address();
     const auto surface = [](const Texture::TICEntry& tic, Tegra::RenderTargetFormat format) {
         Fermi2D::Surface result{};
         result.format = format;
@@ -1634,11 +1706,18 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
                                                      : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
     const auto output_format = dlss_chain.spatial_only ? Tegra::RenderTargetFormat::R16G16B16A16_FLOAT
                                                       : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
-    const bool done = rasterizer->AccelerateTemporalUpscale(
-        surface(*input, input_format), surface(*output, output_format),
-        use_history ? surface(*motion, Tegra::RenderTargetFormat::R16G16_FLOAT) : Fermi2D::Surface{},
-        use_history ? &*depth : nullptr, jitter->offset,
-        use_history ? std::array{1.0f, 1.0f} : std::array{0.0f, 0.0f}, use_history);
+    const auto upscale = [&](bool history) {
+        return rasterizer->AccelerateTemporalUpscale(
+            surface(*input, input_format), surface(*output, output_format),
+            history ? surface(*motion, Tegra::RenderTargetFormat::R16G16_FLOAT) : Fermi2D::Surface{},
+            history ? &*depth : nullptr, jitter->offset,
+            history ? std::array{1.0f, 1.0f} : std::array{0.0f, 0.0f}, history);
+    };
+    bool done = upscale(use_history);
+    if (!done && use_history) {
+        use_history = false;
+        done = upscale(false);
+    }
     static std::array<u32, 2> logged{};
     if (logged[game_index]++ < 8) {
         LOG_INFO(HW_GPU, "{} DLSS replacement: {} temporal={} input={:#x} {}x{} output={:#x} {}x{} jitter={},{}",

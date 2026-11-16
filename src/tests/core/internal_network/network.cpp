@@ -3,6 +3,7 @@
 #include <array>
 #include <chrono>
 #include <future>
+#include <thread>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -70,4 +71,74 @@ TEST_CASE("Network::PerCallNonblockingReceive", "[core][sockets]") {
     CHECK(blocking_result.first == 1);
     CHECK(blocking_result.second == Network::Errno::SUCCESS);
     CHECK(received == 'x');
+}
+
+TEST_CASE("Network::ReusePortSharesUdpPort", "[core][sockets]") {
+    Network::NetworkInstance network_instance;
+    Network::Socket first;
+    Network::Socket second;
+    Network::Socket without_option;
+    for (Network::Socket* socket : {&first, &second, &without_option}) {
+        REQUIRE(socket->Initialize(Network::Domain::INET, Network::Type::DGRAM,
+                                   Network::Protocol::UDP) == Network::Errno::SUCCESS);
+    }
+    REQUIRE(first.SetReusePort(true) == Network::Errno::SUCCESS);
+    REQUIRE(second.SetReusePort(true) == Network::Errno::SUCCESS);
+    REQUIRE(first.Bind({Network::Domain::INET, {127, 0, 0, 1}, 0}) == Network::Errno::SUCCESS);
+    const auto [address, address_error] = first.GetSockName();
+    REQUIRE(address_error == Network::Errno::SUCCESS);
+
+    CHECK(first.GetReusePort() == std::pair{true, Network::Errno::SUCCESS});
+    CHECK(without_option.GetReusePort() == std::pair{false, Network::Errno::SUCCESS});
+    CHECK(second.Bind(address) == Network::Errno::SUCCESS);
+    CHECK(without_option.Bind(address) == Network::Errno::ADDRINUSE);
+}
+
+TEST_CASE("Network::ReuseOptionsStayIndependent", "[core][sockets]") {
+    Network::NetworkInstance network_instance;
+    Network::Socket socket;
+    REQUIRE(socket.Initialize(Network::Domain::INET, Network::Type::DGRAM,
+                              Network::Protocol::UDP) == Network::Errno::SUCCESS);
+    constexpr std::pair set{true, Network::Errno::SUCCESS};
+    constexpr std::pair unset{false, Network::Errno::SUCCESS};
+
+    REQUIRE(socket.SetReuseAddr(true) == Network::Errno::SUCCESS);
+    CHECK(socket.GetReusePort() == unset);
+    REQUIRE(socket.SetReusePort(false) == Network::Errno::SUCCESS);
+    CHECK(socket.GetReuseAddr() == set);
+
+    REQUIRE(socket.SetReusePort(true) == Network::Errno::SUCCESS);
+    REQUIRE(socket.SetReuseAddr(false) == Network::Errno::SUCCESS);
+    CHECK(socket.GetReusePort() == set);
+    CHECK(socket.GetReuseAddr() == unset);
+}
+
+TEST_CASE("Network::UnconnectedUdpIgnoresPortUnreachable", "[core][sockets]") {
+    using namespace std::chrono_literals;
+    Network::NetworkInstance network_instance;
+    Network::Socket socket;
+    Network::Socket departed;
+    for (Network::Socket* each : {&socket, &departed}) {
+        REQUIRE(each->Initialize(Network::Domain::INET, Network::Type::DGRAM,
+                                 Network::Protocol::UDP) == Network::Errno::SUCCESS);
+        REQUIRE(each->Bind({Network::Domain::INET, {127, 0, 0, 1}, 0}) ==
+                Network::Errno::SUCCESS);
+    }
+    const auto [own_address, own_error] = socket.GetSockName();
+    const auto [departed_address, departed_error] = departed.GetSockName();
+    REQUIRE(own_error == Network::Errno::SUCCESS);
+    REQUIRE(departed_error == Network::Errno::SUCCESS);
+    REQUIRE(departed.Close() == Network::Errno::SUCCESS);
+
+    // The closed port answers with ICMP port unreachable, as a peer that left does.
+    const std::array<u8, 1> data{'x'};
+    REQUIRE(socket.SendTo(0, data, &departed_address).second == Network::Errno::SUCCESS);
+    std::this_thread::sleep_for(50ms);
+    std::array<u8, 1> buffer{};
+    CHECK(socket.RecvFrom(Network::FLAG_MSG_DONTWAIT, buffer, nullptr) ==
+          std::pair{-1, Network::Errno::AGAIN});
+
+    REQUIRE(socket.SendTo(0, data, &own_address).second == Network::Errno::SUCCESS);
+    REQUIRE(socket.SetRcvTimeo(2000) == Network::Errno::SUCCESS);
+    CHECK(socket.RecvFrom(0, buffer, nullptr) == std::pair{1, Network::Errno::SUCCESS});
 }

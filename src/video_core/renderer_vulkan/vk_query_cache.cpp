@@ -125,7 +125,6 @@ public:
             return;
         case VK_ERROR_DEVICE_LOST:
             device.ReportLoss();
-            [[fallthrough]];
         default:
             throw vk::Exception(query_result);
         }

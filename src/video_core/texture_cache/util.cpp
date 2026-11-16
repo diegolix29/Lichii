@@ -1541,6 +1541,16 @@ void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const Ima
     }
 }
 
+bool ScaledImageFits(const ImageInfo& info, const Settings::ResolutionScalingInfo& resolution,
+                     u32 max_extent) noexcept {
+    const auto [samples_x, samples_y] = SamplesLog2(info.num_samples);
+    const u32 width = resolution.ScaleUp(info.size.width) >> samples_x;
+    const u32 height =
+        (info.type == ImageType::e2D ? resolution.ScaleUp(info.size.height) : info.size.height) >>
+        samples_y;
+    return width <= max_extent && height <= max_extent;
+}
+
 bool IsBlockLinearSizeCompatible(const ImageInfo& lhs, const ImageInfo& rhs, u32 lhs_level,
                                  u32 rhs_level, bool strict_size) noexcept {
     ASSERT(lhs.type != ImageType::Linear);
@@ -1554,6 +1564,15 @@ bool IsBlockLinearSizeCompatible(const ImageInfo& lhs, const ImageInfo& rhs, u32
         const Extent3D rhs_size = BlockLinearAlignedSize(rhs, rhs_level);
         return lhs_size.width == rhs_size.width && lhs_size.height == rhs_size.height;
     }
+}
+
+bool IsPaddedSquare(const ImageInfo& info) noexcept {
+    if (info.type != ImageType::e2D || info.num_samples != 1 || info.size.width <= info.size.height) {
+        return false;
+    }
+    ImageInfo square = info;
+    square.size.width = info.size.height;
+    return IsBlockLinearSizeCompatible(info, square, 0, 0, false);
 }
 
 bool IsBlockLinearSizeCompatibleBPPRelaxed(const ImageInfo& lhs, const ImageInfo& rhs,

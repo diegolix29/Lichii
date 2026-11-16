@@ -285,6 +285,7 @@ void FrameDump::Arm(VideoCore::Nx2Debug::CaptureRequest request) {
     preview_jpeg = request.preview_jpeg;
     truncated = false;
     recorded_bytes = 0;
+    sampled_bytes = 0;
     written_bytes = 0;
     sequence = 0;
     images = 0;
@@ -423,16 +424,33 @@ std::optional<std::pair<GPUVAddr, u32>> SampledKey(const FrameDump::Sampled& tex
 bool FrameDump::RecordSampled(const Sampled& texture, u32 index, std::string name,
                               std::string tags) {
     tags += SamplerJson(texture.sampler);
-    if (const auto target = MakeTarget(*texture.view, index)) {
-        return Record(*target, std::move(name), std::move(tags));
-    }
     const Image& image = *texture.view->BackingImage();
-    const auto& info = image.info;
-    Enqueue({.tags = fmt::format(
-                 R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"depth":{},"type":{},"gpu_addr":"{:#x}","skipped":"format"}})",
-                 name, tags, info.format, info.size.width, info.size.height, info.size.depth,
-                 static_cast<u32>(info.type), image.gpu_addr)});
-    return false;
+    const auto skip = [&](std::string_view reason) {
+        const auto& info = image.info;
+        Enqueue({.tags = fmt::format(
+                     R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"depth":{},"type":{},"gpu_addr":"{:#x}","skipped":"{}"}})",
+                     name, tags, info.format, info.size.width, info.size.height, info.size.depth,
+                     static_cast<u32>(info.type), image.gpu_addr, reason)});
+        return false;
+    };
+    const auto target = MakeTarget(*texture.view, index);
+    if (!target) {
+        return skip("format");
+    }
+    // Sampled textures get at most half the cap, and none more than a sixteenth of it, so the
+    // pass targets after them still fit. Mario Kart World's first compute dispatches sample four
+    // terrain textures of 896 MiB together, which filled a bug bundle's 1 GiB before any view was
+    // drawn.
+    const size_t size =
+        size_t{target->width} * target->height * target->depth * TexelBytes(*target);
+    if (size > size_cap / 16 || sampled_bytes + size > size_cap / 2) {
+        return skip("size");
+    }
+    if (!Record(*target, std::move(name), std::move(tags))) {
+        return false;
+    }
+    sampled_bytes += size;
+    return true;
 }
 
 bool FrameDump::NoteSampled(std::span<const Sampled> textures) {

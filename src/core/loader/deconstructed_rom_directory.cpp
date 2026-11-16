@@ -609,4 +609,29 @@ ResultStatus AppLoader_DeconstructedRomDirectory::ReadNSOModules(Modules& out_mo
     return ResultStatus::Success;
 }
 
+ResultStatus AppLoader_DeconstructedRomDirectory::ReadMainBuildId(
+    Core::System& system, std::array<u8, 0x20>& build_id) {
+    auto exefs = dir ? dir : (file ? file->GetContainingDirectory() : nullptr);
+    if (!exefs) {
+        return ResultStatus::ErrorNoExeFS;
+    }
+    if (override_update) {
+        auto program_id = title_id;
+        if (const auto npdm = exefs->GetFile("main.npdm")) {
+            FileSys::ProgramMetadata program;
+            if (program.Load(npdm) == ResultStatus::Success) {
+                program_id = program.GetTitleID();
+            }
+        }
+        const FileSys::PatchManager manager(program_id, system.GetFileSystemController(),
+                                            system.GetContentProvider());
+        exefs = manager.PatchExeFS(exefs, apply_installed_update);
+    }
+    const auto main = exefs ? exefs->GetFile("main") : nullptr;
+    if (!main) {
+        return ResultStatus::ErrorNoExeFS;
+    }
+    return AppLoader_NSO(main).ReadMainBuildId(system, build_id);
+}
+
 } // namespace Loader

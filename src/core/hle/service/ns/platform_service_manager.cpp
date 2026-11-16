@@ -48,6 +48,37 @@ constexpr u32 EXPECTED_MAGIC{0x36f81a1e};  // What we expect the encrypted bfttf
 constexpr u64 SHARED_FONT_MEM_SIZE{0x1100000};
 constexpr FontRegion EMPTY_REGION{0, 0};
 
+// pl:u 2020 and the Nx font service's GetFontDataSet: u8 font types in, a 12-byte descriptor per
+// available font out, then a bool (any available) and the descriptor count.
+static void ReplyFontDataSet(HLERequestContext& ctx, std::span<const FontRegion> regions) {
+    struct Descriptor {
+        u32_le flags;
+        u32_le offset;
+        u32_le size;
+    };
+    static_assert(sizeof(Descriptor) == 12);
+    const auto types = ctx.CanReadBuffer() ? ctx.ReadBuffer() : std::span<const u8>{};
+    const auto capacity = ctx.CanWriteBuffer() ? ctx.GetWriteBufferNumElements<Descriptor>() : 0;
+    std::vector<Descriptor> descriptors;
+    for (const auto type : types) {
+        if (descriptors.size() == capacity) {
+            break;
+        }
+        if (type < regions.size() && regions[type].size != 0) {
+            descriptors.push_back({0, regions[type].offset, regions[type].size});
+        }
+    }
+    if (!descriptors.empty()) {
+        ctx.WriteBuffer(descriptors);
+    }
+    LOG_INFO(Service_NS, "Built-in font set: {} requested, {} available", types.size(),
+             descriptors.size());
+    IPC::ResponseBuilder rb{ctx, 4};
+    rb.Push(ResultSuccess);
+    rb.Push<u32>(descriptors.empty() ? 0 : 1);
+    rb.Push<u32>(static_cast<u32>(descriptors.size()));
+}
+
 /// The controller button icons of the Switch's extension font that Switch 2 titles look up in the
 /// standard font: the face buttons, the shoulder buttons, the sticks, the directions and the
 /// plus and minus buttons.
@@ -94,12 +125,19 @@ void EncryptSharedFont(const std::vector<u32>& input, std::vector<u8>& output, s
 
 class INx2FontService final : public ServiceFramework<INx2FontService> {
 public:
-    explicit INx2FontService(Core::System& system_, std::vector<FontRegion> regions_)
-        : ServiceFramework{system_, "nx2:pl:font"}, regions{std::move(regions_)} {
+    explicit INx2FontService(Core::System& system_, Kernel::KTransferMemory* memory_,
+                             std::vector<FontRegion> regions_)
+        : ServiceFramework{system_, "nx2:pl:font"}, memory{memory_}, regions{std::move(regions_)} {
+        memory->Open(kernel);
         static const FunctionInfo functions[] = {
             {0, &INx2FontService::GetFontData, "GetFontData"},
+            {1, &INx2FontService::GetFontDataSet, "GetFontDataSet"},
         };
         RegisterHandlers(functions);
+    }
+
+    ~INx2FontService() override {
+        memory->Close(kernel);
     }
 
 private:
@@ -118,6 +156,12 @@ private:
         rb.Push<u32>(region.size);
     }
 
+    void GetFontDataSet(HLERequestContext& ctx) {
+        ReplyFontDataSet(ctx, regions);
+    }
+
+    // The SDK closes its copy handle after OpenFont. Keep the transferred pages alive.
+    Kernel::KTransferMemory* memory;
     std::vector<FontRegion> regions;
 };
 
@@ -165,6 +209,7 @@ IPlatformServiceManager::IPlatformServiceManager(Core::System& system_, const ch
         {2100, &IPlatformServiceManager::RequestLoadNxFont, "RequestLoadNxFont"},
         {2000, &IPlatformServiceManager::GetBuiltInFontSharedMemory, "GetBuiltInFontSharedMemory (Switch 2)"},
         {2010, &IPlatformServiceManager::GetBuiltInFontData, "GetBuiltInFontData (Switch 2)"},
+        {2020, &IPlatformServiceManager::GetBuiltInFontDataSet, "GetBuiltInFontDataSet (Switch 2)"},
     };
     // clang-format on
     RegisterHandlers(functions);
@@ -284,7 +329,7 @@ void IPlatformServiceManager::RequestLoadNxFont(HLERequestContext& ctx) {
                                     impl->builtin_font_regions.end()};
     IPC::ResponseBuilder rb{ctx, 2, 0, 1};
     rb.Push(ResultSuccess);
-    rb.PushIpcInterface<INx2FontService>(ctx, system, std::move(regions));
+    rb.PushIpcInterface<INx2FontService>(ctx, system, transfer, std::move(regions));
 }
 
 // Switch 2: the shared memory GetBuiltInFontData offsets point into (copy handle, u32 size); the
@@ -324,6 +369,11 @@ void IPlatformServiceManager::GetBuiltInFontSharedMemory(HLERequestContext& ctx)
     rb.Push(ResultSuccess);
     rb.Push<u32>(impl->builtin_font_memory_size);
     rb.PushCopyObjects(ctx, *impl->builtin_font_memory);
+}
+
+// The SDK sends up to six font types.
+void IPlatformServiceManager::GetBuiltInFontDataSet(HLERequestContext& ctx) {
+    ReplyFontDataSet(ctx, impl->builtin_font_regions);
 }
 
 // nn::pl::GetBuiltInFontData(BuiltInFontDataOunce*, BuiltInFontTypeOunce, bool): returns a 16-byte

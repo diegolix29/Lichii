@@ -1529,12 +1529,13 @@ bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
     if (!cpu_dst_address) {
         return false;
     }
-    const bool dest_dirty = IsRegionRegistered(*cpu_dst_address, amount);
+    // amount counts words: the range is checked in bytes, as it is cleared.
+    const size_t size = amount * sizeof(u32);
+    const bool dest_dirty = IsRegionRegistered(*cpu_dst_address, size);
     if (!dest_dirty) {
         return false;
     }
 
-    const size_t size = amount * sizeof(u32);
     ClearDownload(*cpu_dst_address, size);
     gpu_modified_ranges.Subtract(*cpu_dst_address, size);
     NoteUniformWrite(*cpu_dst_address, size);
@@ -3440,7 +3441,7 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
             return Nx2ListRead::Unknown;
         }
         const auto current = [&](const Nx2ListPage& entry) {
-            return entry.copy && !entry.draw_written && entry.copy_writes == entry.writes &&
+            return entry.copy && entry.copy_writes == entry.writes &&
                    offset >= entry.copy_begin && offset + out.size() <= entry.copy_end;
         };
         u64 tick{};
@@ -3461,8 +3462,8 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
                 if (!past_sync) {
                     return Nx2ListRead::NeedsSync;
                 }
-                return entry.synced_writes == entry.writes ? Nx2ListRead::Synced
-                                                           : Nx2ListRead::Unknown;
+                // Past the sync the back noted every write the list can see: a copy made after
+                // the last of them holds the page, without a flush and Scheduler::Finish.
             }
             // Pages the CPU writes the lists of (GPU-written once, long before) stay synced.
             if (entry.synced_writes == entry.writes) {

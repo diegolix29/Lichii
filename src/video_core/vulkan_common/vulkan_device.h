@@ -20,6 +20,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/fsr4_support.h"
+#include "video_core/vulkan_common/descriptor_limits.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 #include <vulkan/vulkan_beta.h>
@@ -261,8 +262,10 @@ public:
     bool IsFormatSupported(VkFormat wanted_format, VkFormatFeatureFlags wanted_usage,
                            FormatType format_type) const;
 
-    /// Reports a device loss.
-    void ReportLoss() const;
+    /// Logs a device loss and what the driver knows about it, then ends the process. Nothing can
+    /// run on a lost device, and the vk::Exception a caller would throw ends it anyway, as an
+    /// unhandled exception on whichever thread saw the loss (#1934).
+    [[noreturn]] void ReportLoss() const;
 
     /// Logs what VK_EXT_device_fault reports about a device loss.
     void ReportDeviceFault() const;
@@ -459,6 +462,7 @@ public:
     FN_MAX_LIMIT_ELEM(DescriptorSetSampledImages) \
     FN_MAX_LIMIT_ELEM(DescriptorSetStorageImages) \
     FN_MAX_LIMIT_ELEM(DescriptorSetInputAttachments) \
+    FN_MAX_LIMIT_ELEM(ImageDimension2D) \
     FN_MAX_LIMIT_ELEM(FramebufferWidth) \
     FN_MAX_LIMIT_ELEM(FramebufferHeight) \
     FN_MAX_LIMIT_ELEM(FramebufferLayers)
@@ -600,6 +604,17 @@ FN_MAX_LIMIT_LIST
     /// Returns the maximum number of push descriptors.
     u32 MaxPushDescriptors() const {
         return properties.push_descriptor.maxPushDescriptors;
+    }
+
+    SampledDescriptorLimits CoreSampledLimits() const {
+        return CoreSampledDescriptorLimits(properties.properties.limits);
+    }
+
+    /// Returns the sampled descriptor limits of sets from update-after-bind pools, when they are
+    /// larger than the core limits.
+    std::optional<SampledDescriptorLimits> UpdateAfterBindSampledLimits() const {
+        return UpdateAfterBindSampledDescriptorLimits(properties.properties.limits,
+                                                      properties.descriptor_indexing);
     }
 
     /// Returns true if robust buffer access is enabled on the device.
@@ -1405,6 +1420,7 @@ private:
         VkPhysicalDeviceSubgroupProperties subgroup_properties{};
         VkPhysicalDeviceFloatControlsProperties float_controls{};
         VkPhysicalDevicePushDescriptorPropertiesKHR push_descriptor{};
+        VkPhysicalDeviceDescriptorIndexingProperties descriptor_indexing{};
         VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer{};
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_size_control{};
         VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback{};

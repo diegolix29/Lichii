@@ -281,6 +281,10 @@ bool ReactiveFlushing() {
     return values.use_reactive_flushing.GetValue() || values.force_reactive_flushing;
 }
 
+bool SkipCpuInnerInvalidation() {
+    return values.skip_cpu_inner_invalidation.GetValue() && !values.keep_cpu_inner_invalidation;
+}
+
 bool CurrentProgramIsSwitch2() {
     return current_program_is_switch2;
 }

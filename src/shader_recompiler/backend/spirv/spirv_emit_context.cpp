@@ -1092,8 +1092,16 @@ const EmitContext::GlobalMemoryFunctions& EmitContext::GlobalMemoryFunctionsOf(
 /// holding the address at run time.
 void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     const Info& info{program.info};
-    global_memory_functions.resize(program.global_memory_routes.size() + 1);
-    global_memory_route = program.global_memory_route;
+    // NVIDIA's Linux driver hangs the GPU (Xid 109) in the Ocarina programs of #619 when their
+    // accesses select among their own candidate buffers, and runs them when every access selects
+    // among all bound buffers. The candidate routes exist for ANV's compile time (#1756), and
+    // select_global_memory_buffer is on for the NVIDIA proprietary driver only.
+    if (!profile.select_global_memory_buffer) {
+        global_memory_functions.resize(program.global_memory_routes.size() + 1);
+        global_memory_route = program.global_memory_route;
+    } else {
+        global_memory_functions.resize(1);
+    }
     if (!info.uses_global_memory || !profile.support_int64) {
         return;
     }
@@ -1989,7 +1997,13 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         fswzadd_lut_b =
             ConstantComposite(F32[4], f32_minus_one, f32_minus_one, f32_one, f32_minus_one);
     }
-    if (loads[IR::Attribute::PrimitiveId]) {
+    if (loads[IR::Attribute::PrimitiveId] && stage == Stage::Fragment &&
+        runtime_info.primitive_id_location != ~0U) {
+        // Mesh emulation: the mesh program's PrimitiveId, from the vertex shader.
+        primitive_id = DefineInput(*this, U32[1], false);
+        Decorate(primitive_id, spv::Decoration::Location, runtime_info.primitive_id_location);
+        Decorate(primitive_id, spv::Decoration::Flat);
+    } else if (loads[IR::Attribute::PrimitiveId]) {
         primitive_id = DefineInput(*this, U32[1], false, spv::BuiltIn::PrimitiveId);
         if (stage == Stage::Fragment) {
             // A fragment PrimitiveId input requires Geometry (geometryShader is a required feature).
@@ -2101,6 +2115,10 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         }
         const bool is_integer = input_type == AttributeType::SignedInt ||
                                 input_type == AttributeType::UnsignedInt;
+        if (runtime_info.per_primitive_generics.test(index) && runtime_info.per_primitive_flat) {
+            Decorate(id, spv::Decoration::Flat);
+            continue;
+        }
         if (runtime_info.per_primitive_generics.test(index)) {
             // Written per primitive by a mesh program: constant over the primitive.
             AddExtension("SPV_EXT_mesh_shader");

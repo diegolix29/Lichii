@@ -1281,7 +1281,8 @@ bool ManualContentProvider::AddEntriesFromContainer(VirtualFile file, bool only_
     if (NupContainer::IsNupFile(file)) {
         // A NUP holds loose trees: its add-ons are served as decrypted add-on NCAs, newest
         // version per title (as in Eglantine-Community/Eglantine#724). Its updates are left to
-        // the NUP loader, which merges them into the program's RomFS.
+        // the NUP loader, which merges them into the program's RomFS. A Switch 2 Edition's
+        // add-ons can keep the Switch 1 application's ID (as in jpasqui/Eglantine#1).
         NupContainer nup{file};
         if (nup.GetStatus() != Loader::ResultStatus::Success) {
             return false;
@@ -1290,8 +1291,10 @@ bool ManualContentProvider::AddEntriesFromContainer(VirtualFile file, bool only_
         std::map<u64, std::size_t> newest;
         for (std::size_t i = 0; i < packages.size(); ++i) {
             const auto& package = packages[i];
+            const u64 base = GetBaseTitleID(package.title_id);
             if (package.kind != NupContainer::PackageKind::Addon ||
-                (base_program_id && GetBaseTitleID(package.title_id) != *base_program_id)) {
+                (base_program_id && base != GetBaseTitleID(*base_program_id) &&
+                 base != GetSwitch1ApplicationID(GetBaseTitleID(*base_program_id)))) {
                 continue;
             }
             const auto [it, inserted] = newest.try_emplace(package.title_id, i);

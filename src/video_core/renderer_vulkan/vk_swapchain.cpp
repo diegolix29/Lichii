@@ -274,7 +274,7 @@ bool Swapchain::Create(
     return true;
 }
 
-bool Swapchain::AcquireNextImage(bool may_flush) {
+bool Swapchain::AcquireNextImage(bool may_flush, u32 game_frame_presents) {
     const VkResult result = device.GetLogical().AcquireNextImageKHR(
         *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
         VK_NULL_HANDLE, &image_index);
@@ -299,22 +299,22 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
         return true;
     }
 
-    const auto wait_with_frame_pacing = [this, may_flush] {
+    const auto wait_with_frame_pacing = [this, may_flush, game_frame_presents] {
     switch (Settings::values.frame_pacing_mode.GetValue()) {
     case Settings::FramePacingMode::Target_Auto:
         scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);
         break;
     case Settings::FramePacingMode::Target_30:
-        scheduler.Wait(resource_ticks[image_index], 30.0, may_flush);
+        scheduler.Wait(resource_ticks[image_index], 30.0, may_flush, game_frame_presents);
         break;
     case Settings::FramePacingMode::Target_60:
-        scheduler.Wait(resource_ticks[image_index], 60.0, may_flush);
+        scheduler.Wait(resource_ticks[image_index], 60.0, may_flush, game_frame_presents);
         break;
     case Settings::FramePacingMode::Target_90:
-        scheduler.Wait(resource_ticks[image_index], 90.0, may_flush);
+        scheduler.Wait(resource_ticks[image_index], 90.0, may_flush, game_frame_presents);
         break;
     case Settings::FramePacingMode::Target_120:
-        scheduler.Wait(resource_ticks[image_index], 120.0, may_flush);
+        scheduler.Wait(resource_ticks[image_index], 120.0, may_flush, game_frame_presents);
         break;
     }
     };

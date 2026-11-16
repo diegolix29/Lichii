@@ -141,6 +141,7 @@ jobs:
         run: |
           python3 tools/nx2/test_cache_metrics.py
           python3 tools/nx2/test_cache_bench.py
+          python3 tools/nx2/test_cache_records.py
 
       - name: Test ThreadWorker wake-ups
         run: |

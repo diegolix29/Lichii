@@ -11,6 +11,7 @@
 #include <algorithm>
 #include "common/concepts.h"
 #include "common/fs/path_util.h"
+#include "common/hex_util.h"
 #include "common/logging.h"
 #include "common/string_util.h"
 #include "core/core.h"
@@ -380,6 +381,14 @@ ResultStatus AppLoader::ReadDisplayVersion(std::string& version) {
     }
     version = control.GetVersionString();
     return ResultStatus::Success;
+}
+
+std::optional<std::string> AppLoader::ReadMainBuildIdHex(Core::System& system) {
+    std::array<u8, 0x20> build_id{};
+    if (ReadMainBuildId(system, build_id) != ResultStatus::Success) {
+        return std::nullopt;
+    }
+    return Common::HexToString(build_id);
 }
 
 /**

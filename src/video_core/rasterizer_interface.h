@@ -240,7 +240,7 @@ public:
 
     virtual void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
         // The skip keeps the texture cache: software engine writes reach images only here.
-        const auto which = Settings::values.skip_cpu_inner_invalidation.GetValue()
+        const auto which = Settings::SkipCpuInnerInvalidation()
                                ? VideoCommon::CacheType::TextureCache
                                : VideoCommon::CacheType::All;
         for (const auto& [cpu_addr, size] : sequences) {

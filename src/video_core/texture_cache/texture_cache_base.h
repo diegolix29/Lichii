@@ -180,6 +180,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// (6.48 GB) and the collector deleted ~40 recently used images a frame again; images that
     /// do not fit add to the out-of-memory margin.
     u64 retention_limit{};
+    u64 retention_budget{}; ///< The lowest driver budget read lately (RetentionBudget)
     u64 logged_critical_memory{}; ///< The critical threshold of the last thresholds line logged
     u32 seen_pressure_events{};   ///< Allocator pressure events already answered
     u32 seen_failed_images{};     ///< Images the allocator could not make, already collected for
@@ -204,6 +205,10 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// Why the next DeleteImage happens, for EDEN_NX2_TC_TRACE: the collector (and its mode),
     /// an unmap or a join. Read and reset by DeleteImage.
     const char* trace_delete_reason = "other";
+    /// The collector's deleted image: its flags before UnregisterImage cleared BadOverlap, and
+    /// whether its contents were written back to guest memory. Read and reset by DeleteImage.
+    u32 trace_delete_flags{};
+    bool trace_delete_downloaded{};
     u64 scale_epoch{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
     bool debug_stats{}; ///< Collect what only the debug statistics lines use
@@ -370,6 +375,10 @@ public:
 
     [[nodiscard]] const RenderTargets& GetRenderTargets() const noexcept {
         return render_targets;
+    }
+
+    [[nodiscard]] Runtime& GetRuntime() noexcept {
+        return runtime;
     }
 
     /// Images created, deleted and created from overlapping ones (joins), invalidations of every
@@ -710,6 +719,8 @@ private:
     /// skip the upload of a new target the clear overwrites whole.
     bool clearing_render_targets = false;
     bool is_rescaling = false;
+    /// The bound depth target is wider than tall by padding only (see FindDepthBuffer).
+    bool depth_target_padded = false;
     u64 total_used_memory = 0;
     u64 minimum_memory;
     u64 expected_memory;
@@ -779,6 +790,11 @@ private:
 
     Common::ScratchBuffer<u8> swizzle_data_buffer;
     Common::ScratchBuffer<u8> unswizzle_data_buffer;
+    /// What the last CPU upload spent reading guest memory and untiling it, for EDEN_NX2_TC_TRACE.
+    struct {
+        double read_ms{};
+        double untile_ms{};
+    } upload_trace;
     Tegra::Texture::UnswizzleWorker unswizzle_worker;
 
     u64 modification_tick = 0;

@@ -74,8 +74,8 @@ size_t BytesPerIndex(VkIndexType index_type) {
     }
 }
 
-vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allocator, u64 size,
-                        VkDeviceSize sparse_alignment) {
+vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allocator,
+                        StagingBufferPool& staging_pool, u64 size, VkDeviceSize sparse_alignment) {
     VkBufferUsageFlags flags =
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
         VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
@@ -101,11 +101,26 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
-    if (sparse_alignment > 1) {
-        return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal, sparse_alignment);
-    }
-    return memory_allocator.CreateBuffer(
-        buffer_ci, device.IsMoltenVK() ? MemoryUsage::Stream : MemoryUsage::DeviceLocal);
+    // The staging pool holds most of the memory that can be freed now (#262: 926 MiB of an Intel
+    // UHD's 3.2 GB heap when a 128 KiB buffer had no room after a scene change).
+    return CreateAfterRecovery(
+        [&] {
+            if (sparse_alignment > 1) {
+                return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal,
+                                                     sparse_alignment);
+            }
+            return memory_allocator.CreateBuffer(
+                buffer_ci, device.IsMoltenVK() ? MemoryUsage::Stream : MemoryUsage::DeviceLocal);
+        },
+        [&] {
+            static u32 logged{};
+            if (logged++ < 32) {
+                LOG_WARNING(Render_Vulkan,
+                            "No memory for a {} byte buffer; freeing staging buffers and retrying",
+                            size);
+            }
+            staging_pool.ReleaseMemory();
+        });
 }
 } // Anonymous namespace
 
@@ -126,7 +141,7 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
                bool sparse_compatible_)
     : VideoCommon::BufferBase(cpu_addr_, size_bytes_), device{&runtime.device},
       scheduler{&runtime.scheduler},
-      buffer{CreateBuffer(*device, runtime.memory_allocator, SizeBytes(),
+      buffer{CreateBuffer(*device, runtime.memory_allocator, runtime.staging_pool, SizeBytes(),
                           runtime.SparseAlignmentFor(sparse_compatible_))},
       tracker{SizeBytes()} {
     sparse_compatible = sparse_compatible_;
@@ -416,8 +431,11 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
     limit_dynamic_storage_buffers = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
                                     driver_id == VK_DRIVER_ID_ARM_PROPRIETARY;
     if (limit_dynamic_storage_buffers) {
-        max_dynamic_storage_buffers = device.GetMaxDescriptorSetStorageBuffersDynamic();
-    }    
+        // Guest storage buffers are bound as plain VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, so the
+        // per-stage limit applies, not the much lower dynamic one (16 on Adreno 830, which left
+        // Ocarina of Time's compute shaders with half their buffers unbound).
+        max_dynamic_storage_buffers = device.GetMaxPerStageDescriptorStorageBuffers();
+    }
     if (device.SupportsUint8Indices()) {
         uint8_pass = std::make_unique<Uint8Pass>(device, scheduler, descriptor_pool, staging_pool,
                                                  compute_pass_descriptor_queue);
