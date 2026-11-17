@@ -9,6 +9,7 @@
 #include "common/fs/path_util.h"
 #include "core/crypto/key_manager.h"
 #include "frontend_common/firmware_manager.h"
+#include "tests/common/restore_eden_path.h"
 
 namespace {
 
@@ -25,7 +26,7 @@ public:
     }
 
     ~KeysDirectory() {
-        Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, original);
+        Tests::RestoreEdenPath(Common::FS::EdenPath::KeysDir, original);
         std::error_code error;
         std::filesystem::remove_all(root, error);
     }

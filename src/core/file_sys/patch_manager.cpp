@@ -681,6 +681,15 @@ std::vector<std::string> PatchManager::GetDisabledAddons() const {
         const auto& shared = Settings::values.disabled_addons[*parent_title_id];
         disabled.insert(disabled.end(), shared.begin(), shared.end());
     }
+    if (!Settings::values.online_service_redirect.GetValue()) {
+        if (const auto load_dir = GetModificationLoadRoot()) {
+            for (const auto& mod : load_dir->GetSubdirectories()) {
+                if (mod->GetName().starts_with(HostRedirectModPrefix)) {
+                    disabled.push_back(mod->GetName());
+                }
+            }
+        }
+    }
     return disabled;
 }
 
@@ -882,6 +891,12 @@ std::vector<VirtualFile> PatchManager::CollectPatches(const std::vector<VirtualD
     for (const auto& subdir : patch_dirs) {
         if (std::find(disabled.cbegin(), disabled.cend(), subdir->GetName()) != disabled.cend())
             continue;
+        if (subdir->GetName().starts_with(HostRedirectModPrefix)) {
+            LOG_WARNING(Loader,
+                        "Host redirect: loading mod \"{}\", which changes how the game checks "
+                        "the servers it connects to",
+                        subdir->GetName());
+        }
 
         auto exefs_dir = FindSubdirectoryCaseless(subdir, "exefs");
         if (exefs_dir != nullptr) {

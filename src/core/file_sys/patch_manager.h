@@ -33,6 +33,10 @@ class NACP;
 
 enum class PatchType { Update, DLC, Mod };
 
+// Mods whose folder name starts with this load only while the host redirect is on: patches the
+// user makes so a title trusts their test server's certificate and name.
+constexpr std::string_view HostRedirectModPrefix = "[Host redirect]";
+
 enum class PatchSource {
     Unknown,
     NAND,

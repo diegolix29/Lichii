@@ -111,6 +111,10 @@ public:
     void WriteUserSaveFile();
 
     void ResetUserSaveFile();
+    /// Whether the last load read the users from profiles.dat, rather than making the default one.
+    bool UserSaveFileRead() const {
+        return user_save_file_read;
+    }
 
     std::vector<Common::UUID> FindExistingProfileUUIDs();
     std::vector<std::string> FindExistingProfileStrings();
@@ -119,10 +123,13 @@ public:
 
 private:
     void ParseUserSaveFile();
+    /// Makes the default user when there is none, and opens the current user.
+    void OpenCurrentUser();
     std::optional<std::size_t> AddToProfiles(const ProfileInfo& profile);
     void RemoveAllProfiles();
 
     bool is_save_needed{};
+    bool user_save_file_read{};
     std::array<ProfileInfo, MAX_USERS> profiles{};
     std::array<ProfileInfo, MAX_USERS> stored_opened_profiles{};
     std::size_t user_count{};

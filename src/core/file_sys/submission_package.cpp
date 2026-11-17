@@ -25,6 +25,7 @@ namespace FileSys {
 NSP::NSP(VirtualFile file_, u64 title_id_, std::size_t program_index_)
     : file(std::move(file_)), expected_program_id(title_id_),
       program_index(program_index_), status{Loader::ResultStatus::Success},
+      nca_error{Loader::ResultStatus::ErrorNSPMissingProgramNCA},
       pfs(std::make_shared<PartitionFilesystem>(file)), keys{Core::Crypto::KeyManager::Instance()} {
     if (pfs->GetStatus() != Loader::ResultStatus::Success) {
         status = pfs->GetStatus();
@@ -57,8 +58,9 @@ NSP::~NSP() = default;
 VirtualFile NSP::GetNCAFileById(const std::array<u8, 16>& id) const {
     std::scoped_lock lock{resolved_nca_files_mutex};
     if (const auto found = resolved_nca_files.find(id); found != resolved_nca_files.end()) {
-        // A solid NCZ reader recovers from a full disk or decoder budget by itself, but stays
-        // failed after corrupt data or a source that changed size: reopen it.
+        // A solid NCZ reader recovers from a full disk or decoder budget by itself, but isn't
+        // readable until then, and stays failed after corrupt data or a source that changed
+        // size: reopen it.
         if (found->second->IsReadable()) {
             return found->second;
         }
@@ -88,7 +90,7 @@ Loader::ResultStatus NSP::GetProgramStatus() const {
 
     const auto iter = program_status.find(GetProgramTitleID());
     if (iter == program_status.end())
-        return Loader::ResultStatus::ErrorNSPMissingProgramNCA;
+        return program_status.empty() ? nca_error : Loader::ResultStatus::ErrorNSPMissingProgramNCA;
     return iter->second;
 }
 
@@ -258,8 +260,11 @@ void NSP::ReadNCAs(const std::vector<VirtualFile>& files) {
         }
 
         const auto nca = std::make_shared<NCA>(outer_file);
-        if (nca->GetStatus() != Loader::ResultStatus::Success || nca->GetSubdirectories().empty()) {
-            program_status[nca->GetTitleId()] = nca->GetStatus();
+        if (nca->GetStatus() != Loader::ResultStatus::Success) {
+            nca_error = nca->GetStatus();
+            continue;
+        }
+        if (nca->GetSubdirectories().empty()) {
             continue;
         }
 
@@ -291,14 +296,18 @@ void NSP::ReadNCAs(const std::vector<VirtualFile>& files) {
 
                 auto next_nca = std::make_shared<NCA>(std::move(next_file));
 
+                if (next_nca->GetStatus() != Loader::ResultStatus::Success &&
+                    next_nca->GetStatus() != Loader::ResultStatus::ErrorMissingBKTRBaseRomFS) {
+                    if (rec.type == ContentRecordType::Program) {
+                        program_status.try_emplace(cnmt.GetTitleID() + rec.id_offset,
+                                                   next_nca->GetStatus());
+                    }
+                    continue;
+                }
+
                 if (next_nca->GetType() == NCAContentType::Program) {
                     program_status[next_nca->GetTitleId()] = next_nca->GetStatus();
                     program_ids.insert(next_nca->GetTitleId() & 0xFFFFFFFFFFFFF000);
-                }
-
-                if (next_nca->GetStatus() != Loader::ResultStatus::Success &&
-                    next_nca->GetStatus() != Loader::ResultStatus::ErrorMissingBKTRBaseRomFS) {
-                    continue;
                 }
 
                 // If the last 3 hexadecimal digits of the CNMT TitleID is 0x800 or is missing the

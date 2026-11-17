@@ -711,6 +711,43 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     // Once FixProfiles has read the configured NAND and -u may have picked another user.
     Common::Nextendo::MigrateAccountFile(
         Service::Account::Nextendo::CurrentProfile(*QtCommon::system));
+    // A default user made for an unreadable profiles.dat would make every account an orphan.
+    auto& profile_manager = QtCommon::system->GetProfileManager();
+    auto orphans =
+        profile_manager.UserSaveFileRead()
+            ? Common::Nextendo::OrphanAccounts(profile_manager.FindExistingProfileUUIDs())
+            : std::vector<Common::UUID>{};
+    std::erase_if(orphans, [kept = Settings::values.nextendo_kept_accounts.GetValue()](
+                               const Common::UUID& profile) {
+        return kept.find(profile.FormattedString()) != std::string::npos;
+    });
+    if (!orphans.empty()) {
+        const auto answer = QMessageBox::question(
+            this, tr("Nextendo Sign-ins"),
+            tr("Lichii found Nextendo sign-ins for %n profile(s) this NAND doesn't have. Profiles "
+               "deleted in an older build left theirs behind.\n\nRemove and sign out those "
+               "sign-ins? Keep them if the profiles are in another NAND folder.",
+               "", static_cast<int>(orphans.size())));
+        if (answer == QMessageBox::Yes) {
+            for (const auto& profile : orphans) {
+                const auto account = Common::Nextendo::LoadAccount(profile);
+                Common::Nextendo::ClearAccount(profile);
+                if (account && !account->refresh_token.empty()) {
+                    void(QtConcurrent::run(
+                        [client_id = Settings::values.nextendo_client_id.GetValue(),
+                         token = account->refresh_token] {
+                            Common::Nextendo::RevokeToken(client_id, token);
+                        }));
+                }
+            }
+        } else {
+            std::string kept = Settings::values.nextendo_kept_accounts.GetValue();
+            for (const auto& profile : orphans) {
+                kept += fmt::format("{}{}", kept.empty() ? "" : ",", profile.FormattedString());
+            }
+            Settings::values.nextendo_kept_accounts = kept;
+        }
+    }
     nextendo_session_timer.start(std::chrono::minutes{2});
     KeepNextendoSessionAlive();
 

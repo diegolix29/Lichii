@@ -13,6 +13,7 @@
 #include "common/hex_util.h"
 #include "common/scope_exit.h"
 #include "core/crypto/key_manager.h"
+#include "tests/common/restore_eden_path.h"
 
 namespace {
 
@@ -65,7 +66,7 @@ TEST_CASE("A personalized ticket's title key is decrypted with the eticket RSA k
     const auto previous = Common::FS::GetEdenPath(Common::FS::EdenPath::KeysDir);
     Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, directory);
     SCOPE_EXIT {
-        Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, previous);
+        Tests::RestoreEdenPath(Common::FS::EdenPath::KeysDir, previous);
         std::filesystem::remove_all(directory);
     };
     keys.ReloadKeys();
@@ -111,7 +112,7 @@ TEST_CASE("A personalized ticket whose block holds no title key gives none", "[c
     const auto previous = Common::FS::GetEdenPath(Common::FS::EdenPath::KeysDir);
     Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, directory);
     SCOPE_EXIT {
-        Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, previous);
+        Tests::RestoreEdenPath(Common::FS::EdenPath::KeysDir, previous);
         std::filesystem::remove_all(directory);
     };
     keys.ReloadKeys();

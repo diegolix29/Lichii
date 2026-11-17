@@ -799,6 +799,40 @@ void ClearAccount(const Common::UUID& profile) {
     ClearAccountLocked(profile);
 }
 
+std::vector<Common::UUID> OrphanAccounts(std::span<const Common::UUID> profiles) {
+    std::vector<Common::UUID> orphans;
+    if (profiles.empty()) {
+        return orphans;
+    }
+    const auto is_formatted_uuid = [](std::string_view text) {
+        if (text.size() != 36) {
+            return false;
+        }
+        for (std::size_t i = 0; i < text.size(); ++i) {
+            const bool dash = i == 8 || i == 13 || i == 18 || i == 23;
+            if (dash ? text[i] != '-' : !std::isxdigit(static_cast<unsigned char>(text[i]))) {
+                return false;
+            }
+        }
+        return true;
+    };
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator{
+             FS::GetEdenPath(FS::EdenPath::ConfigDir) / "nextendo", ec}) {
+        const auto& path = entry.path();
+        const std::string stem = path.stem().string();
+        if (path.extension() != ".json" || !is_formatted_uuid(stem)) {
+            continue;
+        }
+        const Common::UUID profile{stem};
+        if (profile.IsValid() && AccountPath(profile) == path &&
+            std::ranges::find(profiles, profile) == profiles.end()) {
+            orphans.push_back(profile);
+        }
+    }
+    return orphans;
+}
+
 void MigrateAccountFile(const Common::UUID& profile) {
     if (profile.IsInvalid()) {
         return;

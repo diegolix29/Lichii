@@ -564,6 +564,21 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     if (!is_suitable)
         LOG_WARNING(Render_Vulkan, "Unsuitable driver - continuing anyways");
 
+    if (is_radv) {
+        // Mesa splits debug options on commas and spaces.
+        const char* const radv_debug = std::getenv("RADV_DEBUG");
+        std::string_view options{radv_debug ? radv_debug : ""};
+        while (!options.empty() && !radv_hang_report) {
+            const size_t end = (std::min)(options.find_first_of(", "), options.size());
+            radv_hang_report = options.substr(0, end) == "hang";
+            options.remove_prefix((std::min)(end + 1, options.size()));
+        }
+        if (radv_hang_report) {
+            LOG_INFO(Render_Vulkan, "RADV_DEBUG=hang: shaders carry their program hash, and a "
+                                    "device loss waits for RADV's GPU hang report");
+        }
+    }
+
     if (is_nvidia) {
         nvidia_arch = GetNvidiaArchitecture(physical, supported_extensions);
     }
@@ -1210,6 +1225,13 @@ void Device::ReportLoss() const {
     if (nsight_aftermath_tracker) {
         // Give Nsight Aftermath time to write its dump.
         std::this_thread::sleep_for(std::chrono::seconds{15});
+    }
+    if (radv_hang_report) {
+        // RADV writes the report on the thread whose submit hung, then aborts. Another thread
+        // that sees the loss first would end the process before the report is written.
+        LOG_CRITICAL(Render_Vulkan, "Waiting for RADV's GPU hang report in $HOME/radv_dumps_*");
+        Common::Log::Flush();
+        std::this_thread::sleep_for(std::chrono::seconds{60});
     }
     LOG_CRITICAL(Render_Vulkan, "Closing Lichii: the GPU driver lost the Vulkan device");
     Common::Log::Flush();

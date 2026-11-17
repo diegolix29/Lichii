@@ -515,6 +515,11 @@ public:
 
     u32 HostMipLevels() const noexcept;
 
+    /// The format a copy out of the host image yields: the guest format, or what a converted one
+    /// (ASTC re-compressed to BC1/BC3 or decoded to RGBA8, BCn decoded without host support) is
+    /// kept as.
+    [[nodiscard]] VideoCore::Surface::PixelFormat HostFormat() const;
+
     /// No memory was left to make it: the texture cache drops it instead of using it.
     [[nodiscard]] bool OutOfMemory() const noexcept {
         return !original_image && info.type != VideoCommon::ImageType::Buffer;

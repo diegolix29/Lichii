@@ -30,6 +30,7 @@
 #include "core/hle/service/glue/glue_manager.h"
 #include "core/hle/service/kernel_helpers.h"
 #include "core/hle/service/server_manager.h"
+#include "core/internal_network/local_redirect.h"
 #include "core/loader/loader.h"
 
 namespace Service::Account {
@@ -719,9 +720,18 @@ private:
     Kernel::KEvent* completion_event{};
 };
 
-// While Nextendo Network is on, answers with the id token of the profile's account.
+// Under the host redirect with loopback only, answers with a token Lichii makes for the profile.
+// Otherwise, while Nextendo Network is on, with the id token of the profile's account.
 static bool ReplyNextendoIdToken(Core::System& system, HLERequestContext& ctx,
                                  const Common::UUID& profile) {
+    if (Network::LocalRedirect::LoopbackOnly()) {
+        const std::size_t written =
+            Nextendo::WriteIdToken(ctx, Nextendo::BuildLocalIdToken(system, profile));
+        IPC::ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(static_cast<u32>(written));
+        return true;
+    }
     if (!Nextendo::LinkedAccount(profile)) {
         return false;
     }

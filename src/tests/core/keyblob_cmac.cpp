@@ -13,6 +13,7 @@
 #include "common/fs/path_util.h"
 #include "common/hex_util.h"
 #include "core/crypto/key_manager.h"
+#include "tests/common/restore_eden_path.h"
 
 namespace {
 
@@ -76,7 +77,7 @@ TEST_CASE("A console keyblob with a valid MAC is decrypted", "[core][crypto]") {
     Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, directory);
     keys.ReloadKeys();
     keys.DeriveBase();
-    Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, previous);
+    Tests::RestoreEdenPath(Common::FS::EdenPath::KeysDir, previous);
     std::filesystem::remove_all(directory);
 
     REQUIRE(keys.HasKey(S128KeyType::Package1, 0));

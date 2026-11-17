@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <future>
@@ -338,7 +339,7 @@ TEST_CASE("Solid NCZ cache IO faults invalidate cached prefixes", "[ncz]") {
     }
     REQUIRE(file->Read(out.data(), out.size(), Header + 0x200000) == 0);
     CHECK_FALSE(cache->IsOpen());
-    CHECK(file->IsReadable());
+    CHECK_FALSE(file->IsReadable());
     CHECK(file->Read(out.data(), out.size(), 0) == 0);
     CHECK(file->Read(out.data(), out.size(), Header) == 0);
 }
@@ -524,8 +525,9 @@ TEST_CASE("A solid NCZ reader recovers once a full disk or the decoder budget cl
         CHECK(gate->writes == writes);
         gate->full = false;
         std::this_thread::sleep_for(std::chrono::milliseconds{300});
-        CHECK(file->IsReadable());
+        CHECK_FALSE(file->IsReadable());
         CheckRead(file, fixture.expected, Header + 0x200000, 7);
+        CHECK(file->IsReadable());
         CheckRead(file, fixture.expected, Header, 7);
     }
 
@@ -572,10 +574,68 @@ TEST_CASE("A solid NCZ reader recovers once a full disk or the decoder budget cl
         for (auto& reader : decoding) {
             CHECK(reader.get() == out.size());
         }
-        CHECK(file->IsReadable());
+        CHECK_FALSE(file->IsReadable());
         CheckRead(file, fixture.expected, Header, 1);
+        CHECK(file->IsReadable());
         CheckRead(file, fixture.expected, fixture.expected.size() - 1000, 1000);
     }
+}
+
+TEST_CASE("A solid NCZ reader gives up on a header it cannot read or cache", "[ncz][resource]") {
+    struct Disk {
+        std::atomic<bool> full{};
+        std::atomic<std::size_t> writes{};
+    };
+    class DiskCache final : public Core::Crypto::NczCache {
+    public:
+        explicit DiskCache(std::shared_ptr<Disk> disk_) : disk(std::move(disk_)) {}
+        bool Write(std::span<const u8> bytes, u64 offset) override {
+            ++disk->writes;
+            return !disk->full && Core::Crypto::NczCache::Write(bytes, offset);
+        }
+
+    private:
+        std::shared_ptr<Disk> disk;
+    };
+    auto disk = std::make_shared<Disk>();
+    auto fixture = MakeSolid(0x300007);
+    const auto bytes = fixture.source->ReadAllBytes();
+    auto file = Core::Crypto::DecompressNCZ(fixture.source, "synthetic.nca",
+                                            std::make_unique<DiskCache>(disk));
+    REQUIRE(file);
+    CheckRead(file, fixture.expected, Header, 7);
+    disk->full = true;
+    std::array<u8, 7> out{};
+    REQUIRE(file->Read(out.data(), out.size(), Header + 0x200000) == 0);
+    // When the reader would try again if it hadn't given up.
+    std::chrono::milliseconds next_try{};
+
+    SECTION("cache that keeps refusing the header") {
+        // Each try waits out the backoff of the one before: 0, 250, 500 and 1000 ms.
+        for (const auto wait : {0, 300, 600, 1100}) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{wait});
+            const auto writes = disk->writes.load();
+            CHECK(file->Read(out.data(), out.size(), 0) == 0);
+            CHECK(disk->writes == writes + 1);
+        }
+        next_try = std::chrono::milliseconds{2100};
+    }
+    SECTION("source shorter than the header") {
+        disk->full = false;
+        fixture.source->Resize(Header / 2);
+        CHECK(file->Read(out.data(), out.size(), 0) == 0);
+        fixture.source->Assign(bytes);
+        next_try = std::chrono::milliseconds{300};
+    }
+    disk->full = false;
+    std::this_thread::sleep_for(next_try);
+    const auto writes = disk->writes.load();
+    CHECK_FALSE(file->IsReadable());
+    CHECK(file->Read(out.data(), out.size(), 0) == 0);
+    CHECK(disk->writes == writes);
+    auto reopened = Core::Crypto::DecompressNCZ(fixture.source, "synthetic.nca");
+    REQUIRE(reopened);
+    CheckRead(reopened, fixture.expected, Header + 0x200000, 7);
 }
 
 #ifdef _WIN32

@@ -11,6 +11,7 @@
 #include <map>
 #include <mutex>
 #include <random>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -25,6 +26,8 @@
 #include "common/nextendo.h"
 #include "common/nextendo_game_catalog.h"
 #include "common/settings.h"
+#include "core/hle/service/acc/profile_manager.h"
+#include "tests/common/restore_eden_path.h"
 
 namespace Nextendo = Common::Nextendo;
 
@@ -219,8 +222,8 @@ public:
         Nextendo::ClearAccount(Profile);
         Nextendo::ClearAccount(OtherProfile);
         Nextendo::SetApiBaseForTests(std::string{Nextendo::ApiBase});
-        Common::FS::SetEdenPath(Common::FS::EdenPath::ConfigDir, previous_config);
-        Common::FS::SetEdenPath(Common::FS::EdenPath::CacheDir, previous_cache);
+        Tests::RestoreEdenPath(Common::FS::EdenPath::ConfigDir, previous_config);
+        Tests::RestoreEdenPath(Common::FS::EdenPath::CacheDir, previous_cache);
         std::error_code ec;
         std::filesystem::remove_all(directory, ec);
     }
@@ -1035,6 +1038,51 @@ TEST_CASE("Nextendo: each profile keeps its own account", "[common]") {
     REQUIRE_FALSE(Nextendo::LoadAccount(OtherProfile).has_value());
     REQUIRE(Nextendo::LoadAccount(Profile)->refresh_token == "refresh.old");
     REQUIRE(Nextendo::CachedFriends(Profile).friends.size() == 2);
+}
+
+TEST_CASE("Nextendo: deleting a profile removes its account", "[common]") {
+    FakeNextendo fake;
+    const auto config = Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir);
+    struct NandInConfig {
+        std::filesystem::path previous = Common::FS::GetEdenPath(Common::FS::EdenPath::NANDDir);
+        explicit NandInConfig(const std::filesystem::path& config) {
+            Common::FS::SetEdenPath(Common::FS::EdenPath::NANDDir, config);
+        }
+        ~NandInConfig() {
+            Tests::RestoreEdenPath(Common::FS::EdenPath::NANDDir, previous);
+        }
+    } nand{config};
+
+    Service::Account::ProfileManager manager;
+    REQUIRE(manager.CreateNewUser(Profile, "one").IsSuccess());
+    REQUIRE(manager.CreateNewUser(OtherProfile, "two").IsSuccess());
+    Nextendo::SaveAccount(Profile, SocialSignedIn());
+    Nextendo::SaveAccount(OtherProfile, OtherSignedIn());
+
+    REQUIRE(manager.RemoveUser(OtherProfile));
+    REQUIRE_FALSE(std::filesystem::exists(
+        config / "nextendo" / fmt::format("{}.json", OtherProfile.FormattedString())));
+    REQUIRE_FALSE(Nextendo::LoadAccount(OtherProfile).has_value());
+    REQUIRE(Nextendo::LoadAccount(Profile)->refresh_token == "refresh.old");
+}
+
+TEST_CASE("Nextendo: accounts of profiles the NAND doesn't have are found", "[common]") {
+    FakeNextendo fake;
+    const auto directory = Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "nextendo";
+    Nextendo::SaveAccount(Profile, SocialSignedIn());
+    Nextendo::SaveAccount(OtherProfile, OtherSignedIn());
+    for (const char* name : {"zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz.json", "not-a-profile.json",
+                             "00000000-0000-0000-0000-000000000001.json.tmp"}) {
+        std::ofstream{directory / name} << "{}";
+    }
+
+    REQUIRE(Nextendo::OrphanAccounts(std::span<const Common::UUID>{}).empty());
+    const std::array kept{Profile};
+    REQUIRE(Nextendo::OrphanAccounts(kept) == std::vector<Common::UUID>{OtherProfile});
+    REQUIRE(std::filesystem::exists(
+        directory / fmt::format("{}.json", OtherProfile.FormattedString())));
+    const std::array both{Profile, OtherProfile};
+    REQUIRE(Nextendo::OrphanAccounts(both).empty());
 }
 
 TEST_CASE("Nextendo: the heartbeat runs for the profile in use only", "[common]") {

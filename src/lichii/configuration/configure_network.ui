@@ -88,7 +88,7 @@
         <item row="2" column="1" colspan="2">
          <widget class="QLineEdit" name="redirect_hosts">
           <property name="toolTip">
-           <string>Comma-separated host names, for example a.example, b.example. Each also covers its subdomains.</string>
+           <string>Host names separated by commas or spaces, for example *.a.example b.example. Each also covers its subdomains.</string>
           </property>
          </widget>
         </item>
@@ -130,7 +130,7 @@
         <item row="5" column="0" colspan="3">
          <widget class="QCheckBox" name="redirect_loopback_only">
           <property name="toolTip">
-           <string>Other host names don't resolve, and games can reach only this PC and the server address. Multiplayer rooms are not affected.</string>
+           <string>Other host names don't resolve, and games can reach only this PC and the server address. Games get an id token Lichii makes for the current user instead of their Nextendo one. Multiplayer rooms are not affected.</string>
           </property>
           <property name="text">
            <string>Block all other network access</string>

@@ -807,9 +807,16 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 emit(base(0x5c10000000000000ULL) | (u64{c} << 8) | (u64{250} << 20));
                 break;
             }
-            if ((insn.words[2] & ~0x2ffU) != 0x078e0000 || (insn.words[1] & ~0xffU))
+            if ((insn.words[2] & ~0xaffU) != 0x078e0000 || (insn.words[1] & ~0xffU))
                 return fail(index, "native integer register multiply mode");
-            multiply_low(insn.Bits(24, 8), insn.Bits(32, 8), insn.Bits(64, 8), false);
+            // Bit 75 negates the addend, as in the immediate form (0x824).
+            u32 c = insn.Bits(64, 8);
+            if (insn.Bits(75, 1) && c != 255) {
+                emit(0x5c10000000000000ULL | predicate | 252 | (u64{255} << 8) | (u64{c} << 20) |
+                     (u64{1} << 48));
+                c = 252;
+            }
+            multiply_low(insn.Bits(24, 8), insn.Bits(32, 8), c, false);
             break;
         }
         case 0x2a5: { // UIMAD.WIDE.U32 UR(d):UR(d+1) = URa * URb + URc:UR(c+1)
@@ -3993,8 +4000,15 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const bool write = opcode == 0x927;
             const u32 region = insn.Bits(76, 2);
             const bool output = insn.Bits(79, 1) != 0;
-            if ((insn.words[2] & ~0xf800U) != 0 || (region != 0 && region != 3) || write != output ||
-                (!write && region != 3) || (!write && dest == 255))
+            // A read with .O takes back a 32-bit word of the output attribute region: Nintendo
+            // Switch Sports Resort's Power Cruising water has ISBERD.ATTR.32.O (#1043, #2066).
+            // .SKEW packs attributes into 32-value lines; ISBE_nx2 does not model that for reads of
+            // the output region, so such a read stays rejected. That program has it off.
+            const bool output_read =
+                !write && output && insn.Bits(75, 1) != 0 && insn.Bits(78, 1) == 0;
+            if ((insn.words[2] & ~0xf800U) != 0 || (region != 0 && region != 3) ||
+                (write != output && !output_read) || (!write && region != 3) ||
+                (!write && dest == 255))
                 return fail(index, "native stage buffer access mode");
             emit(0xefc0000000000000ULL | predicate | (write ? u64{insn.Bits(32, 8)} : dest) |
                  (u64{insn.Bits(24, 8)} << 8) | (u64{insn.Bits(40, 24)} << 20) |

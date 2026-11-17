@@ -1105,6 +1105,9 @@ struct Values {
                                         Category::Network};
     Setting<std::string> nextendo_client_id{linkage, "nxc_eHeSgpYwMkFV", "nextendo_client_id",
                                            Category::Network};
+    // Profiles missing from the NAND whose Nextendo sign-ins the user chose to keep, comma-separated.
+    Setting<std::string> nextendo_kept_accounts{linkage, std::string(), "nextendo_kept_accounts",
+                                                Category::Network};
     // Host redirect to a server the user runs (core/internal_network/local_redirect.h). Off: the
     // online_redirect_* values are ignored.
     Setting<bool> online_service_redirect{linkage, false, "online_service_redirect",

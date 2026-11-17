@@ -14,6 +14,7 @@
 #include "common/settings.h"
 #include "frontend_common/config.h"
 #include "frontend_common/recommended_settings.h"
+#include "tests/common/restore_eden_path.h"
 
 namespace {
 
@@ -72,7 +73,7 @@ public:
     }
 
     ~ConfigDirectory() {
-        Common::FS::SetEdenPath(Common::FS::EdenPath::ConfigDir, original);
+        Tests::RestoreEdenPath(Common::FS::EdenPath::ConfigDir, original);
         std::error_code error;
         std::filesystem::remove_all(path, error);
     }

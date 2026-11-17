@@ -6,6 +6,9 @@
 
 #include <chrono>
 #include <cstring>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include <fmt/format.h>
@@ -97,6 +100,53 @@ bool NeedsAppId(u64 program_id) {
     }
 }
 
+// The claims a title reads from its BAAS id_token, signed with the session key. nnex carries the
+// Nextendo account's nx2 token, and is left out of tokens Lichii makes for the user's own server.
+std::string SignedIdToken(const std::string& sub, const std::optional<std::string>& nnex,
+                          u64 program_id, std::string_view version) {
+    static const std::string device_id = RandomHex(0x10);
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+
+    const nlohmann::ordered_json header{
+        {"alg", "RS256"}, {"kid", BaasKeyId}, {"typ", "id_token"}, {"jku", BaasJku}};
+    nlohmann::ordered_json payload{
+        {"sub", sub},
+        {"aud", BaasAudience},
+        {"iss", BaasIssuer},
+        {"typ", "id_token"},
+        {"iat", now},
+        {"exp", now + 3 * 60 * 60},
+        {"jku", BaasJku},
+        {"jti", Common::UUID::MakeRandom().FormattedString()},
+        {"di", device_id},
+        {"sn", "XAW10000000000"},
+        {"bs:did", RandomHex(0x10)},
+        // nnAccount rejects a token without the device claims (Ryujinx-Nextendo, citron-nextendo).
+        {"nintendo",
+         {{"dt", "NX Prod 1"}, {"pc", "HAC"}, {"di", device_id}, {"sn", "XAW10000000000"},
+          {"ist", false}}},
+    };
+    if (nnex) {
+        payload["nnex"] = *nnex;
+    }
+    if (!version.empty()) {
+        payload["tv"] = version;
+    }
+    if (NeedsAppId(program_id)) {
+        payload["app_id"] = fmt::format("{:016X}", program_id);
+    }
+    payload["hm"] = true;
+
+    const std::string input = Base64Url(header.dump()) + "." + Base64Url(payload.dump());
+    const std::string signature = SignRs256(input);
+    if (signature.empty()) {
+        LOG_ERROR(Service_ACC, "Could not sign the Nextendo id token");
+    }
+    return input + "." + signature;
+}
+
 } // namespace
 
 Common::UUID CurrentProfile(const Core::System& system) {
@@ -113,52 +163,26 @@ std::optional<Common::Nextendo::Account> LinkedAccount(const Common::UUID& profi
 }
 
 std::string BuildIdToken(Core::System& system, const Common::Nextendo::Account& account) {
-    static const std::string device_id = RandomHex(0x10);
     const u64 program_id = system.GetApplicationProcessProgramID();
-    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
-
-    const nlohmann::ordered_json header{
-        {"alg", "RS256"}, {"kid", BaasKeyId}, {"typ", "id_token"}, {"jku", BaasJku}};
-    nlohmann::ordered_json payload{
-        {"sub", RandomHex(0x10)},
-        {"aud", BaasAudience},
-        {"iss", BaasIssuer},
-        {"typ", "id_token"},
-        {"iat", now},
-        {"exp", now + 3 * 60 * 60},
-        {"jku", BaasJku},
-        {"jti", Common::UUID::MakeRandom().FormattedString()},
-        {"di", device_id},
-        {"sn", "XAW10000000000"},
-        {"bs:did", RandomHex(0x10)},
-        // nnAccount rejects a token without the device claims (Ryujinx-Nextendo, citron-nextendo).
-        {"nintendo",
-         {{"dt", "NX Prod 1"}, {"pc", "HAC"}, {"di", device_id}, {"sn", "XAW10000000000"},
-          {"ist", false}}},
-    };
+    std::optional<std::string> nnex;
     if (!account.nex_token.empty()) {
-        payload["nnex"] = account.nex_token;
-    }
-    if (const std::string version = InstalledVersion(system, program_id); !version.empty()) {
-        payload["tv"] = version;
-    }
-    if (NeedsAppId(program_id)) {
-        payload["app_id"] = fmt::format("{:016X}", program_id);
-    }
-    payload["hm"] = true;
-
-    const std::string input = Base64Url(header.dump()) + "." + Base64Url(payload.dump());
-    const std::string signature = SignRs256(input);
-    if (signature.empty()) {
-        LOG_ERROR(Service_ACC, "Could not sign the Nextendo id token");
-    }
-    if (account.nex_token.empty()) {
+        nnex = account.nex_token;
+    } else {
         LOG_WARNING(Service_ACC, "Nextendo: no nex_token for this account, the game server "
                                  "will refuse the login");
     }
-    return input + "." + signature;
+    return SignedIdToken(RandomHex(0x10), nnex, program_id,
+                         InstalledVersion(system, program_id));
+}
+
+std::string BuildLocalIdToken(Core::System& system, const Common::UUID& profile) {
+    const u64 program_id = system.GetApplicationProcessProgramID();
+    return BuildLocalIdToken(profile, program_id, InstalledVersion(system, program_id));
+}
+
+std::string BuildLocalIdToken(const Common::UUID& profile, u64 program_id,
+                              std::string_view version) {
+    return SignedIdToken(profile.RawString(), std::nullopt, program_id, version);
 }
 
 std::size_t WriteIdToken(HLERequestContext& ctx, std::string_view token) {

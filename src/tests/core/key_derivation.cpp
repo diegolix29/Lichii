@@ -11,6 +11,7 @@
 #include "common/hex_util.h"
 #include "core/crypto/aes_util.h"
 #include "core/crypto/key_manager.h"
+#include "tests/common/restore_eden_path.h"
 
 namespace {
 
@@ -56,7 +57,7 @@ TEST_CASE("Keys of a generation the key file lacks are derived from its sources"
     const auto previous = Common::FS::GetEdenPath(Common::FS::EdenPath::KeysDir);
     Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, directory);
     keys.ReloadKeys();
-    Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, previous);
+    Tests::RestoreEdenPath(Common::FS::EdenPath::KeysDir, previous);
 
     const auto master = Decrypt(Decrypt(Fill(2), Fill(3)), Fill(1));
     CHECK(keys.GetKey(S128KeyType::Master, 0x1F) == master);
@@ -86,7 +87,7 @@ TEST_CASE("Keyblob lines past the keyblob table are skipped", "[core][crypto]") 
     const auto previous = Common::FS::GetEdenPath(Common::FS::EdenPath::KeysDir);
     Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, directory);
     keys.ReloadKeys();
-    Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, previous);
+    Tests::RestoreEdenPath(Common::FS::EdenPath::KeysDir, previous);
 
     CHECK(keys.GetKey(S128KeyType::Source, u64(SourceKeyType::Titlekek)) == titlekek_source);
 

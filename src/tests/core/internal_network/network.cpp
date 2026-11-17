@@ -2,13 +2,21 @@
 
 #include <array>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <future>
+#include <iterator>
+#include <string>
 #include <thread>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "common/fs/path_util.h"
+#include "common/logging.h"
+#include "common/scope_exit.h"
 #include "core/internal_network/network.h"
 #include "core/internal_network/sockets.h"
+#include "tests/common/restore_eden_path.h"
 
 TEST_CASE("Network::Errors", "[core]") {
     Network::NetworkInstance network_instance; // initialize network
@@ -141,4 +149,50 @@ TEST_CASE("Network::UnconnectedUdpIgnoresPortUnreachable", "[core][sockets]") {
     REQUIRE(socket.SendTo(0, data, &own_address).second == Network::Errno::SUCCESS);
     REQUIRE(socket.SetRcvTimeo(2000) == Network::Errno::SUCCESS);
     CHECK(socket.RecvFrom(0, buffer, nullptr) == std::pair{1, Network::Errno::SUCCESS});
+}
+
+TEST_CASE("Network::DefaultProtocol", "[core][sockets]") {
+    using namespace std::chrono_literals;
+    namespace fs = std::filesystem;
+    // Protocol 0 (IP) asks the host for its default protocol: Ocarina of Time's boot probe opens
+    // an INET6 datagram socket with it. Outside FreeBSD it reached 0 only through the
+    // unimplemented path, which logged a critical line at every boot.
+    Network::NetworkInstance network_instance;
+    const auto stamp = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto original = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir);
+    const fs::path dir = fs::temp_directory_path() / ("lichii-protocol-ip-test-" + stamp);
+    REQUIRE(fs::create_directories(dir));
+    Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir, dir);
+    SCOPE_EXIT {
+        Tests::RestoreEdenPath(Common::FS::EdenPath::LogDir, original);
+    };
+    Common::Log::Initialize(); // keeps the backend another test made
+    Common::Log::Start();
+
+    const std::string begin = "protocol ip begin " + stamp;
+    const std::string end = "protocol ip end " + stamp;
+    LOG_INFO(Network, "{}", begin);
+    Network::Socket v4;
+    CHECK(v4.Initialize(Network::Domain::INET, Network::Type::DGRAM, Network::Protocol::IP) ==
+          Network::Errno::SUCCESS);
+    // A host without IPv6 refuses the socket itself; only the translation is checked then.
+    Network::Socket v6;
+    const bool has_v6 = v6.Initialize(Network::Domain::INET6, Network::Type::DGRAM,
+                                      Network::Protocol::IP) == Network::Errno::SUCCESS;
+    INFO("host IPv6 socket: " << has_v6);
+    LOG_INFO(Network, "{}", end);
+
+    std::string logged;
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (logged.find(end) == std::string::npos && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(50ms);
+        Common::Log::Flush();
+        std::ifstream in{Common::Log::FilePath(), std::ios::binary};
+        logged.assign(std::istreambuf_iterator<char>{in}, {});
+    }
+    const auto from = logged.find(begin);
+    const auto to = logged.find(end);
+    REQUIRE(from != std::string::npos);
+    REQUIRE(to != std::string::npos);
+    CHECK(logged.substr(from, to - from).find("Unimplemented protocol") == std::string::npos);
 }

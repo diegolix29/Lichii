@@ -121,18 +121,28 @@ bool IsLoopback(const SockAddrIn& address) {
 
 } // Anonymous namespace
 
+std::vector<std::string> ParseHosts(std::string_view text) {
+    std::vector<std::string> hosts;
+    while (!text.empty()) {
+        const size_t end = text.find_first_of(", \t\r\n");
+        std::string host = Normalize(text.substr(0, end));
+        if (host.starts_with("*.")) {
+            host.erase(0, 2);
+        }
+        // A wildcard anywhere else, or on its own, names no host.
+        if (!host.empty() && host.find('*') == std::string::npos &&
+            std::ranges::find(hosts, host) == hosts.end()) {
+            hosts.push_back(std::move(host));
+        }
+        text = end == std::string_view::npos ? std::string_view{} : text.substr(end + 1);
+    }
+    return hosts;
+}
+
 void Configure() {
     auto config = std::make_shared<Config>();
     if (Settings::values.online_service_redirect.GetValue()) {
-        std::string_view rest{Settings::values.online_redirect_hosts.GetValue()};
-        while (!rest.empty()) {
-            const size_t comma = rest.find(',');
-            std::string host = Normalize(rest.substr(0, comma));
-            if (!host.empty()) {
-                config->hosts.push_back(std::move(host));
-            }
-            rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
-        }
+        config->hosts = ParseHosts(Settings::values.online_redirect_hosts.GetValue());
         if (const auto& text = Settings::values.online_redirect_server.GetValue(); !text.empty()) {
             config->server = ParseServer(text);
             if (!config->server) {

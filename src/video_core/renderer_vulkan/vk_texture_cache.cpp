@@ -3729,6 +3729,39 @@ u32 Image::HostMipLevels() const noexcept {
     return HostMipCount(info) - host_level_offset;
 }
 
+PixelFormat Image::HostFormat() const {
+    if (False(flags & ImageFlagBits::Converted)) {
+        return info.format;
+    }
+    const bool srgb = IsPixelFormatSRGB(info.format);
+    switch (AstcHostFormat(runtime->device, info)
+                .value_or(MaxwellToVK::SurfaceFormat(runtime->device, FormatType::Optimal, false,
+                                                     info.format)
+                              .format)) {
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+        return srgb ? PixelFormat::BC1_RGBA_SRGB : PixelFormat::BC1_RGBA_UNORM;
+    case VK_FORMAT_BC3_UNORM_BLOCK:
+    case VK_FORMAT_BC3_SRGB_BLOCK:
+        return srgb ? PixelFormat::BC3_SRGB : PixelFormat::BC3_UNORM;
+    case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
+    case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+        return srgb ? PixelFormat::A8B8G8R8_SRGB : PixelFormat::A8B8G8R8_UNORM;
+    case VK_FORMAT_R8_UNORM:
+        return PixelFormat::R8_UNORM;
+    case VK_FORMAT_R8_SNORM:
+        return PixelFormat::R8_SNORM;
+    case VK_FORMAT_R8G8_UNORM:
+        return PixelFormat::R8G8_UNORM;
+    case VK_FORMAT_R8G8_SNORM:
+        return PixelFormat::R8G8_SNORM;
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+        return PixelFormat::R16G16B16A16_FLOAT;
+    default:
+        return PixelFormat::Invalid;
+    }
+}
+
 VkImageView Image::StorageImageView(s32 level) noexcept {
     auto& view = storage_image_views[level];
     if (!view) {

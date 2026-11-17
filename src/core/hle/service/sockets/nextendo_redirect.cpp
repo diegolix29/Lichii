@@ -293,7 +293,9 @@ std::optional<Network::SockAddrIn> RouteGamesync(u64 program_id, Network::SockAd
     constexpr u16 GamesyncPort = 7575;
     constexpr u16 NextendoGamesyncPort = 8463;
     constexpr std::array PokemonScarletViolet{0x0100A3D008C5C000ULL, 0x01008F6008C5E000ULL};
-    if (!Common::Nextendo::OnlinePlayActive() || address.portno != GamesyncPort ||
+    // An IPv6 address keeps `ip` zero, which the check below reads as "any": only IPv4 is routed.
+    if (!Common::Nextendo::OnlinePlayActive() || address.family != Network::Domain::INET ||
+        address.portno != GamesyncPort ||
         std::ranges::find(PokemonScarletViolet, program_id) == PokemonScarletViolet.end()) {
         return std::nullopt;
     }

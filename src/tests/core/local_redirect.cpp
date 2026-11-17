@@ -4,12 +4,19 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <string>
 #include <variant>
 #include <vector>
 
+#include <algorithm>
+
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
+#include <openssl/evp.h>
 
 #include "common/settings.h"
+#include "common/uuid.h"
+#include "core/hle/service/acc/nextendo_id_token.h"
 #include "core/internal_network/local_redirect.h"
 #include "core/internal_network/network.h"
 
@@ -144,6 +151,55 @@ TEST_CASE("LocalRedirect: host names map to the user's server", "[core]") {
 
     ResetRedirectSettings();
     REQUIRE_FALSE(LocalRedirect::Matches("a.example"));
+}
+
+TEST_CASE("LocalRedirect: several hosts, separated by commas or whitespace", "[core]") {
+    REQUIRE(LocalRedirect::ParseHosts("").empty());
+    REQUIRE(LocalRedirect::ParseHosts(" *.LP1.t.npln.srv.nintendo.net,\tgamesync.npln.nintendo.net."
+                                      "\n a.example  a.example, *.") ==
+            std::vector<std::string>{"lp1.t.npln.srv.nintendo.net", "gamesync.npln.nintendo.net",
+                                     "a.example"});
+
+    ResetRedirectSettings();
+    Settings::values.online_service_redirect = true;
+    Settings::values.online_redirect_hosts =
+        "*.lp1.t.npln.srv.nintendo.net gamesync.npln.nintendo.net";
+    LocalRedirect::Configure();
+    REQUIRE(LocalRedirect::Matches("lp1.t.npln.srv.nintendo.net"));
+    REQUIRE(LocalRedirect::Matches("g1234.lp1.t.npln.srv.nintendo.net"));
+    REQUIRE(LocalRedirect::Matches("gamesync.npln.nintendo.net"));
+    REQUIRE(LocalRedirect::Matches("eu.gamesync.npln.nintendo.net"));
+    REQUIRE_FALSE(LocalRedirect::Matches("npln.nintendo.net"));
+    REQUIRE_FALSE(LocalRedirect::Matches("t.npln.srv.nintendo.net"));
+    ResetRedirectSettings();
+}
+
+TEST_CASE("LocalRedirect: the local id token names the profile and no Nextendo account",
+          "[core]") {
+    const auto profile = Common::UUID::MakeRandomWithSeed(7);
+    const std::string token =
+        Service::Account::Nextendo::BuildLocalIdToken(profile, 0x0100A3D008C5C000ULL, "1.2.3");
+    const size_t first = token.find('.');
+    const size_t second = token.find('.', first + 1);
+    REQUIRE(second != std::string::npos);
+    REQUIRE(second + 1 < token.size());
+
+    std::string payload = token.substr(first + 1, second - first - 1);
+    std::ranges::replace(payload, '-', '+');
+    std::ranges::replace(payload, '_', '/');
+    payload.append((4 - payload.size() % 4) % 4, '=');
+    std::vector<unsigned char> decoded(payload.size());
+    const int length =
+        EVP_DecodeBlock(decoded.data(), reinterpret_cast<const unsigned char*>(payload.data()),
+                        static_cast<int>(payload.size()));
+    REQUIRE(length > 0);
+    const std::string json(reinterpret_cast<const char*>(decoded.data()),
+                           static_cast<size_t>(length) - std::ranges::count(payload, '='));
+    const auto claims = nlohmann::json::parse(json);
+    REQUIRE(claims.at("sub") == profile.RawString());
+    REQUIRE(claims.at("tv") == "1.2.3");
+    REQUIRE(claims.at("app_id") == "0100A3D008C5C000");
+    REQUIRE_FALSE(claims.contains("nnex"));
 }
 
 TEST_CASE("LocalRedirect: malformed server and CA certificates are ignored", "[core]") {

@@ -12,6 +12,7 @@ add_executable(tests
     video_core/block_linear_swizzle.cpp
     video_core/aftermath_dump.cpp
     video_core/frame_dump_schedule.cpp
+    video_core/frame_dump_decode.cpp
     video_core/frame_gen_generations.cpp
     video_core/frame_pacer.cpp
     video_core/nx2_stutter_trace.cpp
@@ -37,10 +38,12 @@ add_executable(tests
     core/perf_stats.cpp
     core/service_auto_stub.cpp
     core/key_derivation.cpp
+    core/profile_manager_reset.cpp
     core/eticket_title_key.cpp
     core/keyblob_cmac.cpp
     core/aes_xts.cpp
     common/display_hdr.cpp
+    common/restore_eden_path.cpp
     common/dkb_cpu_trace.cpp
     common/dkb_frame_trace.cpp
     audio_core/nx2_sysmix.cpp
@@ -61,6 +64,7 @@ add_executable(tests
     audio_core/hardware_audio_codec.cpp
     core/gpu_dirty_memory.cpp
     core/nso_loader.cpp
+    core/nsp_loader.cpp
     core/memory_acquire.cpp
     core/kip_sections.cpp
     core/memory_span.cpp
@@ -113,6 +117,7 @@ add_executable(tests
     video_core/framebuffer_clear_layers.cpp
     video_core/framebuffer_limits.cpp
     video_core/descriptor_limits.cpp
+    video_core/device_memory_asid.cpp
     video_core/unbacked_fallback.cpp
     video_core/eviction_age.cpp
     video_core/host_memory_limit.cpp
@@ -167,6 +172,7 @@ add_executable(tests
     video_core/ampere_ported_textures.cpp
     video_core/ampere_tennis_i2f.cpp
     video_core/ampere_tennis_tessellation.cpp
+    video_core/ampere_stage_buffer_output.cpp
     video_core/pipeline_cache_files.cpp
     video_core/shader_cache_v2.cpp
     video_core/evicted_pointer_slots.cpp
@@ -187,6 +193,7 @@ add_executable(tests
     video_core/nx2_video_render.cpp
     video_core/ampere_matrix.cpp
     video_core/spirv_software_matrix.cpp
+    video_core/spirv_program_name.cpp
     video_core/spirv_builtin_capabilities.cpp
     video_core/spirv_min_max_denorms.cpp
     video_core/spirv_nan_safe_min_max.cpp
@@ -259,6 +266,7 @@ add_executable(tests
     video_core/nx2_perf_draw_binds.cpp
     video_core/nx2_perf_texture_writes.cpp
     video_core/h264_packet.cpp
+    video_core/vp9_range_encoder.cpp
     video_core/nx2_gpu_mapping.cpp
     video_core/vertex_repack.cpp
     video_core/ampere_lowering.cpp

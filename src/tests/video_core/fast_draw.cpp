@@ -412,6 +412,7 @@ TEST_CASE("Fast draw keeps base vertex and instance as draw parameters", "[fast_
             f.Reg(MAXWELL3D_REG_INDEX(global_base_vertex_index)) + 64);
     f.Write(MAXWELL3D_REG_INDEX(global_base_instance_index),
             f.Reg(MAXWELL3D_REG_INDEX(global_base_instance_index)) + 1);
+    f.Write(MAXWELL3D_REG_INDEX(vertex_id_base), f.Reg(MAXWELL3D_REG_INDEX(vertex_id_base)) + 64);
     f.DrawArrays(0, 3);
     CHECK(f.Reusable());
 }

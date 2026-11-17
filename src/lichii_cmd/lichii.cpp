@@ -708,7 +708,18 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
                  handoff->program_index, state->system.GetUserChannel().size());
     }
     // SdlState read the profiles before the config named the NAND.
-    state->system.GetProfileManager().ResetUserSaveFile();
+    auto& profile_manager = state->system.GetProfileManager();
+    profile_manager.ResetUserSaveFile();
+    if (!lp.selected_user_name.empty()) {
+        // -u <name> was looked up in those profiles; look it up again in these.
+        if (const auto index = profile_manager.GetUserIndex(lp.selected_user_name);
+            index && static_cast<s32>(*index) != Settings::values.current_user.GetValue()) {
+            Settings::values.current_user = static_cast<s32>(*index);
+            profile_manager.ResetUserSaveFile();
+        } else if (!index) {
+            LOG_ERROR(Frontend, "Invalid user argument '{}'", lp.selected_user_name);
+        }
+    }
     Common::Nextendo::MigrateAccountFile(Service::Account::Nextendo::CurrentProfile(state->system));
     if (Common::Nextendo::OnlinePlayActive()) {
         const auto loader = Loader::GetLoader(

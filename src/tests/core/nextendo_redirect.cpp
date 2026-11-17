@@ -12,8 +12,10 @@
 #include "common/fs/file.h"
 #include "common/fs/path_util.h"
 #include "common/settings.h"
+#include "common/scope_exit.h"
 #include "core/hle/service/sockets/nextendo_redirect.h"
 #include "core/hle/service/sockets/sfdnsres.h"
+#include "tests/common/restore_eden_path.h"
 
 namespace Nextendo = Service::Sockets::Nextendo;
 
@@ -109,7 +111,7 @@ TEST_CASE("Nextendo: the hosts file and built-in rules resolve in the wiki's ord
     Settings::values.nextendo_enabled = false;
     REQUIRE_FALSE(Nextendo::RedirectAddress("dauth-lp1.ndas.srv.nintendo.net").has_value());
     Settings::values.nextendo_server_ip.SetValue(Settings::values.nextendo_server_ip.GetDefault());
-    Common::FS::SetEdenPath(Common::FS::EdenPath::SDMCDir, previous_sdmc);
+    Tests::RestoreEdenPath(Common::FS::EdenPath::SDMCDir, previous_sdmc);
     std::error_code ec;
     std::filesystem::remove_all(sdmc, ec);
 }
@@ -182,4 +184,31 @@ TEST_CASE("Nextendo: NPLN ALPN and Gamesync route only while online play is on",
 
     Settings::values.nextendo_enabled = false;
     Settings::values.nextendo_server_ip.SetValue(Settings::values.nextendo_server_ip.GetDefault());
+}
+
+TEST_CASE("Nextendo: Gamesync routes only IPv4 connects", "[core]") {
+    // An IPv6 destination has a zero `ip`, which RouteGamesync took for "any address": the port
+    // was moved to Nextendo's while the IPv6 address stayed, so the connect went nowhere.
+    constexpr u64 Scarlet = 0x0100A3D008C5C000;
+    const bool previous_enabled = Settings::values.nextendo_enabled.GetValue();
+    const std::string previous_ip = Settings::values.nextendo_server_ip.GetValue();
+    SCOPE_EXIT {
+        Settings::values.nextendo_enabled = previous_enabled;
+        Settings::values.nextendo_server_ip = previous_ip;
+    };
+    Settings::values.nextendo_server_ip = "192.0.2.1";
+    Settings::values.nextendo_enabled = true;
+
+    Network::SockAddrIn ipv6{};
+    ipv6.family = Network::Domain::INET6;
+    ipv6.portno = 7575;
+    ipv6.ip6 = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    CHECK_FALSE(Nextendo::RouteGamesync(Scarlet, ipv6).has_value());
+
+    const Network::SockAddrIn ipv4{Network::Domain::INET, {}, 7575};
+    const auto routed = Nextendo::RouteGamesync(Scarlet, ipv4);
+    REQUIRE(routed.has_value());
+    CHECK(routed->family == Network::Domain::INET);
+    CHECK(routed->portno == 8463);
+    CHECK(routed->ip == Network::IPv4Address{192, 0, 2, 1});
 }
