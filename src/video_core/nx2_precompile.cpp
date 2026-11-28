@@ -81,7 +81,7 @@ std::filesystem::path ExeRecipesDirectory() {
 #ifdef _WIN32
     return Common::FS::GetExeDirectory() / "recipes";
 #elif defined(__APPLE__)
-    return Common::FS::GetBundleDirectory() / "Contents/MacOS/recipes";
+    return Common::FS::GetBundleDirectory() / "Contents/Resources/recipes";
 #elif defined(__linux__)
     std::error_code error;
     if (const auto exe = std::filesystem::read_symlink("/proc/self/exe", error); !error) {

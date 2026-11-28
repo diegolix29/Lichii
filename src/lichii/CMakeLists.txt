@@ -297,9 +297,15 @@ endif()
 
 # Precompile recipes (*.nx2recipe), next to the executable: a title's recipe is assembled with the
 # player's own game files and its shaders prepared before the game starts (video_core/nx2_precompile).
+# On macOS they go in the bundle's Resources: codesign rejects data files in Contents/MacOS.
+if (APPLE)
+    set(_recipes_dir "$<TARGET_BUNDLE_CONTENT_DIR:lichii>/Resources/recipes")
+else()
+    set(_recipes_dir "$<TARGET_FILE_DIR:lichii>/recipes")
+endif()
 add_custom_command(TARGET lichii POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
-        "${PROJECT_SOURCE_DIR}/dist/recipes" "$<TARGET_FILE_DIR:lichii>/recipes"
+        "${PROJECT_SOURCE_DIR}/dist/recipes" "${_recipes_dir}"
     VERBATIM)
 
 if (LICHII_CRASH_DUMPS)
