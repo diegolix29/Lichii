@@ -6,6 +6,7 @@
 #include <array>
 #include <bit>
 
+#include "common/logging.h"
 #include "common/scratch_buffer.h"
 #include "common/settings.h"
 #include "video_core/host1x/codecs/h264.h"
@@ -22,7 +23,23 @@ H264::H264(Host1x::Host1x& host1x_, const Host1x::NvdecCommon::NvdecRegisters& r
 
 H264::~H264() = default;
 
+bool H264::ValidPictureIndex() const {
+    // From the guest's picture info: no more than the surfaces Nvdec's registers hold. Without a
+    // valid one the frame's offsets are 0: in presentation order it is still shown in its turn,
+    // in decode order only a Vic slot whose luma offset register is 0 would match it.
+    const u32 pic_idx{static_cast<u32>(current_context.h264_parameter_set.curr_pic_idx.Value())};
+    if (pic_idx < regs.surface_luma_offsets.size()) {
+        return true;
+    }
+    LOG_ERROR(HW_GPU, "H264 picture index {} past the {} surfaces", pic_idx,
+              regs.surface_luma_offsets.size());
+    return false;
+}
+
 std::tuple<u64, u64> H264::GetProgressiveOffsets() {
+    if (!ValidPictureIndex()) {
+        return {0, 0};
+    }
     auto pic_idx{current_context.h264_parameter_set.curr_pic_idx};
     auto luma{regs.surface_luma_offsets[pic_idx].Address() +
               current_context.h264_parameter_set.luma_frame_offset.Address()};
@@ -32,6 +49,9 @@ std::tuple<u64, u64> H264::GetProgressiveOffsets() {
 }
 
 std::tuple<u64, u64, u64, u64> H264::GetInterlacedOffsets() {
+    if (!ValidPictureIndex()) {
+        return {0, 0, 0, 0};
+    }
     auto pic_idx{current_context.h264_parameter_set.curr_pic_idx};
     auto luma_top{regs.surface_luma_offsets[pic_idx].Address() +
                   current_context.h264_parameter_set.luma_top_offset.Address()};

@@ -258,13 +258,11 @@ struct Values {
 
     // Cpu
     SwitchableSetting<CpuBackend, true> cpu_backend{linkage,
-#ifdef HAS_NCE
-                                                    CpuBackend::Nce,
-#else
                                                     CpuBackend::Dynarmic,
-#endif
                                                     CpuBackend::Dynarmic,
-#ifdef HAS_NCE
+#ifdef HAS_HYPERVISOR
+                                                    CpuBackend::Hypervisor,
+#elif defined(HAS_NCE)
                                                     CpuBackend::Nce,
 #else
                                                     CpuBackend::Dynarmic,
@@ -491,7 +489,7 @@ struct Values {
                                       Specialization::Default, true, false};
 
     SwitchableSetting<FrameGenType> frame_gen_type{linkage,
-                                                   FrameGenType::Fsr3,
+                                                   FrameGenType::OpticalFlow,
                                                    "frame_gen_type",
                                                    Category::Renderer,
                                                    Specialization::Default,
@@ -552,6 +550,15 @@ struct Values {
                                                         true,
                                                         false,
                                                         &frame_gen};
+
+    SwitchableSetting<bool> frame_gen_flyhigh_protect_hud{linkage,
+                                                          true,
+                                                          "frame_gen_flyhigh_protect_hud",
+                                                          Category::Renderer,
+                                                          Specialization::Default,
+                                                          true,
+                                                          false,
+                                                          &frame_gen};
 
     SwitchableSetting<bool> frame_gen_dump_flow{linkage, false, "frame_gen_dump_flow",
                                                 Category::Renderer};
@@ -683,7 +690,7 @@ struct Values {
         Specialization::Default};
 
     SwitchableSetting<NativeAsyncDraws> native_async_draws{linkage,
-                                                           NativeAsyncDraws::Wait,
+                                                           NativeAsyncDraws::Bounded,
                                                            "native_async_draws",
                                                            Category::RendererAdvanced,
                                                            Specialization::Default,
@@ -699,6 +706,9 @@ struct Values {
                                                          Specialization::Countable,
                                                          true,
                                                          true};
+
+    SwitchableSetting<bool> skip_unbuilt_mesh_draws{linkage, false, "skip_unbuilt_mesh_draws",
+                                                    Category::RendererAdvanced};
 
     // Precache shaders before the game starts: the compute programs in the game files are built on
     // the loading screen, so the driver's cache holds them before the game first uses them.
@@ -759,6 +769,12 @@ struct Values {
                                                   true,
                                                   true};
 
+    // The GPU render thread (video_core/gpu_split.cpp, the render follower): records Vulkan
+    // commands off the GPU back thread. Experimental, so off by default; EDEN_NX2_RENDER_FOLLOWER
+    // overrides it either way.
+    SwitchableSetting<bool> render_thread{linkage, false, "render_thread",
+                                          Category::RendererAdvanced};
+
 #ifdef __ANDROID__
     SwitchableSetting<bool> use_optimized_vertex_buffers{linkage,
                                                  false,
@@ -799,7 +815,7 @@ struct Values {
     SwitchableSetting<bool> emulate_bgr565{linkage, false, "emulate_bgr565",
                                             Category::RendererHacks};
 
-    SwitchableSetting<bool> use_asynchronous_shaders{linkage, false, "use_asynchronous_shaders",
+    SwitchableSetting<bool> use_asynchronous_shaders{linkage, true, "use_asynchronous_shaders",
                                                      Category::RendererHacks};
 
     SwitchableSetting<GpuUnswizzleSize> gpu_unswizzle_texture_size{linkage,
@@ -1182,7 +1198,7 @@ bool IsGPUFenceBehaviorBalanced();
 bool IsGPUFenceBehaviorAccurate();
 
 bool IsFastmemEnabled();
-void SetNceEnabled(bool is_64bit);
+void SetNceEnabled(bool enabled);
 bool IsNceEnabled();
 
 void SetCurrentProgramID(u64 program_id);

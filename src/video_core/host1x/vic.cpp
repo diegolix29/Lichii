@@ -92,6 +92,7 @@ Vic::Vic(Host1x& host1x_, s32 id_, u32 syncpt) noexcept
 }
 
 Vic::~Vic() noexcept {
+    StopThread();
     LOG_INFO(HW_GPU, "Destroying vic {}", id);
     host1x.frame_queue.Close(id);
 }

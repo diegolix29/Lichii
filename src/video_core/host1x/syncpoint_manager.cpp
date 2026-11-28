@@ -148,6 +148,27 @@ void SyncpointManager::Increment(std::atomic<u32>& syncpoint, std::condition_var
     std::erase(due_actions, &due);
 }
 
+bool SyncpointManager::WaitHost(u32 syncpoint_id, u32 expected_value,
+                                const std::stop_token& stop_token) {
+    std::atomic<u32>& syncpoint = syncpoints_host[syncpoint_id];
+    const auto reached = [&] {
+        return syncpoint.load(std::memory_order_acquire) >= expected_value;
+    };
+    if (reached()) {
+        return true;
+    }
+    // The callback notifies under guard, so a stop requested between the waiter's look at the
+    // token and its sleep still wakes it. Made before guard is taken: it runs at once when the
+    // stop was already requested.
+    const std::stop_callback wake{stop_token, [this] {
+        std::scoped_lock lk(guard);
+        wait_host_cv.notify_all();
+    }};
+    std::unique_lock lk(guard);
+    wait_host_cv.wait(lk, [&] { return reached() || stop_token.stop_requested(); });
+    return reached();
+}
+
 void SyncpointManager::Wait(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv,
                             u32 expected_value) {
     const auto pred = [&]() { return syncpoint.load(std::memory_order_acquire) >= expected_value; };

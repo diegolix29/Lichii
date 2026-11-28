@@ -103,6 +103,19 @@ Normal and an unscaled counter are prerequisites for evaluating its timing;
 the Add-On does not change global clock behavior or automatically override
 the user's settings. Correct gameplay speed with the Add-On is unverified.
 
+## Default frame pacing
+
+Both Ocarina FPS built-ins use the vsync timer, whose `nx2_frame_rate_limit`
+defaults to 60 Hz. FPS Unlock does not opt into display-driven pacing, so a
+high-refresh monitor cannot raise the default game rate when `fps_limit` is 0.
+Explicit timer-rate overrides still apply; existing settings are not reset.
+
+In #2049, keeping FPS Unlock enabled and limiting the emulator to 60 FPS resolved
+stuck battle music, skipped song notes and Epona's missing jump animation. Keeping
+the default at 60 is a mitigation for those high-frame-rate bugs, not a fix for
+their underlying game logic. Users with a higher configured rate should keep the
+60 FPS limit until those bugs are resolved.
+
 ## FPS Unlock: sound manager at 60 Hz
 
 `FPS Unlock (built-in)` lowers the step below 1.0 above 60 fps (0.5 at 120 fps).
@@ -254,11 +267,11 @@ wind run fast (twice as fast at 120 fps). Four sites load the 1/60 constant befo
 `0x14632C` (`ldr s0`), `0x2AB804` (`fmov s0, w8`), `0x2C207A4` (`ldr s0`) and `0x2C2208C` (`ldr s2`).
 
 `FPS Unlock (built-in)` replaces each with `bl` to 48 bytes at `0x3C46B00` (result in `s0`) or
-`0x3C46B30` (in `s2`), which return `min(T+0x18, 1/60)` (`T+0x18` is step / 60), or 1/60 when the
-step is not positive. At 60 fps and below the value is the original constant bit for bit. The
-routines use only x16 and x17. Live in Kakariko, breakpoints hit `0x2C2208C` and `0x2AB804` several
-times a frame (the other two sites did not run there); at about 86 fps, restoring the original bytes
-made clothes and hair visibly sway faster, and the patch brought them back to the 60 fps pace.
+`0x3C46B30` (in `s2`), which return the game's step / 60 at `T+0x18`, capped at 4/60.
+At a step of 1 the result is the original constant bit for bit. Below 60 fps, cloth now advances
+with the rest of the game instead of lagging behind movement. This applies only with FPS Unlock;
+Dark's Dynamic FPS is unchanged. The routines use x16 and x17. The prior above-60-fps fix was
+checked in Kakariko by restoring the original bytes at about 86 fps, which sped up cloth again.
 The drifting dust fog (full-screen shader `3ddfb1d7a854c849`) needs no fix: its time, written at
 `0x478338`, already advances by wind speed / 120 times the frame step.
 

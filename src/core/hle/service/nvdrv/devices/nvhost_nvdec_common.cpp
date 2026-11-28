@@ -82,6 +82,13 @@ NvResult nvhost_nvdec_common::SetNVMAPfd(IoctlSetNvmapFD& params) {
 
 NvResult nvhost_nvdec_common::Submit(IoctlSubmit& params, std::span<u8> data, DeviceFD fd) {
     LOG_DEBUG(Service_NVDRV, "called NVDEC Submit, cmd_buffer_count={}", params.cmd_buffer_count);
+    // A channel whose fd is past Host1x's devices has no device to run its lists: fail the
+    // submit before it raises the syncpoints' maximum, so the guest gets an error instead of
+    // waiting on a threshold nothing will reach.
+    if (!host1x.ValidFd(fd)) {
+        LOG_ERROR(Service_NVDRV, "No host1x device for fd {}: submit refused", fd);
+        return NvResult::BadParameter;
+    }
 
     // Instantiate param buffers
     std::vector<CommandBuffer> command_buffers(params.cmd_buffer_count);
@@ -100,10 +107,26 @@ NvResult nvhost_nvdec_common::Submit(IoctlSubmit& params, std::span<u8> data, De
 
     auto* session = core.GetSession(sessions[fd]);
 
+    // Each increment names a syncpoint by a guest id. One past the syncpoints made
+    // IncrementSyncpointMaxExt throw std::out_of_range, which nothing catches: refuse the submit
+    // before any syncpoint's maximum is raised.
+    for (const SyncptIncr& syncpt_incr : syncpt_increments) {
+        if (syncpt_incr.id >= MaxSyncPoints) {
+            LOG_ERROR(Service_NVDRV, "Submit refused: syncpoint {} past the syncpoints",
+                      syncpt_incr.id);
+            return NvResult::BadParameter;
+        }
+    }
+
+    // The guest gives the two counts separately: each increment raises its syncpoint's max, and
+    // its threshold is returned only where the guest made room for one.
     for (std::size_t i = 0; i < syncpt_increments.size(); i++) {
         const SyncptIncr& syncpt_incr = syncpt_increments[i];
-        fence_thresholds[i] =
+        const u32 threshold =
             syncpoint_manager.IncrementSyncpointMaxExt(syncpt_incr.id, syncpt_incr.increments);
+        if (i < fence_thresholds.size()) {
+            fence_thresholds[i] = threshold;
+        }
     }
 
     for (const auto& cmd_buffer : command_buffers) {

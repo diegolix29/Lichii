@@ -1595,9 +1595,20 @@ void ConfigureInputPlayer::keyPressEvent(QKeyEvent* event) {
         return;
     }
     event->ignore();
+    if (event->key() == Qt::Key_Tab || event->key() == Qt::Key_Backtab) {
+        // Accepted so that the dialog doesn't move the focus instead.
+        event->accept();
+    }
     if (event->key() != Qt::Key_Escape) {
         input_subsystem->GetKeyboard()->PressKey(event->key());
     }
+}
+
+bool ConfigureInputPlayer::focusNextPrevChild(bool next) {
+    if (input_setter) {
+        return false;
+    }
+    return QWidget::focusNextPrevChild(next);
 }
 
 bool ConfigureInputPlayer::eventFilter(QObject* object, QEvent* event) {

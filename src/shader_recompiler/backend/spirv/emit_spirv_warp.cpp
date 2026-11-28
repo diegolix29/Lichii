@@ -58,7 +58,6 @@ void SetInBoundsFlag(IR::Inst* inst, Id result) {
         return;
     }
     in_bounds->SetDefinition(result);
-    in_bounds->Invalidate();
 }
 
 Id ComputeMinThreadId(EmitContext& ctx, Id thread_id, Id segmentation_mask) {

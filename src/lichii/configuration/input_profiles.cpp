@@ -17,7 +17,7 @@ namespace {
 
 bool ProfileExistsInFilesystem(std::string_view profile_name) {
     return FS::Exists(FS::GetEdenPath(FS::EdenPath::ConfigDir) / "input" /
-                      fmt::format("{}.ini", profile_name));
+                      FS::ToU8String(fmt::format("{}.ini", profile_name)));
 }
 
 bool IsINI(const std::filesystem::path& filename) {

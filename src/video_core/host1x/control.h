@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <stop_token>
+
 #include "common/common_types.h"
 
 namespace Tegra::Host1x {
@@ -22,9 +24,11 @@ public:
     };
 
     /// Writes the method into the state, Invoke Execute() if encountered
-    void ProcessMethod(Host1x& host1x, Method method, u32 argument);
+    /// A wait ends early once stop_token is stopped (the device is being destroyed).
+    void ProcessMethod(Host1x& host1x, Method method, u32 argument,
+                       const std::stop_token& stop_token);
     /// For Host1x, execute is waiting on a syncpoint previously written into the state
-    void Execute(Host1x& host1x, u32 data);
+    void Execute(Host1x& host1x, u32 data, const std::stop_token& stop_token);
 
     u32 syncpoint_value{};
 };

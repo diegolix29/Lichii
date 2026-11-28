@@ -201,6 +201,7 @@ struct Translation {
                 case IR::Opcode::UMin32: result[0] = (std::min)(arg(0), arg(1)); break;
                 case IR::Opcode::UMax32: result[0] = (std::max)(arg(0), arg(1)); break;
                 case IR::Opcode::IEqual: result[0] = arg(0) == arg(1); break;
+                case IR::Opcode::INotEqual: result[0] = arg(0) != arg(1); break;
                 case IR::Opcode::UGreaterThanEqual: result[0] = arg(0) >= arg(1); break;
                 case IR::Opcode::SelectU1:
                 case IR::Opcode::SelectU32: result[0] = arg(0) ? arg(1) : arg(2); break;

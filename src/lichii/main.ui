@@ -151,6 +151,7 @@
     <addaction name="action_Post_Processing_Shaders"/>
     <addaction name="separator"/>
     <addaction name="menu_Reset_Window_Size"/>
+    <addaction name="action_Preserve_Window_Size"/>
     <addaction name="menu_View_Debugging"/>
     <addaction name="menu_Game_List_Mode"/>
     <addaction name="menuGame_Icon_Size"/>
@@ -220,6 +221,7 @@
     <addaction name="menuInstall_Firmware"/>
     <addaction name="action_Verify_installed_contents"/>
     <addaction name="action_Data_Manager"/>
+    <addaction name="action_Mod_Store"/>
     <addaction name="separator"/>
     <addaction name="menu_cabinet_applet"/>
     <addaction name="menu_Applets"/>
@@ -252,6 +254,17 @@
    <addaction name="menu_Multiplayer"/>
    <addaction name="menu_Help"/>
   </widget>
+  <action name="action_Preserve_Window_Size">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>Preserve Window Size Across Sessions</string>
+   </property>
+   <property name="toolTip">
+    <string>Keep the saved window size instead of resizing automatically when a game starts.</string>
+   </property>
+  </action>
   <action name="action_Install_File_NAND">
    <property name="enabled">
     <bool>true</bool>
@@ -595,6 +608,11 @@
   <action name="action_Data_Manager">
    <property name="text">
     <string>&amp;Data Manager</string>
+   </property>
+  </action>
+  <action name="action_Mod_Store">
+   <property name="text">
+    <string>&amp;Mod Store</string>
    </property>
   </action>
   <action name="action_Tree_View">

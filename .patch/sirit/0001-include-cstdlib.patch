@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: danieljesus <danieljesus@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 00:33:21 +0100
+Subject: [PATCH] [stream] include <cstdlib> for std::abort
+
+stream.h calls std::abort() but relied on another header to declare it.
+libc++ from LLVM 23 (Homebrew clang 23.1.6) no longer brings <cstdlib> in
+through the headers it includes, so sirit fails to build there without an
+-include cstdlib workaround.
+---
+ src/stream.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/stream.h b/src/stream.h
+index 31c2680..f7cf0df 100644
+--- a/src/stream.h
++++ b/src/stream.h
+@@ -11,6 +11,7 @@
+ #include <cassert>
+ #include <concepts>
+ #include <cstddef>
++#include <cstdlib>
+ #include <functional>
+ #include <string_view>
+ #include <unordered_map>

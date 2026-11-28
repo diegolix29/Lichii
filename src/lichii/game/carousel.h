@@ -17,7 +17,8 @@ public:
     explicit GameCarousel(QWidget* parent = nullptr);
 
     void SetModel(GameListModel* model);
-    void ApplyFilter(const QString& edit_filter_text, GameListModel* model);
+    /// Hides the games the filter doesn't match; returns how many are shown.
+    int ApplyFilter(const QString& edit_filter_text, GameListModel* model);
     void UpdateIconSize();
 
     QModelIndex indexAt(const QPoint& point) const override;

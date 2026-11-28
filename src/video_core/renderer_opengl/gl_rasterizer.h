@@ -271,6 +271,7 @@ private:
     bool has_written_global_memory = false;
     /// The draw's pipeline puts every vertex on the far plane and the game set no polygon offset
     bool far_plane_draw = false;
+    float polygon_offset_slope_scale = 1.0f;
 
     u32 last_clip_distance_mask = 0;
     bool depth_zero_to_one = false;

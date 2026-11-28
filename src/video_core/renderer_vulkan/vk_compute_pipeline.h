@@ -6,10 +6,12 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <span>
+#include <utility>
 
 #include <boost/container/small_vector.hpp>
 
@@ -33,6 +35,7 @@ namespace Vulkan {
 
 class Device;
 class PipelineBinaries;
+class PipelineCache;
 class PipelineStatistics;
 class Scheduler;
 
@@ -61,12 +64,54 @@ public:
 
     using BindCommand = std::function<void(vk::CommandBuffer)>;
 
-    [[nodiscard]] bool Configure(Tegra::Engines::KeplerCompute& kepler_compute,
-                                 Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
-                                 BufferCache& buffer_cache, TextureCache& texture_cache,
-                                 TextureCacheRuntime& texture_runtime,
-                                 std::optional<ByteAddressedShadow>& shadow,
-                                 BindCommand* deferred_bind = nullptr);
+    enum class ConfigureResult {
+        Ready,
+        Failed,
+        /// The pipeline is still building and the dispatch is skipped
+        /// (PipelineCache::SkipUnbuiltDispatch); nothing was bound or marked written.
+        Skipped,
+    };
+
+    [[nodiscard]] ConfigureResult Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+                                            Tegra::MemoryManager& gpu_memory,
+                                            Scheduler& scheduler, BufferCache& buffer_cache,
+                                            TextureCache& texture_cache,
+                                            TextureCacheRuntime& texture_runtime,
+                                            PipelineCache& pipelines,
+                                            std::optional<ByteAddressedShadow>& shadow,
+                                            BindCommand* deferred_bind = nullptr);
+
+    /// EDEN_NX2_RENDER_UNLEND_DISPATCH: the back's half of an unlent dispatch, by value.
+    struct BackHalf {
+        /// Not value-initialized: the small vectors' inline storage stays untouched.
+        BackHalf() {}
+
+        /// Texture and image handles as read from memory, in descriptor order.
+        boost::container::small_vector<u32, 16> handles;
+        /// Buffer descriptor entries.
+        boost::container::small_vector<DescriptorUpdateEntry, 16> entries;
+        /// The buffer commands, played on GPURender as the dispatch's stamp.
+        VideoCommon::CommandArena commands;
+        u64 stamp{};
+    };
+    /// Whether the pipeline's dispatches can go unlent: built and bound, no texture or image
+    /// buffers, no byte-addressed images.
+    [[nodiscard]] bool CanUnlend() const noexcept {
+        return unlend_ok && IsBuilt() && IsBound();
+    }
+    /// The constant buffers the back reads handles and storage buffer descriptors from (all of
+    /// them where a handle is computed at dispatch time).
+    [[nodiscard]] u32 HandleConstBuffers() const noexcept {
+        return handle_cbufs;
+    }
+    /// The back: the buffer bindings and the handle values.
+    void ConfigureBack(Tegra::Engines::KeplerCompute& kepler_compute,
+                       Tegra::MemoryManager& gpu_memory, BufferCache& buffer_cache, BackHalf& half,
+                       GuestDescriptorQueue& capture);
+    /// GPURender: the images, the descriptors and the binding, from `pools`.
+    bool ConfigureRender(const BackHalf& half, const VideoCommon::ComputePools& pools,
+                         Scheduler& scheduler, TextureCache& texture_cache,
+                         BufferCacheRuntime& buffer_runtime, BindCommand* deferred_bind);
 
     /// Whether the bindings fit an Ocarina upscale pass: one written image, no other writes.
     [[nodiscard]] bool CanReplaceOcarinaUpscale() const;
@@ -85,9 +130,18 @@ public:
         return is_built.load(std::memory_order_acquire);
     }
 
+    /// Raises its build to NeedNow and waits up to `timeout` for it.
+    /// @return True when the pipeline is built.
+    [[nodiscard]] bool WaitBuilt(std::chrono::microseconds timeout);
+
     /// The SPIR-V (zstd) the pipeline was built from; read it only once IsBuilt().
     [[nodiscard]] const std::vector<u8>& KeptSpirv() const noexcept {
         return kept_spirv;
+    }
+
+    /// True the first time it is called, so a dispatch's wait for this build is logged once
+    [[nodiscard]] bool FirstWaitForBuild() noexcept {
+        return !std::exchange(wait_logged, true);
     }
 
     /// Storage images written by the last configured dispatch
@@ -141,6 +195,14 @@ private:
     /// Builds the pipeline once, on whichever thread gets here first.
     void RunBuild();
 
+    /// Configure's tail, once the buffer entries are queued: image descriptors, descriptor
+    /// memory and the binding.
+    ConfigureResult FinishConfigure(Scheduler& scheduler, TextureCache& texture_cache,
+                                    std::span<const VideoCommon::ImageViewInOut> views,
+                                    std::span<const VideoCommon::SamplerId> samplers,
+                                    const std::optional<ByteAddressedShadow>& shadow,
+                                    std::optional<size_t> shadow_index, BindCommand* deferred_bind);
+
     const Device& device;
     vk::PipelineCache& pipeline_cache;
     PipelineBinaries* const binaries;
@@ -150,19 +212,22 @@ private:
     Shader::Info info;
     u64 shader_hash{};
     u32 num_descriptor_entries{};
+    bool unlend_ok{};
+    u32 handle_cbufs{};
     boost::container::small_vector<VideoCommon::ImageViewId, 8> written_images;
+    bool wait_logged{};
     std::vector<SampledImage> sampled_images;
 
     VideoCommon::ComputeUniformBufferSizes uniform_buffer_sizes{};
 
     vk::ShaderModule spv_module;
     std::vector<u8> kept_spirv;
-    vk::DescriptorSetLayout descriptor_set_layout;
+    VkDescriptorSetLayout descriptor_set_layout{}; ///< Owned by the PipelineLayoutCache
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
     DescriptorBufferLayout descriptor_buffer_layout;
     DescriptorAllocator descriptor_allocator;
-    vk::PipelineLayout pipeline_layout;
+    VkPipelineLayout pipeline_layout{}; ///< Owned by the PipelineLayoutCache
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
 
@@ -172,6 +237,11 @@ private:
 
     std::function<void()> build_task;
     std::atomic_bool build_claimed{false};
+    /// Counts the build as done in the "Building: N shader(s)" status, once: when it ran, or
+    /// when the pipeline went with its build still queued (cancelled, never run).
+    void NotifyBuilt() noexcept;
+    VideoCore::ShaderNotify* build_notify{};
+    std::atomic_bool build_notified{false};
     std::condition_variable build_condvar;
     std::mutex build_mutex;
     std::atomic_bool is_built{false};

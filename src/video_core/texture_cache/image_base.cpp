@@ -23,7 +23,7 @@ using VideoCore::Surface::DefaultBlockWidth;
 
 namespace {
 /// Returns the base layer and mip level offset
-[[nodiscard]] std::pair<s32, s32> LayerMipOffset(s32 diff, u32 layer_stride) {
+[[nodiscard]] std::pair<u64, u64> LayerMipOffset(u64 diff, u32 layer_stride) {
     if (layer_stride == 0) {
         return {0, diff};
     } else {
@@ -81,21 +81,21 @@ std::optional<SubresourceBase> ImageBase::TryFindBase(GPUVAddr other_addr) const
         // Subresource address can't be lower than the base
         return std::nullopt;
     }
-    const u32 diff = static_cast<u32>(other_addr - gpu_addr);
-    if (diff > guest_size_bytes) {
+    const u64 diff = other_addr - gpu_addr;
+    if (diff >= guest_size_bytes) {
         // This can happen when two CPU addresses are used for different GPU addresses
         return std::nullopt;
     }
     if (info.type != ImageType::e3D) {
         const auto [layer, mip_offset] = LayerMipOffset(diff, info.layer_stride);
         const auto end = mip_level_offsets.begin() + info.resources.levels;
-        const auto it = std::find(mip_level_offsets.begin(), end, static_cast<u32>(mip_offset));
-        if (layer > info.resources.layers || it == end) {
+        const auto it = std::find(mip_level_offsets.begin(), end, mip_offset);
+        if (layer >= static_cast<u64>(info.resources.layers) || it == end) {
             return std::nullopt;
         }
         return SubresourceBase{
             .level = static_cast<s32>(std::distance(mip_level_offsets.begin(), it)),
-            .layer = layer,
+            .layer = static_cast<s32>(layer),
         };
     } else {
         // TODO: Consider using binary_search after a threshold
@@ -153,6 +153,27 @@ void ImageBase::CheckAliasState() {
         return;
     }
     flags &= ~ImageFlagBits::Alias;
+}
+
+namespace {
+[[nodiscard]] u32 LevelMask(const SubresourceRange& range) noexcept {
+    const u32 levels = (std::min)(static_cast<u32>(range.extent.levels), 32U);
+    const u32 mask = levels >= 32 ? ~0U : (1U << levels) - 1;
+    return range.base.level >= 32 ? 0 : mask << range.base.level;
+}
+} // Anonymous namespace
+
+void NoteStorageWrite(ImageBase& image, u32 levels_before, const SubresourceRange& range) noexcept {
+    const bool every_layer =
+        range.base.layer == 0 && range.extent.layers >= image.info.resources.layers;
+    image.storage_written_levels = levels_before | (every_layer ? LevelMask(range) : 0);
+}
+
+bool HoldsStorageWrites(const ImageBase& image, const SubresourceRange& range) noexcept {
+    const u32 mask = LevelMask(range);
+    return True(image.flags & ImageFlagBits::GpuModified) &&
+           False(image.flags & ImageFlagBits::CpuModified) && mask != 0 &&
+           (image.storage_written_levels & mask) == mask;
 }
 
 bool AddImageAlias(ImageBase& lhs, ImageBase& rhs, ImageId lhs_id, ImageId rhs_id) {

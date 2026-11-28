@@ -170,7 +170,15 @@ public:
     void StartDevice(s32 fd, ChannelType type, u32 syncpt);
     void StopDevice(s32 fd, ChannelType type);
 
+    /// Whether fd indexes the devices. One past them has no device (StartDevice refuses it).
+    [[nodiscard]] bool ValidFd(s32 fd) const {
+        return fd >= 0 && static_cast<size_t>(fd) < devices.size();
+    }
+
     void PushEntries(s32 fd, ChCommandHeaderList&& entries) {
+        if (!ValidFd(fd)) {
+            return;
+        }
         if (auto const nvdec = std::get_if<Tegra::Host1x::Nvdec>(&devices[fd])) {
             nvdec->PushEntries(std::move(entries));
         } else if (auto const vic = std::get_if<Tegra::Host1x::Vic>(&devices[fd])) {

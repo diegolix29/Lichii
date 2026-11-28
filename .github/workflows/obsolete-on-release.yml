@@ -1,0 +1,42 @@
+name: Mark issues obsolete on release
+
+on:
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (defaults to the latest stable release)
+        type: string
+      issues:
+        description: Comma-separated issue numbers (defaults to the opt-in list in the release notes)
+        type: string
+      dry_run:
+        description: List eligible issues without changing them
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: obsolete-on-release
+  cancel-in-progress: false
+
+jobs:
+  mark-obsolete:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - name: Ask reporters to retest on the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          ISSUES: ${{ inputs.issues }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+        run: python3 tools/ci/release_retest.py

@@ -155,6 +155,28 @@ TEST_CASE("Linux installs only get the package they were installed from", "[upda
               .empty());
 }
 
+TEST_CASE("Linux ARM64 PGO installs update to the newer standard package", "[updater]") {
+    using Common::Net::LinuxPackage;
+    const auto package = GENERATE(LinuxPackage::AppImage, LinuxPackage::Archive);
+    const std::string extension = package == LinuxPackage::AppImage ? ".AppImage" : ".tar.gz";
+    const std::string other_extension =
+        package == LinuxPackage::AppImage ? ".tar.gz" : ".AppImage";
+    const auto releases = std::array{
+        MakeRelease("build-501", "lichii-linux-aarch64-pgo" + extension),
+        MakeRelease("build-502", "lichii-linux-aarch64" + extension),
+        MakeRelease("build-503", "lichii-linux-x86_64-pgo" + extension),
+        MakeRelease("build-504", "lichii-linux-aarch64" + other_extension),
+    };
+    const auto update = UpdateChecker::SelectUpdate(releases, "build-500", "linux-aarch64-pgo",
+                                                    package);
+    REQUIRE(update);
+    CHECK(update->tag == "build-502");
+    const auto assets = update->GetPlatformAssets("linux-aarch64-pgo", package);
+    REQUIRE(assets.size() == 1);
+    CHECK(assets[0].name == "Standard");
+    CHECK(assets[0].filename == "lichii-linux-aarch64" + extension);
+}
+
 TEST_CASE("Asset digest and size come from the release JSON", "[updater]") {
     const std::string sha(64, 'A');
     const nlohmann::json json{

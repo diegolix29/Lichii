@@ -780,7 +780,10 @@ bool GRenderWindow::InitRenderTarget() {
     // Reset minimum required size to avoid resizing issues on the main window after restarting.
     setMinimumSize(1, 1);
 
-    resize(target_width, target_height);
+    // A separate render window keeps the size it was restored to when the user asked for that.
+    if (!isWindow() || !UISettings::values.preserve_window_size.GetValue()) {
+        resize(target_width, target_height);
+    }
 
     OnMinimalClientAreaChangeRequest(GetActiveConfig().min_client_area_size);
     OnFramebufferSizeChanged();

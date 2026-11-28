@@ -77,7 +77,7 @@ bool DescriptorBufferRing::CreateChunk(size_t index) {
         LOG_DEBUG(Render_Vulkan, "Descriptor buffer is not host coherent");
         return false;
     }
-    if (device.HasDebuggingToolAttached()) {
+    if (device.NamesObjects()) {
         buffer.SetObjectNameEXT("Descriptor buffer");
     }
     const VkDeviceAddress raw_address{device.GetLogical().GetBufferDeviceAddress(*buffer)};

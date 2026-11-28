@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "common/assert.h"
+#include "common/logging.h"
 #include "core/hle/service/nvdrv/core/syncpoint_manager.h"
 #include "video_core/host1x/host1x.h"
 
@@ -46,13 +47,22 @@ u32 SyncpointManager::FindFreeSyncpoint() {
             return i;
         }
     }
-    ASSERT_MSG(false, "Failed to find a free syncpoint!");
     return 0;
 }
 
 u32 SyncpointManager::AllocateSyncpoint(bool client_managed) {
+    const auto id = TryAllocateSyncpoint(client_managed);
+    ASSERT_MSG(id.has_value(), "Failed to find a free syncpoint!");
+    return id.value_or(0);
+}
+
+std::optional<u32> SyncpointManager::TryAllocateSyncpoint(bool client_managed) {
     std::lock_guard lock(reservation_lock);
-    return ReserveSyncpoint(FindFreeSyncpoint(), client_managed);
+    const u32 id = FindFreeSyncpoint();
+    if (id == 0) {
+        return std::nullopt;
+    }
+    return ReserveSyncpoint(id, client_managed);
 }
 
 void SyncpointManager::FreeSyncpoint(u32 id) {
@@ -115,6 +125,42 @@ u32 SyncpointManager::UpdateMin(u32 id) {
 
     syncpoint.counter_min = host1x.GetSyncpointManager().GetHostSyncpointValue(id);
     return syncpoint.counter_min;
+}
+
+u32 SyncpointManager::CompleteSyncpoint(u32 id) {
+    auto& syncpoint = syncpoints.at(id);
+
+    if (!syncpoint.reserved) {
+        ASSERT(false);
+        return 0;
+    }
+
+    // Values wrap: one behind the maximum by less than half the range is short of it. A long
+    // shortfall means the values are not this channel's increments: leave them as they are.
+    constexpr u32 MaxShortfall = 1U << 16;
+    const u32 max = syncpoint.counter_max.load(std::memory_order_relaxed);
+    auto& host1x_syncpoints = host1x.GetSyncpointManager();
+    const auto complete = [&](u32 value, auto&& increment, const char* bank) {
+        const u32 shortfall = max - value;
+        if (static_cast<s32>(shortfall) <= 0) {
+            return;
+        }
+        if (shortfall > MaxShortfall) {
+            LOG_WARNING(Service_NVDRV, "Syncpoint {} {} value {} is {} short of its max {}: left",
+                        id, bank, value, shortfall, max);
+            return;
+        }
+        for (u32 i = 0; i < shortfall; ++i) {
+            increment();
+        }
+    };
+    // All guest increments, then all host ones. A list's IncSyncpts interleave the two banks
+    // per increment, but nothing compares the banks against each other.
+    complete(host1x_syncpoints.GetGuestSyncpointValue(id),
+             [&] { host1x_syncpoints.IncrementGuest(id); }, "guest");
+    complete(host1x_syncpoints.GetHostSyncpointValue(id),
+             [&] { host1x_syncpoints.IncrementHost(id); }, "host");
+    return UpdateMin(id);
 }
 
 NvFence SyncpointManager::GetSyncpointFence(u32 id) {

@@ -86,3 +86,37 @@ TEST_CASE("Alternating leftover vertex input always lends the first key",
         REQUIRE(drawn == first);
     }
 }
+
+TEST_CASE("Failed mesh pipelines never seed a vertex-input lender",
+          "[video_core][mesh_vertex_input]") {
+    struct PipelineProbe {
+        bool mesh;
+        bool failed;
+        bool IsMeshPipeline() const { return mesh; }
+        bool Failed() const { return failed; }
+    };
+    using Vulkan::CanSeedMeshVertexInput;
+    const PipelineProbe failed_mesh{true, true};
+    const PipelineProbe working_mesh{true, false};
+    const PipelineProbe working_vertex{false, false};
+    REQUIRE_FALSE(CanSeedMeshVertexInput(static_cast<const PipelineProbe*>(nullptr)));
+    REQUIRE_FALSE(CanSeedMeshVertexInput(&failed_mesh));
+    REQUIRE(CanSeedMeshVertexInput(&working_mesh));
+    REQUIRE_FALSE(CanSeedMeshVertexInput(&working_vertex));
+
+    GraphicsPipelineCacheKey failed_key = MeshKey(true);
+    failed_key.state.attribute_types = 0x5;
+    GraphicsPipelineCacheKey working_key = MeshKey(true);
+    working_key.state.attribute_types = 0xa0;
+    MeshVertexInputs<GraphicsPipelineCacheKey> inputs;
+    if (CanSeedMeshVertexInput(&failed_mesh)) {
+        inputs.Add(failed_key);
+    }
+    if (CanSeedMeshVertexInput(&working_mesh)) {
+        inputs.Add(working_key);
+    }
+    GraphicsPipelineCacheKey draw = MeshKey(true);
+    draw.state.attribute_types = 0x3;
+    REQUIRE(inputs.Lend(draw));
+    REQUIRE(draw == working_key);
+}

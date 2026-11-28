@@ -9,6 +9,7 @@
 #include <list>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <thread>
 #include <vector>
 
@@ -83,6 +84,9 @@ public:
     void WaitGuest(u32 syncpoint_id, u32 expected_value);
 
     void WaitHost(u32 syncpoint_id, u32 expected_value);
+
+    /// As WaitHost, until the value is reached or stop_token is stopped: true if it was reached.
+    bool WaitHost(u32 syncpoint_id, u32 expected_value, const std::stop_token& stop_token);
 
     bool IsReadyGuest(u32 syncpoint_id, u32 expected_value) const {
         return syncpoints_guest[syncpoint_id].load(std::memory_order_acquire) >= expected_value;

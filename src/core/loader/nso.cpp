@@ -239,6 +239,7 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
 
     // Apply patches if necessary
     const auto name = nso_file.GetName();
+    bool frame_rate_unlocked = false;
     if (pm && (pm->HasNSOPatch(nso_header.build_id, name) || Settings::values.dump_nso)) {
         std::span<u8> patchable_section(codeset.memory.data() + module_start, codeset.memory.size() - module_start);
         std::vector<u8> pi_header(sizeof(NSOHeader) + patchable_section.size());
@@ -246,7 +247,7 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         std::memcpy(pi_header.data() + sizeof(NSOHeader), patchable_section.data(),
                     patchable_section.size());
 
-        pi_header = pm->PatchNSO(pi_header, name);
+        pi_header = pm->PatchNSO(pi_header, name, &frame_rate_unlocked);
 
         std::copy(pi_header.begin() + sizeof(NSOHeader), pi_header.end(), patchable_section.data());
     }
@@ -527,6 +528,9 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         process.SetMkwDynamicFpsPatchApplied(mkw_dynamic_fps_patch_applied);
         process.SetMkwFrameModeAddress(
             mkw_mode_word_offset != 0 ? load_base + module_start + mkw_mode_word_offset : 0);
+    }
+    if (frame_rate_unlocked) {
+        process.SetFrameRateUnlocked(true);
     }
     if (frame_interval_offset != 0) {
         process.SetFrameIntervalAddresses(load_base + module_start + frame_interval_offset,

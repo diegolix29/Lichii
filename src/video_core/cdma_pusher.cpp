@@ -44,15 +44,20 @@ CDmaPusher::CDmaPusher(Host1x::Host1x& host1x_, s32 id)
 
             size_t i = 0;
             for (const auto value : command_list) {
+                // A stop ends the list in progress: what follows may use the device, or run
+                // syncpoint actions of services already gone, at shutdown.
+                if (stop_token.stop_requested()) {
+                    return;
+                }
                 i++;
                 if (mask != 0) {
                     const auto lbs = static_cast<u32>(std::countr_zero(mask));
                     mask &= ~(1U << lbs);
-                    ExecuteCommand(method_offset + lbs, value.raw);
+                    ExecuteCommand(method_offset + lbs, value.raw, stop_token);
                     continue;
                 } else if (count != 0) {
                     --count;
-                    ExecuteCommand(method_offset, value.raw);
+                    ExecuteCommand(method_offset, value.raw, stop_token);
                     if (incrementing) {
                         ++method_offset;
                     }
@@ -79,7 +84,7 @@ CDmaPusher::CDmaPusher(Host1x::Host1x& host1x_, s32 id)
                 case ChSubmissionMode::Immediate: {
                     const u32 data = value.value & 0xfff;
                     method_offset = value.method_offset;
-                    ExecuteCommand(method_offset, data);
+                    ExecuteCommand(method_offset, data, stop_token);
                     break;
                 }
                 default:
@@ -92,13 +97,27 @@ CDmaPusher::CDmaPusher(Host1x::Host1x& host1x_, s32 id)
     });
 }
 
-CDmaPusher::~CDmaPusher() = default;
+CDmaPusher::~CDmaPusher() {
+    if (thread.joinable()) {
+        // Too late to be safe: the derived destructor has run and ProcessMethod is pure again.
+        LOG_ERROR(HW_GPU, "A CDmaPusher's thread outlived its derived destructor, which must call "
+                          "StopThread first");
+        StopThread();
+    }
+}
 
-void CDmaPusher::ExecuteCommand(u32 method, u32 arg) {
+void CDmaPusher::StopThread() {
+    if (thread.joinable()) {
+        thread.request_stop();
+        thread.join();
+    }
+}
+
+void CDmaPusher::ExecuteCommand(u32 method, u32 arg, const std::stop_token& stop_token) {
     switch (current_class) {
     case ChClassId::Control:
         LOG_TRACE(Service_NVDRV, "Class {} method {:#x} arg {:#x}", u32(current_class), method, arg);
-        host_processor.ProcessMethod(host1x, Host1x::Control::Method(method), arg);
+        host_processor.ProcessMethod(host1x, Host1x::Control::Method(method), arg, stop_token);
         break;
     default:
         thi_regs.reg_array[method] = arg;

@@ -197,8 +197,8 @@ void GameTree::UpdateColumnVisibility(GameListModel* model) {
     setColumnHidden(GameListModel::COLUMN_PLAY_TIME, !UISettings::values.show_play_time);
 }
 
-QString GameTree::GetLastFilterResultItem() const {
-    QString file_path;
+QModelIndex GameTree::GetFilterResult() const {
+    QModelIndex result;
 
     auto* model = qobject_cast<GameListModel*>(QTreeView::model());
     if (!model)
@@ -213,13 +213,14 @@ QString GameTree::GetLastFilterResultItem() const {
             if (isRowHidden(j, folder_index)) {
                 continue;
             }
-
-            const QStandardItem* child = folder->child(j, 0);
-            file_path = child->data(GameListItemPath::FullPathRole).toString();
+            if (result.isValid()) {
+                return {};
+            }
+            result = folder->child(j, 0)->index();
         }
     }
 
-    return file_path;
+    return result;
 }
 
 int GameTree::FilterClosedResultCount(GameListModel* model) {

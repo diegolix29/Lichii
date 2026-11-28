@@ -119,7 +119,8 @@ void State::ProcessData(std::span<const u8> read_buffer) {
         Tegra::Texture::SwizzleSubrect(tmp, read_buffer, bytes_per_pixel, width, regs.dest.height,
                                        regs.dest.depth, x_offset, regs.dest.y, x_elements,
                                        regs.line_count, regs.dest.BlockHeight(),
-                                       regs.dest.BlockDepth(), regs.line_length_in);
+                                       regs.dest.BlockDepth(), regs.line_length_in,
+                                       memory_manager.UsesNativeTiling());
     }
 }
 

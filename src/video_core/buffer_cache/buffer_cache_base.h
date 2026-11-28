@@ -305,6 +305,10 @@ public:
     /// then, and another read of them waits for these copies (GetFlushArea: in_flight).
     void DownloadMemoryForRead(DAddr device_addr, u64 size);
 
+    void SetReadRunPageFilter(std::function<bool(DAddr, u64)> filter) {
+        read_run_page_allowed = std::move(filter);
+    }
+
     /// Writes the DownloadMemoryForRead copies over [device_addr, device_addr + size), and those
     /// submitted before them, to guest memory, waiting for the host GPU if it must. Any thread:
     /// the reading one before it reads, the GPU's side before it writes guest memory there. Takes
@@ -425,6 +429,10 @@ public:
     template <typename Ranges>
     void ClaimCpuWrites(const Ranges& ranges);
 
+    /// Whether WriteMemory uploads a write on a page holding GPU-written data into its buffer
+    /// (Switch 2 titles, a buffer registered there) instead of downloading the page first.
+    [[nodiscard]] bool InlinesPageWrite(DAddr device_addr, u64 size);
+
     /// Return true when there are uncommitted buffers to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
 
@@ -441,7 +449,11 @@ public:
     void PopAsyncFlushes();
     void PopAsyncBuffers();
 
-    bool DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount);
+    /// gpu_written_dest: the destination ranges that took GPU-written bytes, which guest memory
+    /// doesn't hold until they are downloaded
+    bool DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount,
+                 boost::container::small_vector<std::pair<DAddr, size_t>, 4>* gpu_written_dest =
+                     nullptr);
 
     bool DMAClear(GPUVAddr src_address, u64 amount, u32 value);
 
@@ -453,6 +465,13 @@ public:
         if (!collect) {
             nx2_list_copy_requests.clear();
         }
+    }
+    [[nodiscard]] bool Nx2HasListCopyRequests() const {
+        return !nx2_list_copy_requests.empty();
+    }
+    /// Pages a dispatch's NoteWorkRecorded records early downloads of.
+    [[nodiscard]] bool HasEarlyDownloads() const {
+        return !early_pages.empty();
     }
     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
     bool Nx2CopyListPages(u64 tick);
@@ -476,6 +495,26 @@ public:
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
+
+    /// Whether DownloadMemory(device_addr, size) would download nothing: no deferred CPU read
+    /// ranges, and no GPU-modified range on the pages it visits.
+    [[nodiscard]] bool DownloadsNothing(DAddr device_addr, u64 size) {
+        if constexpr (USE_MEMORY_MAPS) {
+            if (download_cpu_read_ranges) {
+                return false;
+            }
+        }
+        const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+        const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
+        return !IsRegionGpuModified(begin, end - begin);
+    }
+
+    /// Whether every byte the bound compute storage and texture buffers would mark GPU-written
+    /// for this dispatch already holds GPU writes. Call before the bindings are made (and mark).
+    [[nodiscard]] bool ComputeWritesHoldGpuData();
+
+    /// Whether every byte of the range holds GPU writes (a DMA clear or CPU write removes them).
+    [[nodiscard]] bool IsRegionFullyGpuModified(DAddr addr, size_t size);
 
     /// Visits the uniform and storage buffers bound for the last draw or dispatch with the cached
     /// host buffer holding each range, if one does, for diagnostics. Nothing is
@@ -598,7 +637,9 @@ private:
                ((device_addr + size) & ~Core::DEVICE_PAGEMASK);
     }
 
-    void RunGarbageCollector(bool aggressive_gc);
+    /// Deletes buffers unused for idle_frames frames (when not 0) or else 120 (60 if aggressive_gc).
+    /// Unless aggressive_gc, buffers holding GPU-written data stay.
+    void RunGarbageCollector(bool aggressive_gc, u64 idle_frames = 0);
 
     void BindHostIndexBuffer();
 
@@ -815,7 +856,10 @@ private:
     /// A read's download is submitted at once; an early one goes with the GPU thread's next
     /// submission.
     void RecordReadDownload(std::span<const std::pair<DAddr, u64>> ranges,
-                            std::span<const std::pair<DAddr, u64>> own, bool early);
+                            std::span<const std::pair<DAddr, u64>> own, bool early,
+                            std::span<const std::pair<DAddr, u64>> extra = {});
+
+    std::array<std::pair<DAddr, u64>, 2> AdjacentReadRanges(DAddr addr, u64 size);
 
     /// A guest read of the pages [begin, end): learns which pages the guest reads after the GPU
     /// writes them. `gpu_modified`: the read found GPU writes not yet in guest memory.
@@ -833,7 +877,7 @@ private:
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
                                                bool native_pointer = false,
                                                bool table_pointer = false,
-                                               bool compute = false) const;
+                                               bool compute = false, bool sized = false) const;
 
     void TraceTablePointer(bool compute, size_t stage, size_t ssbo_index, u32 cbuf_index,
                            u32 cbuf_offset, u32 indirect_offset, GPUVAddr holder,
@@ -891,6 +935,33 @@ private:
         u64 deletions{};
     };
     std::array<GeometrySync, NUM_VERTEX_BUFFERS + 1> geometry_syncs{};
+    /// The buffer a binding slot last touched in the LRU, and in which frame (TouchBufferOnce).
+    struct TouchMemo {
+        u64 frame{~u64{0}};
+        BufferId buffer_id{};
+        u64 deletions{}; ///< buffer_deletions then: the id may be another buffer's since
+    };
+    std::array<TouchMemo, NUM_VERTEX_BUFFERS> vertex_touches{};
+    std::array<std::array<TouchMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES> uniform_touches{};
+    void TouchBufferOnce(TouchMemo& memo, Buffer& buffer, BufferId buffer_id) noexcept;
+    /// FindBuffer's recent results by caching page.
+    struct FindMemo {
+        u64 page{~u64{0}};
+        u64 deletions{}; ///< buffer_deletions then
+        DAddr begin{};
+        DAddr end{};
+        BufferId buffer_id{};
+        bool sparse_compatible{};
+    };
+    std::array<FindMemo, 256> find_memos{};
+    /// Storage ranges VirtualRangeCache found in one segment (ResolveMultiRangeStorage).
+    struct SingleRangeMemo {
+        const Tegra::MemoryManager* memory{};
+        u64 map_serial{};
+        GPUVAddr gpu_addr{};
+        u32 size{};
+    };
+    std::array<SingleRangeMemo, 64> single_ranges{};
     /// Counts DeleteBuffer calls: a buffer id older than this count may have been freed or reused.
     u64 buffer_deletions = 0;
     /// EDEN_NX2_BUFFER_TRACE: buffers created (with the buffers they joined) and collected, logged
@@ -1146,14 +1217,17 @@ private:
         /// No longer GPU-modified once written: a newer GPU write (MarkWrittenBuffer) or value in
         /// guest memory takes its bytes out.
         Common::RangeSet<DAddr> clean_ranges;
+        std::optional<Common::RangeSet<DAddr>> speculative_clean_ranges;
         std::unique_ptr<ReadCheck> check; ///< EDEN_NX2_READ_CHECK
+        size_t first_extra_copy{};
         /// Recorded right after a GPU write, before any read (RecordEarlyDownloads)
         bool early{};
     };
     /// Oldest first, and written to guest memory in that order: none lands over newer bytes.
     std::deque<ReadDownload> read_downloads;
-    /// All the read downloads' clean_ranges (they don't overlap): GPU-modified bytes already on
-    /// their way, which later reads wait for rather than download again.
+    std::function<bool(DAddr, u64)> read_run_page_allowed;
+    /// Required clean_ranges only: GPU-modified bytes later reads can wait for without recording
+    /// another copy. A speculative copy can be discarded, so it never contributes coverage.
     Common::RangeSet<DAddr> read_download_ranges;
 
     /// EDEN_NX2_READ_CHECK: the bytes early downloads brought to a page's guest memory, and

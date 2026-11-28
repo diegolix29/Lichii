@@ -125,6 +125,9 @@ private:
     /// Handle key press events.
     void keyPressEvent(QKeyEvent* event) override;
 
+    /// Keeps Tab from moving the focus while an input is being mapped.
+    bool focusNextPrevChild(bool next) override;
+
     /// Handle combobox list refresh
     bool eventFilter(QObject* object, QEvent* event) override;
 

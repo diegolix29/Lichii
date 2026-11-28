@@ -7,6 +7,7 @@
 
 #include <deque>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include "common/container/unordered_map.h"
@@ -74,6 +75,12 @@ public:
         return ref->second.storage_id;
     }
 
+    /// EDEN_NX2_RENDER_UNLEND: GPURender points the cache at its register view of the channel
+    /// while it plays an unlent draw. Returns the engine it used.
+    Tegra::Engines::Maxwell3D* SwapMaxwell3D(Tegra::Engines::Maxwell3D* engine) noexcept {
+        return std::exchange(maxwell3d, engine);
+    }
+
 protected:
     static constexpr size_t UNSET_CHANNEL{(std::numeric_limits<size_t>::max)()};
 
@@ -93,6 +100,8 @@ protected:
         size_t ref_count;
         size_t storage_id;
         Tegra::MemoryManager* gpu_memory;
+        /// nvdrv owns the memory manager and destroys it when the address space is closed.
+        std::weak_ptr<Tegra::MemoryManager> owner;
     };
     ::Common::unordered_map<size_t, AddressSpaceRef> address_spaces;
     mutable std::mutex config_mutex;

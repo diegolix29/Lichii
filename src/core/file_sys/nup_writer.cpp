@@ -62,6 +62,7 @@ constexpr u16 TlvIcon = 0x0003;
 constexpr u16 TlvDisplayVersion = 0x0004;
 constexpr u16 TlvTitleName = 0x0005;
 constexpr u16 TlvPublisher = 0x0006;
+constexpr u16 TlvBuildId = 0x0007;
 constexpr u16 TlvSourceDump = 0x0008;
 constexpr u16 TlvLocalizedTitles = 0x0009;
 
@@ -232,7 +233,10 @@ void PutLE(std::vector<u8>& buffer, size_t offset, u64 value, size_t bytes) {
 }
 
 void PutBytes(std::vector<u8>& buffer, size_t offset, std::span<const u8> bytes) {
-    std::memcpy(buffer.data() + offset, bytes.data(), bytes.size());
+    // memcpy takes no null pointers, not even for zero bytes: an empty span can hold one.
+    if (!bytes.empty()) {
+        std::memcpy(buffer.data() + offset, bytes.data(), bytes.size());
+    }
 }
 
 using Digest = std::array<u8, 32>;
@@ -649,6 +653,24 @@ private:
             tlvs.emplace_back(TlvNpdm, std::move(npdm));
         }
 
+        if (kind == KindUpdate) {
+            for (const auto& sidecar_dir : {exefs, dir}) {
+                if (sidecar_dir.empty() || !IsFile(sidecar_dir / "control.nacp")) {
+                    continue;
+                }
+                Common::FS::IOFile file{sidecar_dir / "control.nacp",
+                                        Common::FS::FileAccessMode::Read};
+                if (!file.IsOpen() || file.GetSize() != sizeof(RawNACP)) {
+                    continue;
+                }
+                std::vector<u8> nacp(sizeof(RawNACP));
+                if (file.ReadSpan(std::span{nacp}) == nacp.size()) {
+                    tlvs.emplace_back(TlvNacp, std::move(nacp));
+                    break;
+                }
+            }
+        }
+
         if (kind != KindAddon) {
             if (auto loader = OpenLoader(vfs, dir)) {
                 std::string display_version;
@@ -687,8 +709,8 @@ private:
         return plan.packages.back().title_id;
     }
 
-    // Names, icon and control data belong to the base package, or the first one without a base.
-    // Our dumps rarely carry a control folder; when one does, the base's own wins, then updates.
+    // Keep the application-wide display metadata and fallback control on the base package,
+    // or the first package without a base.
     void AddApplicationMetadata() {
         const auto app = static_cast<u32>(std::distance(
             plan.packages.begin(), std::ranges::find(plan.packages, KindBase, &PlanPackage::kind)));
@@ -705,7 +727,9 @@ private:
             if (!have_control &&
                 loader->ReadControlData(control) == Loader::ResultStatus::Success) {
                 have_control = true;
-                tlvs.emplace_back(TlvNacp, control.GetRawBytes());
+                if (std::ranges::none_of(tlvs, [](const auto& tlv) { return tlv.first == TlvNacp; })) {
+                    tlvs.emplace_back(TlvNacp, control.GetRawBytes());
+                }
                 if (const auto name = control.GetApplicationName(); !name.empty()) {
                     tlvs.emplace_back(TlvTitleName, StringBytes(name));
                 }
@@ -2247,6 +2271,7 @@ EditResult EditNupMetadata(const fs::path& archive, const MetadataEdit& edit,
     std::string cur_publisher;
     std::vector<u8> cur_icon;
     std::vector<std::pair<std::string, std::string>> cur_localized;
+    bool publisher_matches_module_id = false;
     {
         RealVfsFilesystem vfs;
         const auto file =
@@ -2269,6 +2294,19 @@ EditResult EditNupMetadata(const fs::path& archive, const MetadataEdit& edit,
         cur_title = current.title_name;
         cur_version = current.display_version;
         cur_publisher = current.publisher;
+        constexpr size_t ModuleIdOffset = 0x40;
+        constexpr size_t ModuleIdSize = 0x20;
+        if (edit.publisher && *edit.publisher != cur_publisher &&
+            cur_publisher.size() == ModuleIdSize) {
+            const auto exefs = nup.GetExeFSDir(target);
+            const auto main = exefs ? exefs->GetFile("main") : nullptr;
+            std::array<u8, ModuleIdOffset + ModuleIdSize> header{};
+            publisher_matches_module_id =
+                main && main->ReadObject(&header) == header.size() &&
+                (std::memcmp(header.data(), "NSO0", 4) == 0 ||
+                 std::memcmp(header.data() + 0x10, "NRO0", 4) == 0) &&
+                std::memcmp(header.data() + ModuleIdOffset, cur_publisher.data(), ModuleIdSize) == 0;
+        }
         cur_icon = current.icon;
         cur_localized = current.localized_titles;
         cur_update_version =
@@ -2374,6 +2412,17 @@ EditResult EditNupMetadata(const fs::path& archive, const MetadataEdit& edit,
                     SetOrRemoveTlv(tlvs, TlvTitleName, StringBytes(*edit.title_name));
                 }
                 if (edit.publisher) {
+                    if (publisher_matches_module_id &&
+                        std::ranges::none_of(tlvs, [&](const auto& tlv) {
+                            return tlv.first == TlvBuildId &&
+                                   tlv.second.size() == cur_publisher.size() &&
+                                   std::memcmp(tlv.second.data(), cur_publisher.data(),
+                                               tlv.second.size()) == 0;
+                        })) {
+                        return fail(EditResult::InvalidSource,
+                                    "cannot edit Publisher: this NUP stores its Build ID in the "
+                                    "Publisher record");
+                    }
                     SetOrRemoveTlv(tlvs, TlvPublisher, StringBytes(*edit.publisher));
                 }
                 if (edit.icon) {

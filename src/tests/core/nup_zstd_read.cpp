@@ -160,6 +160,26 @@ std::size_t DirectoryBytes(const fs::path& dir) {
     return total;
 }
 
+// POSIX unlinks a spill file once it is open, so its bytes are counted through the descriptors
+// that still hold it. Other POSIX systems have no way to see them.
+#if defined(_WIN32) || defined(__linux__)
+std::size_t SpillBytes(const fs::path& dir) {
+    std::size_t total = DirectoryBytes(dir);
+#ifdef __linux__
+    std::error_code ec;
+    const auto prefix = fs::canonical(dir, ec).string();
+    for (const auto& fd : fs::directory_iterator("/proc/self/fd", ec)) {
+        const auto target = fs::read_symlink(fd.path(), ec).string();
+        if (target.starts_with(prefix) && target.ends_with(" (deleted)")) {
+            const auto size = fs::file_size(fd.path(), ec);
+            total += ec ? 0 : static_cast<std::size_t>(size);
+        }
+    }
+#endif
+    return total;
+}
+#endif
+
 } // namespace
 
 TEST_CASE("NUP zstd random reads match the source in memory and spilled", "[nup][nup-read]") {
@@ -264,9 +284,13 @@ TEST_CASE("NUP zstd spill file grows only as far as reads need", "[nup][nup-read
     REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
     const auto file = nup.OpenFile(0);
     REQUIRE(ReadMatches(file, content, 0, 4096));
-    REQUIRE(DirectoryBytes(t.path) < content.size() / 4);
+#if defined(_WIN32) || defined(__linux__)
+    REQUIRE(SpillBytes(t.path) < content.size() / 4);
+#endif
     REQUIRE(ReadMatches(file, content, content.size() - 4096, 4096));
-    REQUIRE(DirectoryBytes(t.path) == content.size());
+#if defined(_WIN32) || defined(__linux__)
+    REQUIRE(SpillBytes(t.path) == content.size());
+#endif
 }
 
 TEST_CASE("NUP zstd reads fail cleanly on corrupt or truncated extents", "[nup][nup-read]") {

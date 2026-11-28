@@ -112,7 +112,7 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
     connect(item_model, &GameListModel::SaveConfig, this, &GameList::SaveConfig);
     connect(item_model, &GameListModel::PopulatingStarted, this, &GameList::OnPopulate);
 
-    // TODO: impl on grid/carousel
+    // The grid and the carousel report theirs from OnTextChanged.
     connect(tree_view, &GameTree::FilterResultReady, search_field,
             [this](int visible, int total) { search_field->setFilterResult(visible, total); });
 
@@ -147,8 +147,34 @@ void GameList::SetupViews() {
     carousel_view->SetModel(item_model);
 }
 
-QString GameList::GetLastFilterResultItem() const {
-    return tree_view->GetLastFilterResultItem();
+QModelIndex GameList::GetFilterResult() const {
+    if (m_isTreeMode) {
+        return tree_view->GetFilterResult();
+    }
+    // The grid and the carousel show the games without folders, and filter alike. Only a sole
+    // shown game is a result.
+    QModelIndex result;
+    for (int row = 0; row < item_model->rowCount(); ++row) {
+        if (!grid_view->isRowHidden(row)) {
+            if (result.isValid()) {
+                return {};
+            }
+            result = item_model->index(row, 0);
+        }
+    }
+    return result;
+}
+
+int GameList::GameCount() const {
+    if (!m_isTreeMode) {
+        return item_model->rowCount();
+    }
+    int games = 0;
+    // The first row is Favorites and the last adds a directory; the rest are folders.
+    for (int i = 1; i < item_model->rowCount() - 1; ++i) {
+        games += item_model->item(i, 0)->rowCount();
+    }
+    return games;
 }
 
 void GameList::ClearFilter() {
@@ -167,6 +193,10 @@ void GameList::SetFilterVisible(bool visibility) {
 
 bool GameList::IsEmpty() const {
     return item_model->IsEmpty();
+}
+
+bool GameList::IsPopulating() const {
+    return m_populating;
 }
 
 void GameList::OnPopulate() {
@@ -190,8 +220,8 @@ void GameList::PopulateAsync(QVector<UISettings::GameDir>& game_dirs) {
     item_model->PopulateAsync(game_dirs);
 }
 
-void GameList::SetScanEnabled(bool enabled) {
-    item_model->SetScanEnabled(enabled);
+void GameList::SetScanEnabled(bool enabled, bool stop_worker) {
+    item_model->SetScanEnabled(enabled, stop_worker);
 }
 
 void GameList::SaveInterfaceLayout() {
@@ -284,7 +314,10 @@ void GameList::OnTextChanged(const QString& new_text) {
     if (m_isTreeMode) {
         tree_view->ApplyFilter(edit_filter_text, item_model);
     } else {
-        grid_view->ApplyFilter(edit_filter_text, item_model);
+        // Both views show the same flat list, and either can be switched to.
+        const int shown = grid_view->ApplyFilter(edit_filter_text, item_model);
+        carousel_view->ApplyFilter(edit_filter_text, item_model);
+        search_field->setFilterResult(shown, GameCount());
     }
 }
 
@@ -360,10 +393,7 @@ void GameList::OnPopulatingCompleted(const QStringList& watch_list) {
     m_populating = false;
     m_currentView->setEnabled(true);
 
-    int children_total = 0;
-    for (int i = 1; i < item_model->rowCount() - 1; ++i) {
-        children_total += item_model->item(i, 0)->rowCount();
-    }
+    const int children_total = GameCount();
 
     search_field->setFilterResult(children_total, children_total);
     if (children_total > 0) {
@@ -661,6 +691,12 @@ void GameList::UpdateIconSizes() {
 }
 
 void GameList::ValidateEntry(const QModelIndex& item) {
+    // Qt can activate a current row the search has hidden.
+    const bool hidden = m_isTreeMode ? tree_view->isRowHidden(item.row(), item.parent())
+                                     : grid_view->isRowHidden(item.row());
+    if (hidden) {
+        return;
+    }
     const auto selected = item.sibling(item.row(), 0);
 
     switch (selected.data(GameListItem::TypeRole).value<GameListItemType>()) {
@@ -769,6 +805,9 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     const bool has_shader_warm = ShaderWarmFilesExist(program_id);
     QAction* prepare_shaders = context_menu.addAction(
         has_shader_warm ? tr("Rebuild Shader Precache") : tr("Build Shader Precache"));
+    QAction* precompile_shaders = context_menu.addAction(tr("Precompile All Shaders"));
+    precompile_shaders->setCheckable(true);
+    precompile_shaders->setChecked(ShaderWarmRequested(program_id));
     QAction* delete_shader_warm = nullptr;
     if (has_shader_warm) {
         delete_shader_warm = context_menu.addAction(tr("Delete Shader Precache"));
@@ -853,7 +892,7 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
                 [this, program_id] { emit ReportCompatibilityRequested(program_id); });
     }
 
-    const std::array<std::pair<QAction*, const char*>, 20> icons{{
+    const std::array<std::pair<QAction*, const char*>, 21> icons{{
         {favorite, "star"},
         {start_game, "play"},
         {start_game_global, "play"},
@@ -861,6 +900,7 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
         {open_mod_location, "puzzle"},
         {open_transferable_shader_cache, "layers"},
         {prepare_shaders, "cpu"},
+        {precompile_shaders, "cpu"},
         {delete_shader_warm, "trash"},
         {ryujinx, "link"},
         {remove_menu->menuAction(), "trash"},
@@ -911,6 +951,9 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
             [this, program_id]() { emit OpenTransferableShaderCacheRequested(program_id); });
     connect(prepare_shaders, &QAction::triggered, this,
             [this, program_id, path]() { emit PrepareShaderWarmRequested(program_id, path); });
+    connect(precompile_shaders, &QAction::toggled, this, [this, program_id, path](bool checked) {
+        emit PrecompileShadersRequested(program_id, path, checked);
+    });
     if (delete_shader_warm) {
         connect(delete_shader_warm, &QAction::triggered, this,
                 [this, program_id]() { emit DeleteShaderWarmRequested(program_id); });
@@ -996,7 +1039,7 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
             });
 #endif
     connect(properties, &QAction::triggered, this,
-            [this, path]() { emit OpenPerGameGeneralRequested(path); });
+            [this, program_id, path]() { emit OpenPerGameGeneralRequested(program_id, path); });
     connect(lookup_artwork, &QAction::triggered, this, [this, program_id] {
         QueueArtworkLookup(program_id, GameTitle(program_id), true);
     });

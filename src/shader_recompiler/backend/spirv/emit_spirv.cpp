@@ -238,7 +238,20 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
     }
 }
 
+// Definitions are ids of the module being emitted. Those an earlier emission of this program
+// left are ids of another module: clear them, so that each emission starts as the first did and a
+// pseudo-operation is only taken as defined by its parent in this one. Nothing defines an
+// instruction before DefineMain.
+void ClearDefinitions(IR::Program& program) {
+    for (IR::Block* const block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            inst.SetDefinition(Id{});
+        }
+    }
+}
+
 Id DefineMain(EmitContext& ctx, IR::Program& program) {
+    ClearDefinitions(program);
     const Id void_function{ctx.TypeFunction(ctx.void_id)};
     const Id main{ctx.OpFunction(ctx.void_id, spv::FunctionControlMask::MaskNone, void_function)};
     for (IR::Block* const block : program.blocks) {
@@ -597,7 +610,11 @@ void PatchPhiNodes(IR::Program& program, EmitContext& ctx) {
                     ++phi_index;
                 }
                 IR::Inst* phi = phi_instructions[phi_index];
-                return { ctx.Def(phi->Arg(phi_arg)), parent };
+                const Id value{ctx.Def(phi->Arg(phi_arg))};
+                if (!Sirit::ValidId(value)) {
+                    throw LogicError("Phi operand {} has no definition", phi_arg);
+                }
+                return {value, parent};
             });
         }
 
@@ -733,28 +750,41 @@ void EmitPhiMove(EmitContext&) {
     throw LogicError("Unreachable instruction");
 }
 
-void EmitGetZeroFromOp(EmitContext&) {
-    throw LogicError("Unreachable instruction");
+namespace {
+// A pseudo-operation is emitted by its parent, which defines it; the parent comes first, so by
+// the time the pseudo-operation is reached it has its definition from this emission. One
+// without a definition was not emitted by its parent.
+void CheckPseudoOperation(IR::Inst* inst) {
+    if (!Sirit::ValidId(inst->Definition<Id>())) {
+        const IR::Inst* const parent{inst->Arg(0).TryInstRecursive()};
+        throw LogicError("{} was not defined by its parent {}", inst->GetOpcode(),
+                         parent ? IR::NameOf(parent->GetOpcode()) : "(not an instruction)");
+    }
+}
+} // Anonymous namespace
+
+void EmitGetZeroFromOp(EmitContext&, IR::Inst* inst) {
+    CheckPseudoOperation(inst);
 }
 
-void EmitGetSignFromOp(EmitContext&) {
-    throw LogicError("Unreachable instruction");
+void EmitGetSignFromOp(EmitContext&, IR::Inst* inst) {
+    CheckPseudoOperation(inst);
 }
 
-void EmitGetCarryFromOp(EmitContext&) {
-    throw LogicError("Unreachable instruction");
+void EmitGetCarryFromOp(EmitContext&, IR::Inst* inst) {
+    CheckPseudoOperation(inst);
 }
 
-void EmitGetOverflowFromOp(EmitContext&) {
-    throw LogicError("Unreachable instruction");
+void EmitGetOverflowFromOp(EmitContext&, IR::Inst* inst) {
+    CheckPseudoOperation(inst);
 }
 
-void EmitGetSparseFromOp(EmitContext&) {
-    throw LogicError("Unreachable instruction");
+void EmitGetSparseFromOp(EmitContext&, IR::Inst* inst) {
+    CheckPseudoOperation(inst);
 }
 
-void EmitGetInBoundsFromOp(EmitContext&) {
-    throw LogicError("Unreachable instruction");
+void EmitGetInBoundsFromOp(EmitContext&, IR::Inst* inst) {
+    CheckPseudoOperation(inst);
 }
 
 } // namespace Shader::Backend::SPIRV

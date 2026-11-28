@@ -92,10 +92,14 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
     LOG_DEBUG(Service_NVDRV, "syncpt_id={}, threshold={}, timeout={}, is_allocation={}",
               params.fence.id, params.fence.value, params.timeout, is_allocation);
 
+    // For a wait on a given slot, the guest's value names the slot. It is checked before it
+    // indexes the events, and the write takes the events lock like every other use of fails.
+    // The lock taken below is released before this runs.
     bool must_unmark_fail = !is_allocation;
     const u32 event_id = params.value.raw;
     SCOPE_EXIT {
-        if (must_unmark_fail) {
+        if (must_unmark_fail && event_id < MaxNvEvents) {
+            auto lock = NvEventsLock();
             events[event_id].fails = 0;
         }
     };
@@ -282,6 +286,10 @@ NvResult nvhost_ctrl::IocCtrlClearEventWait(IocCtrlEventClearParams& params) {
     auto lock = NvEventsLock();
 
     auto& event = events[event_id];
+    // A slot never registered, or unregistered since, has no KEvent to clear.
+    if (!event.registered) {
+        return NvResult::BadParameter;
+    }
     if (event.status.exchange(EventState::Cancelling, std::memory_order_acq_rel) ==
         EventState::Waiting) {
         auto& host1x_syncpoint_manager = system.Host1x().GetSyncpointManager();

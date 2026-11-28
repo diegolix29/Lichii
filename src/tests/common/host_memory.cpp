@@ -4,7 +4,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <thread>
+#include <vector>
+
+#ifdef __linux__
+#include <fstream>
+#include <string>
+#endif
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -17,6 +27,7 @@
 
 #include "common/host_memory.h"
 #include "common/literals.h"
+#include "common/thread.h"
 
 using Common::HostMemory;
 using namespace Common::Literals;
@@ -262,6 +273,79 @@ TEST_CASE("HostMemory: Partial sparse middle unmap and check bindings", "[common
     REQUIRE(ptr[0x3fff] == 12);
 }
 
+#if defined(_WIN32) || defined(__linux__)
+TEST_CASE("HostMemory: Partial unmap preserves the protections of both kept pieces",
+          "[common][host_memory]") {
+    if (!MapsSingleGuestPages()) {
+        SKIP("Host pages larger than 4 KiB only map whole host pages");
+    }
+    constexpr size_t Page = 0x1000;
+    constexpr size_t VirtualOffset = 0x80000;
+    constexpr size_t BackingOffset = 0x20000;
+    HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
+    REQUIRE(mem.VirtualBasePointer() != nullptr);
+    mem.Map(VirtualOffset, BackingOffset, 6 * Page, PERMS, HEAP);
+    u8* const view = mem.VirtualBasePointer() + VirtualOffset;
+    const auto protection = [view](size_t page) {
+        const u8* const address = view + page * Page;
+#ifdef _WIN32
+        MEMORY_BASIC_INFORMATION info{};
+        REQUIRE(VirtualQuery(address, &info, sizeof(info)) == sizeof(info));
+        switch (info.Protect) {
+        case PAGE_READWRITE:
+            return PERMS;
+        case PAGE_READONLY:
+            return Common::MemoryPermission::Read;
+        case PAGE_NOACCESS:
+            return Common::MemoryPermission{};
+        }
+#else
+        const auto pointer = reinterpret_cast<uintptr_t>(address);
+        std::ifstream maps{"/proc/self/maps"};
+        std::string line;
+        while (std::getline(maps, line)) {
+            unsigned long long begin{}, end{};
+            char perms[5]{};
+            if (std::sscanf(line.c_str(), "%llx-%llx %4s", &begin, &end, perms) == 3 &&
+                begin <= pointer && pointer < end) {
+                auto permission = Common::MemoryPermission{};
+                if (perms[0] == 'r') {
+                    permission |= Common::MemoryPermission::Read;
+                }
+                if (perms[1] == 'w') {
+                    permission |= Common::MemoryPermission::Write;
+                }
+                return permission;
+            }
+        }
+#endif
+        FAIL("Could not determine the protection of kept page " << page);
+        return Common::MemoryPermission{};
+    };
+
+    view[5 * Page] = 0x15;
+    mem.Protect(VirtualOffset, Page, Common::MemoryPermission::Read);
+    mem.Protect(VirtualOffset + 4 * Page, Page, Common::MemoryPermission{});
+    mem.Protect(VirtualOffset + 5 * Page, Page, Common::MemoryPermission::Read);
+    REQUIRE(protection(0) == Common::MemoryPermission::Read);
+    REQUIRE(protection(4) == Common::MemoryPermission{});
+
+    mem.Unmap(VirtualOffset + 2 * Page, 2 * Page, HEAP);
+
+    REQUIRE(protection(0) == Common::MemoryPermission::Read);
+    REQUIRE(protection(1) == PERMS);
+    REQUIRE(protection(4) == Common::MemoryPermission{});
+    REQUIRE(protection(5) == Common::MemoryPermission::Read);
+    REQUIRE(view[5 * Page] == 0x15);
+
+    mem.Protect(VirtualOffset + 4 * Page, 2 * Page, PERMS);
+    REQUIRE(protection(4) == PERMS);
+    REQUIRE(protection(5) == PERMS);
+    view[4 * Page] = 0x24;
+    REQUIRE(mem.BackingBasePointer()[BackingOffset + 4 * Page] == 0x24);
+}
+#endif
+
 #ifdef _WIN32
 TEST_CASE("HostMemory: Trim zero pages keeps contents", "[common]") {
     constexpr size_t Page = 0x1000;
@@ -305,6 +389,73 @@ TEST_CASE("HostMemory: Trim zero pages keeps contents", "[common]") {
     REQUIRE(all(view + 2 * Page, 0));
     REQUIRE(all(view + 3 * Page, 0));
     REQUIRE(all(backing + 0x400000, 0));
+}
+
+// Latency of protect calls that take the placeholder lock (across two views) while a zero-page
+// pass runs at the ZeroTrim thread's low priority and every core is busy, as on a loaded PC.
+// tests "[.zero_trim_lock_benchmark]" runs it.
+TEST_CASE("HostMemory: Protect latency during a zero-page pass", "[.zero_trim_lock_benchmark]") {
+    constexpr size_t Page = 0x1000;
+    constexpr size_t ViewSize = 1_MiB;
+    constexpr size_t Views = 256;
+    constexpr size_t Base = 0x100000000;
+    HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
+    REQUIRE(mem.BackingBasePointer() != nullptr);
+    for (size_t i = 0; i < Views; ++i) {
+        mem.Map(Base + i * ViewSize, i * ViewSize, ViewSize, PERMS, HEAP);
+    }
+    u8* const view = mem.VirtualBasePointer() + Base;
+    for (size_t offset = 0; offset < Views * ViewSize; offset += Page) {
+        view[offset] = 1;
+    }
+
+    std::atomic<bool> done{false};
+    std::vector<std::jthread> spinners;
+    for (unsigned i = 0; i < std::max(1U, std::thread::hardware_concurrency()); ++i) {
+        spinners.emplace_back([&] {
+            const auto stop = std::chrono::steady_clock::now() + std::chrono::seconds{20};
+            while (!done.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() < stop) {
+            }
+        });
+    }
+    std::vector<double> latencies;
+    std::jthread protector([&] {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+        while (!done.load(std::memory_order_relaxed)) {
+            const auto start = std::chrono::steady_clock::now();
+            mem.Protect(Base + ViewSize - Page, 2 * Page, PERMS);
+            latencies.push_back(
+                std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start)
+                    .count());
+            std::this_thread::sleep_for(std::chrono::microseconds{200});
+        }
+    });
+    double pass_ms = 0;
+    std::jthread trimmer([&] {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        for (int pass = 0; pass < 4; ++pass) {
+            const auto start = std::chrono::steady_clock::now();
+            static_cast<void>(mem.TrimZeroPages());
+            pass_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                 start)
+                           .count();
+        }
+    });
+    trimmer.join();
+    done = true;
+    protector.join();
+    spinners.clear();
+
+    REQUIRE(!latencies.empty());
+    std::ranges::sort(latencies);
+    std::printf("zero-page pass over %zu MiB of views: %.1f ms a pass; %zu locked protects, us p50 "
+                "%.1f p99 %.1f max %.1f\n",
+                Views * ViewSize >> 20, pass_ms / 4, latencies.size(),
+                latencies[latencies.size() / 2], latencies[latencies.size() * 99 / 100],
+                latencies.back());
+    for (size_t offset = 0; offset < Views * ViewSize; offset += Page) {
+        REQUIRE(view[offset] == 1);
+    }
 }
 
 TEST_CASE("HostMemory: Protect within a view, across views and over a gap", "[common]") {

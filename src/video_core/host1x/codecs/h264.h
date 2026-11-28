@@ -75,6 +75,9 @@ public:
     /// Compose the H264 frame for FFmpeg decoding
     [[nodiscard]] std::span<const u8> ComposeFrame() override;
 
+    /// Whether the picture info's current picture index names one of the surfaces.
+    [[nodiscard]] bool ValidPictureIndex() const;
+
     std::tuple<u64, u64> GetProgressiveOffsets() override;
     std::tuple<u64, u64, u64, u64> GetInterlacedOffsets() override;
     bool IsInterlaced() override;

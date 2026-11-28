@@ -39,14 +39,18 @@ bool GameListSearchField::KeyReleaseEater::eventFilter(QObject* obj, QEvent* eve
         // If there is only one result launch this game
         case Qt::Key_Return:
         case Qt::Key_Enter: {
-            if (gamelist->search_field->visible == 1) {
-                const QString file_path = gamelist->GetLastFilterResultItem();
-
+            // While a scan runs, rows change without the search being applied to them.
+            const QPersistentModelIndex result =
+                gamelist->search_field->visible == 1 && !gamelist->IsPopulating()
+                    ? gamelist->GetFilterResult()
+                    : QModelIndex{};
+            if (result.isValid()) {
                 // To avoid loading error dialog loops while confirming them using enter
                 // Also users usually want to run a different game after closing one
                 gamelist->search_field->edit_filter->clear();
                 edit_filter_text.clear();
-                emit gamelist->GameChosen(file_path);
+                // Launch it as a click would, with its program id: an archive can hold several.
+                gamelist->ValidateEntry(result);
             } else {
                 return QObject::eventFilter(obj, event);
             }

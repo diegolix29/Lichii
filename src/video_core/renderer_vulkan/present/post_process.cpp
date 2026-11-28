@@ -624,10 +624,19 @@ bool PostProcessChain::BuildEffects(const Device& device, MemoryAllocator& alloc
             continue;
         }
 
-        const u32 buffer_size = std::max<u32>(effect.uniform_size, 4);
+        const VkBufferCreateInfo uniform_buffer_ci{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .size = std::max<u32>(effect.uniform_size, 4),
+            .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+        };
         for (u32 i = 0; i < m_image_count; ++i) {
             effect.uniform_buffers.push_back(
-                CreateWrappedBuffer(allocator, buffer_size, MemoryUsage::Upload));
+                allocator.CreateBuffer(uniform_buffer_ci, MemoryUsage::Upload));
         }
 
         size_t sampler_descriptor_count = 0;

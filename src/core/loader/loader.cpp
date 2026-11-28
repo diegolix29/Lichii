@@ -286,7 +286,7 @@ std::string GetFileTypeString(FileType type) {
     return "unknown";
 }
 
-constexpr std::array<const char*, 70> RESULT_MESSAGES{
+constexpr std::array<const char*, 71> RESULT_MESSAGES{
     "The operation completed successfully.",
     "The loader requested to load is already loaded.",
     "The operation is not implemented.",
@@ -360,6 +360,7 @@ constexpr std::array<const char*, 70> RESULT_MESSAGES{
     "Integrity verification failed.",
     "The NUP container is malformed or its TOC hash does not match.",
     "The NUP container does not contain a loadable base package.",
+    "The selected executable is not the Switch 2 HOME system program.",
 };
 
 std::string GetResultStatusString(ResultStatus status) {
@@ -373,6 +374,15 @@ std::ostream& operator<<(std::ostream& os, ResultStatus status) {
 
 AppLoader::AppLoader(FileSys::VirtualFile file_) : file(std::move(file_)) {}
 AppLoader::~AppLoader() = default;
+
+ResultStatus AppLoader::ReadDeveloper(std::string& developer) {
+    FileSys::NACP control;
+    if (const ResultStatus result = ReadControlData(control); result != ResultStatus::Success) {
+        return result;
+    }
+    developer = control.GetDeveloperName();
+    return ResultStatus::Success;
+}
 
 ResultStatus AppLoader::ReadDisplayVersion(std::string& version) {
     FileSys::NACP control;

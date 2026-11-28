@@ -452,17 +452,26 @@ protected:
         }
     }
 
+    Common::FS::IOFile OpenAvatar() const {
+        if (profile_manager.IsScratch()) {
+            return {};
+        }
+        return Common::FS::IOFile{GetImagePath(user_id), Common::FS::FileAccessMode::Read,
+                                  Common::FS::FileType::BinaryFile};
+    }
+
     void LoadImage(HLERequestContext& ctx) {
         LOG_DEBUG(Service_ACC, "called");
 
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
 
-        const Common::FS::IOFile image(GetImagePath(user_id), Common::FS::FileAccessMode::Read,
-                                       Common::FS::FileType::BinaryFile);
+        const auto image = OpenAvatar();
         if (!image.IsOpen()) {
-            LOG_WARNING(Service_ACC,
-                        "Failed to load user provided image! Falling back to built-in backup...");
+            if (!profile_manager.IsScratch()) {
+                LOG_WARNING(Service_ACC,
+                            "Failed to load user provided image! Falling back to built-in backup...");
+            }
             ctx.WriteBuffer(Core::Constants::ACCOUNT_BACKUP_JPEG);
             rb.Push(static_cast<u32>(Core::Constants::ACCOUNT_BACKUP_JPEG.size()));
             return;
@@ -485,12 +494,13 @@ protected:
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
 
-        const Common::FS::IOFile image(GetImagePath(user_id), Common::FS::FileAccessMode::Read,
-                                       Common::FS::FileType::BinaryFile);
+        const auto image = OpenAvatar();
 
         if (!image.IsOpen()) {
-            LOG_WARNING(Service_ACC,
-                        "Failed to load user provided image! Falling back to built-in backup...");
+            if (!profile_manager.IsScratch()) {
+                LOG_WARNING(Service_ACC,
+                            "Failed to load user provided image! Falling back to built-in backup...");
+            }
             rb.Push(static_cast<u32>(Core::Constants::ACCOUNT_BACKUP_JPEG.size()));
             return;
         }
@@ -567,6 +577,12 @@ protected:
     }
 
     void StoreWithImage(HLERequestContext& ctx) {
+        if (profile_manager.IsScratch()) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(ResultAccountUpdateFailed);
+            return;
+        }
+
         IPC::RequestParser rp{ctx};
         const auto base = rp.PopRaw<ProfileBase>();
 
@@ -1141,7 +1157,12 @@ void Module::Interface::InitializeApplicationInfoV2(HLERequestContext& ctx) {
 
 void Module::Interface::BeginUserRegistration(HLERequestContext& ctx) {
     const auto user_id = Common::UUID::MakeRandom();
-    profile_manager->CreateNewUser(user_id, "Eden");
+    const auto created = profile_manager->CreateNewUser(user_id, "Eden");
+    if (profile_manager->IsScratch() && created.IsFailure()) {
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(created);
+        return;
+    }
 
     LOG_INFO(Service_ACC, "called, uuid={}", user_id.FormattedString());
 
@@ -1749,7 +1770,67 @@ public:
     }
 };
 
+namespace {
+
+class ScratchSystemAccount final : public Module::Interface {
+public:
+    ScratchSystemAccount(Core::System& system_, std::shared_ptr<ProfileManager> profile_manager_)
+        : Interface{std::make_shared<Module>(), std::move(profile_manager_), system_, "acc:su"} {
+        static const FunctionInfo functions[] = {
+            {0, &Interface::GetUserCount, "GetUserCount"},
+            {1, &Interface::GetUserExistence, "GetUserExistence"},
+            {2, &Interface::ListAllUsers, "ListAllUsers"},
+            {3, &Interface::ListOpenUsers, "ListOpenUsers"},
+            {4, &Interface::GetLastOpenedUser, "GetLastOpenedUser"},
+            {5, &Interface::GetProfile, "GetProfile"},
+            {50, &Interface::IsUserRegistrationRequestPermitted, "IsUserRegistrationRequestPermitted"},
+            {200, &Interface::BeginUserRegistration, "BeginUserRegistration"},
+            {201, &Interface::CompleteUserRegistration, "CompleteUserRegistration"},
+            {203, &Interface::DeleteUser, "DeleteUser"},
+            {204, &Interface::SetUserPosition, "SetUserPosition"},
+            {205, &Interface::GetProfileEditor, "GetProfileEditor"},
+        };
+        RegisterHandlers(functions);
+    }
+
+    Result HandleSyncRequest(Kernel::KServerSession& session, HLERequestContext& ctx) override {
+        const auto type = ctx.GetCommandType();
+        const bool request = type == IPC::CommandType::Request ||
+                             type == IPC::CommandType::RequestWithContext;
+        const bool control = type == IPC::CommandType::Control ||
+                             type == IPC::CommandType::ControlWithContext;
+        if (type == IPC::CommandType::Close || type == IPC::CommandType::TIPC_Close ||
+            (request && handlers.contains(ctx.GetCommand())) || (control && ctx.GetCommand() <= 4)) {
+            return ServiceFrameworkBase::HandleSyncRequest(session, ctx);
+        }
+
+        IPC::ResponseBuilder reply{ctx, 2};
+        reply.Push(ResultUnknown);
+        if (system.IsPoweredOn()) {
+            ctx.WriteToOutgoingCommandBuffer();
+        }
+        return ResultSuccess;
+    }
+};
+
+} // namespace
+
+std::shared_ptr<SessionRequestHandler> CreateScratchSystemAccountService(Core::System& system) {
+    auto profile_manager = system.GetScratchProfileManager();
+    if (!profile_manager) {
+        return {};
+    }
+    return std::make_shared<ScratchSystemAccount>(system, std::move(profile_manager));
+}
+
 void LoopProcess(Core::System& system) {
+    if (auto scratch = CreateScratchSystemAccountService(system)) {
+        auto server_manager = std::make_unique<ServerManager>(system);
+        server_manager->RegisterNamedService("acc:su", std::move(scratch));
+        ServerManager::RunServer(std::move(server_manager));
+        return;
+    }
+
     auto module = std::make_shared<Module>();
     auto profile_manager = std::make_shared<ProfileManager>();
     auto server_manager = std::make_unique<ServerManager>(system);

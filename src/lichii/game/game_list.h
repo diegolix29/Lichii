@@ -74,14 +74,17 @@ public:
                       MainWindow* parent = nullptr);
     ~GameList() override;
 
-    QString GetLastFilterResultItem() const;
+    QModelIndex GetFilterResult() const;
+    /// The games in the list, not counting Favorites' copies.
+    int GameCount() const;
     void ClearFilter();
     void SetFilterFocus();
     void SetFilterVisible(bool visibility);
     bool IsEmpty() const;
+    bool IsPopulating() const;
 
     void PopulateAsync(QVector<UISettings::GameDir>& game_dirs);
-    void SetScanEnabled(bool enabled);
+    void SetScanEnabled(bool enabled, bool stop_worker = true);
     void SetReportableProgramId(u64 program_id);
 
     void SaveInterfaceLayout();
@@ -116,7 +119,7 @@ signals:
     void OpenTransferableShaderCacheRequested(u64 program_id);
     void PrepareShaderWarmRequested(u64 program_id, const std::string& game_path);
     void DeleteShaderWarmRequested(u64 program_id);
-    void PrepareShadersFromRecipeRequested(u64 program_id, const std::string& game_path);
+    void PrecompileShadersRequested(u64 program_id, const std::string& game_path, bool on);
     void RemoveInstalledEntryRequested(u64 program_id, QtCommon::Game::InstalledEntryType type);
     void RemoveFileRequested(u64 program_id, QtCommon::Game::GameListRemoveTarget target,
                              const std::string& game_path);
@@ -134,7 +137,7 @@ signals:
     void CopyTIDRequested(u64 program_id);
     void CreateShortcut(u64 program_id, const std::string& game_path,
                         const QtCommon::Game::ShortcutTarget target);
-    void OpenPerGameGeneralRequested(const std::string& file);
+    void OpenPerGameGeneralRequested(u64 program_id, const std::string& file);
     void LinkToRyujinxRequested(const u64& program_id);
     void OpenDirectory(const QString& directory);
     void AddDirectory();

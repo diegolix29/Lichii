@@ -23,6 +23,7 @@
 #include "core/hle/ipc.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/service/am/am_types.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/kernel_helpers.h"
 #include "core/hle/service/service.h"
@@ -72,14 +73,21 @@ void PushStubZeroes(IPC::ResponseBuilder& rb) {
     }
 }
 
+// Switch 2 programs and the Switch 1 applets (the HOME Menu, overlayDisp, the LLE applets) still
+// call commands nobody has implemented. An unanswered command aborts the caller, so they get a
+// zeroed reply, as in Ryujinx-Nextendo (d00349a3).
+bool AutoStubsCaller(const Kernel::KProcess* caller) {
+    return caller != nullptr &&
+           (caller->IsSwitch2() || AM::IsAppletProgramId(caller->GetProgramId()));
+}
+
 } // namespace
 
 bool ServiceFrameworkBase::StubAllowed(HLERequestContext& ctx) {
     static const bool env_auto_stub = std::getenv("EDEN_NX2_AUTO_STUB") != nullptr;
     const auto* const caller = ctx.GetThread().GetOwnerProcess();
     if (Settings::values.use_auto_stub || env_auto_stub ||
-        std::string_view{service_name}.starts_with(Nx2StubPrefix) ||
-        (caller != nullptr && caller->IsSwitch2())) {
+        std::string_view{service_name}.starts_with(Nx2StubPrefix) || AutoStubsCaller(caller)) {
         // Logged once per command: these are still unimplemented.
         static std::mutex mutex;
         static std::set<std::pair<std::string_view, u32>> logged;
@@ -141,13 +149,11 @@ void ServiceFrameworkBase::RegisterHandlersBaseTipc(const FunctionInfoBase* func
 
 void ServiceFrameworkBase::ReportUnimplementedFunction(HLERequestContext& ctx,
                                                        const FunctionInfoBase* info) {
-    // EDEN_NX2_AUTO_STUB=1 auto-stubs every unknown command without touching the config. Switch 2
-    // programs are always auto-stubbed: they still call many commands nobody has implemented.
+    // EDEN_NX2_AUTO_STUB=1 auto-stubs every unknown command without touching the config.
     static const bool env_auto_stub = std::getenv("EDEN_NX2_AUTO_STUB") != nullptr;
-    const auto* const caller = ctx.GetThread().GetOwnerProcess();
     const bool auto_stub = Settings::values.use_auto_stub || env_auto_stub ||
                            std::string_view{service_name}.starts_with(Nx2StubPrefix) ||
-                           (caller != nullptr && caller->IsSwitch2());
+                           AutoStubsCaller(ctx.GetThread().GetOwnerProcess());
     // Auto-stubbed commands are reported once each: title 1 polls nx2:camera 29 every frame
     // (~47 calls a second), and every report wrote a Critical line, which flushes the log file.
     if (auto_stub) {

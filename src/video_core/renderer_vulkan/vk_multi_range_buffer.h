@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -43,6 +44,7 @@ class MultiRangeBufferCache final {
 public:
     static constexpr VkDeviceSize DEFAULT_BLOCK_SIZE = 64 * 1024;
     static constexpr size_t MAX_RETIRED = 256;
+    static constexpr u64 MAX_UNUSED_FRAMES = 60;
 
     explicit MultiRangeBufferCache(const Device& device);
 
@@ -57,9 +59,13 @@ public:
 
     void Invalidate(u64 key);
 
-    void DropOwner(Scheduler& scheduler, VkBuffer owner);
+    [[nodiscard]] bool DropOwner(Scheduler& scheduler, VkBuffer owner);
 
-    void TickFrame(Scheduler& scheduler);
+    /// Stamp retirements only after the current draw and earlier follower packets have recorded.
+    /// The caller uses the same completion snapshot for sources.
+    void TickFrame(Scheduler& scheduler, u64 tick, u64 completed_tick);
+
+    void Clear();
 
     VkDeviceSize block_size{DEFAULT_BLOCK_SIZE};
     bool use_sparse{};
@@ -68,21 +74,20 @@ private:
     struct Retired {
         SparseBuffer handle;
         vk::Buffer gathered;
-        u64 tick{};
+        std::optional<u64> tick{};
+        std::vector<MultiRangeSource> sparse_sources;
     };
 
     struct Entry {
         vk::Buffer gathered;
         SparseBuffer sparse_handle;
-        std::vector<VkBuffer> owners;
+        std::vector<MultiRangeSource> sources;
         VkDeviceAddress address{};
         VkDeviceSize size{};
-        u64 geometry{};
         u64 content{};
+        u64 last_used{};
         bool dirty{true};
     };
-
-    [[nodiscard]] u64 HashSources(std::span<const MultiRangeSource> sources) const;
 
     [[nodiscard]] u64 HashContent(std::span<const MultiRangeSource> sources) const;
 
@@ -96,12 +101,13 @@ private:
 
     void RetireEntry(Scheduler& scheduler, Entry& entry);
 
-    void DrainRetired(Scheduler& scheduler);
+    void DrainRetired(u64 completed_tick);
 
     ::Common::unordered_map<u64, Entry> entries;
     boost::container::small_vector<Retired, MAX_RETIRED> retired;
     u32 sparse_memory_type_bits{};
     VkBufferUsageFlags sparse_usage{};
+    u64 frame{};
 };
 
 } // namespace Vulkan

@@ -569,10 +569,12 @@ NupEditDialog::NupEditDialog(const std::filesystem::path& archive, QWidget* pare
     icon_row->addLayout(icon_buttons, 1);
 
     name_edit = new QLineEdit(QString::fromStdString(current.title_name));
+    name_edit->setObjectName(QStringLiteral("nupEditName"));
     name_edit->setPlaceholderText(tr("Name shown in the game list"));
     name_edit->setClearButtonEnabled(true);
 
     publisher_edit = new QLineEdit(QString::fromStdString(current.publisher));
+    publisher_edit->setObjectName(QStringLiteral("nupEditPublisher"));
     publisher_edit->setPlaceholderText(tr("Publisher shown in the game list"));
     publisher_edit->setClearButtonEnabled(true);
 
@@ -696,7 +698,7 @@ FileSys::Nup::MetadataEdit NupEditDialog::Edit() const {
         edit.localized_titles = std::move(localized);
     }
     if (const auto publisher = publisher_edit->text().trimmed().toStdString();
-        publisher != current.publisher) {
+        publisher_edit->isModified() && publisher != current.publisher) {
         edit.publisher = publisher;
     }
     if (const auto version = version_edit->text().trimmed().toStdString();

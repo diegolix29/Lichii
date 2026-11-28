@@ -216,7 +216,7 @@ private:
         bool initialised{};
         bool absolute_big_page_limit{}; //!< Switch 2 layout: big-page limit is va_range_end
     } vm;
-    std::unique_ptr<Tegra::MemoryManager> gmmu;
+    std::shared_ptr<Tegra::MemoryManager> gmmu;
 
     struct IoctlNx2SyncpointShimInfo {
         u64_le address;

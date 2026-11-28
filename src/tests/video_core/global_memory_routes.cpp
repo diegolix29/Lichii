@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <set>
+#include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -14,6 +21,7 @@
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/profile.h"
+#include "video_core/renderer_vulkan/pipeline_shader_emission.h"
 
 namespace {
 using namespace Shader;
@@ -57,6 +65,47 @@ std::vector<size_t> SelectionsPerFunction(const std::vector<u32>& code) {
             ++result.back();
         }
         i += count;
+    }
+    return result;
+}
+
+// EDEN_GLOBAL_MEMORY_ROUTES_TEST_OUTPUT=<dir>: write the modules for spirv-val.
+void Dump(const std::vector<u32>& code, std::string_view name) {
+    const char* const directory{std::getenv("EDEN_GLOBAL_MEMORY_ROUTES_TEST_OUTPUT")};
+    if (!directory) {
+        return;
+    }
+    std::filesystem::create_directories(directory);
+    std::ofstream file{std::filesystem::path{directory} / (std::string{name} + ".spv"),
+                       std::ios::binary};
+    file.write(reinterpret_cast<const char*>(code.data()),
+               static_cast<std::streamsize>(code.size() * sizeof(u32)));
+    REQUIRE(file.good());
+}
+
+// The functions marked DontInline, and the functions that call each of them
+std::vector<std::pair<u32, std::set<u32>>> NotInlinedCallers(const std::vector<u32>& code) {
+    static constexpr u32 op_function{54};
+    static constexpr u32 op_function_call{57};
+    static constexpr u32 dont_inline{2};
+    std::vector<std::pair<u32, std::set<u32>>> result;
+    for (size_t i = 5; i < code.size(); i += code[i] >> 16) {
+        if ((code[i] & 0xffff) == op_function && (code[i + 3] & dont_inline) != 0) {
+            result.emplace_back(code[i + 2], std::set<u32>{});
+        }
+    }
+    u32 function{};
+    for (size_t i = 5; i < code.size(); i += code[i] >> 16) {
+        const u32 opcode{code[i] & 0xffff};
+        if (opcode == op_function) {
+            function = code[i + 2];
+        } else if (opcode == op_function_call) {
+            for (auto& [callee, callers] : result) {
+                if (code[i + 3] == callee) {
+                    callers.insert(function);
+                }
+            }
+        }
     }
     return result;
 }
@@ -157,10 +206,114 @@ TEST_CASE("Selecting the buffer routes every access among all bound buffers",
     profile.select_global_memory_buffer = true;
     const auto selections{
         SelectionsPerFunction(Backend::SPIRV::EmitSPIRV(profile, fixture.program))};
-    // The 32, 64 and 128-bit load and store through every buffer, and the entry point: the routed
-    // load and store add none
-    CHECK(selections.size() == 7);
+    // The buffer search, the 32, 64 and 128-bit load and store through every buffer, and the entry
+    // point: the routed load and store add none
+    CHECK(selections.size() == 8);
     CHECK(routed == 9);
+}
+
+TEST_CASE("Selecting the buffer searches the bound buffers in one function that is not inlined",
+          "[shader][global_memory_routes]") {
+    Fixture fixture;
+    Profile profile{};
+    // SPIR-V 1.6 as on NVIDIA: the routed loads select a vector with a scalar condition (1.4)
+    profile.supported_spirv = 0x00010600;
+    profile.support_int64 = true;
+    profile.support_descriptor_aliasing = true;
+    profile.unified_descriptor_binding = true;
+    profile.min_ssbo_alignment = 16;
+    CHECK(NotInlinedCallers(Backend::SPIRV::EmitSPIRV(profile, fixture.program)).empty());
+    profile.select_global_memory_buffer = true;
+    const auto code{Backend::SPIRV::EmitSPIRV(profile, fixture.program)};
+    Dump(code, "select");
+    const auto searches{NotInlinedCallers(code)};
+    REQUIRE(searches.size() == 1);
+    // The 32, 64 and 128-bit load and store each call it
+    CHECK(searches.front().second.size() == 6);
+}
+
+TEST_CASE("NVIDIA compute uses single-candidate routes except for the #619 shaders",
+          "[shader][global_memory_routes]") {
+    constexpr u64 ordinary{0x1234};
+    Profile profile{};
+    profile.supported_spirv = 0x00010600;
+    profile.support_int64 = true;
+    profile.support_descriptor_aliasing = true;
+    profile.unified_descriptor_binding = true;
+    profile.min_ssbo_alignment = 16;
+    profile.select_global_memory_buffer = true;
+    const auto emit = [&](Stage stage, u64 hash, bool single, bool use_pipeline_policy) {
+        Fixture fixture;
+        fixture.program.stage = stage;
+        fixture.program.info.is_task = stage == Stage::Task;
+        fixture.program.info.is_mesh = stage == Stage::Mesh;
+        if (single) {
+            auto& routes = fixture.program.global_memory_routes;
+            REQUIRE(routes.size() == 1);
+            const u32 first_candidate{routes.front().front()};
+            routes.push_back({first_candidate});
+            fixture.program.global_memory_route.at(fixture.routed) = 1;
+        }
+        Backend::Bindings bindings;
+        if (use_pipeline_policy) {
+            return Vulkan::EmitPipelineShader(profile, {}, fixture.program, bindings, hash);
+        }
+        return Backend::SPIRV::EmitSPIRV(profile, {}, fixture.program, bindings);
+    };
+
+    const auto all_buffers{emit(Stage::Compute, ordinary, true, false)};
+    CHECK(emit(Stage::Compute, 0xf98012dc9a4465ffULL, true, true) == all_buffers);
+    CHECK(emit(Stage::Compute, 0xe78efceda31f97a8ULL, true, true) == all_buffers);
+    CHECK(emit(Stage::Compute, ordinary, false, true) == all_buffers);
+    for (Stage stage : {Stage::Task, Stage::Mesh}) {
+        CHECK(emit(stage, ordinary, true, true) == emit(stage, ordinary, true, false));
+    }
+    const auto single{emit(Stage::Compute, ordinary, true, true)};
+    const auto selections{SelectionsPerFunction(single)};
+    REQUIRE(selections.size() == 10);
+    CHECK(selections[7] == 1);
+    CHECK(selections[8] == 1);
+    const auto searches{NotInlinedCallers(single)};
+    REQUIRE(searches.size() == 1);
+    CHECK(searches.front().second.size() == 6);
+    Dump(all_buffers, "single_candidate_all_buffers");
+    Dump(single, "single_candidate_routed");
+}
+
+TEST_CASE("Task and mesh programs search the bound buffers inline",
+          "[shader][global_memory_routes]") {
+    const Stage stage{GENERATE(Stage::Task, Stage::Mesh)};
+    Fixture fixture;
+    fixture.program.stage = stage;
+    fixture.program.info.is_task = stage == Stage::Task;
+    fixture.program.info.is_mesh = stage == Stage::Mesh;
+    Profile profile{};
+    profile.supported_spirv = 0x00010600;
+    profile.support_int64 = true;
+    profile.support_descriptor_aliasing = true;
+    profile.unified_descriptor_binding = true;
+    profile.min_ssbo_alignment = 16;
+    profile.select_global_memory_buffer = true;
+    const auto code{Backend::SPIRV::EmitSPIRV(profile, fixture.program)};
+    Dump(code, stage == Stage::Task ? "select_task" : "select_mesh");
+    CHECK(NotInlinedCallers(code).empty());
+}
+
+TEST_CASE("Pascal and older search the bound buffers inline in every stage",
+          "[shader][global_memory_routes]") {
+    Fixture fixture;
+    Profile profile{};
+    profile.supported_spirv = 0x00010600;
+    profile.support_int64 = true;
+    profile.support_descriptor_aliasing = true;
+    profile.unified_descriptor_binding = true;
+    profile.min_ssbo_alignment = 16;
+    profile.select_global_memory_buffer = true;
+    REQUIRE(NotInlinedCallers(Backend::SPIRV::EmitSPIRV(profile, fixture.program)).size() == 1);
+    profile.has_broken_global_memory_search_call = true;
+    const auto code{Backend::SPIRV::EmitSPIRV(profile, fixture.program)};
+    Dump(code, "select_inline_pascal");
+    CHECK(NotInlinedCallers(code).empty());
 }
 
 TEST_CASE("A route through a pointer array keeps the bound slots past those searched",

@@ -15,6 +15,7 @@
 //      https://link.springer.com/chapter/10.1007/978-3-642-37051-9_6
 //
 
+#include <algorithm>
 #include <deque>
 #include <map>
 #include <span>
@@ -22,6 +23,8 @@
 #include "common/hash.h"
 #include <variant>
 #include <vector>
+
+#include <boost/container/small_vector.hpp>
 
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/opcodes.h"
@@ -437,19 +440,26 @@ void VisitBlock(Pass& pass, IR::Block* block) {
 }
 
 IR::Type GetConcreteType(IR::Inst* inst) {
+    boost::container::small_vector<IR::Inst*, 16> visited;
     std::deque<IR::Inst*> queue;
+    visited.push_back(inst);
     queue.push_back(inst);
     while (!queue.empty()) {
         IR::Inst* current = queue.front();
         queue.pop_front();
         const size_t num_args{current->NumArgs()};
         for (size_t i = 0; i < num_args; ++i) {
-            const auto set_type = current->Arg(i).Type();
+            const IR::Value resolved{current->Arg(i).Resolve()};
+            const auto set_type = resolved.Type();
             if (set_type != IR::Type::Opaque) {
                 return set_type;
             }
-            if (!current->Arg(i).IsImmediate()) {
-                queue.push_back(current->Arg(i).Inst());
+            if (!resolved.IsImmediate()) {
+                IR::Inst* const next_inst{resolved.Inst()};
+                if (std::ranges::find(visited, next_inst) == visited.end()) {
+                    visited.push_back(next_inst);
+                    queue.push_back(next_inst);
+                }
             }
         }
     }

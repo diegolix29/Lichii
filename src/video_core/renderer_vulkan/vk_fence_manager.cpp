@@ -57,6 +57,10 @@ FenceManager::FenceManager(VideoCore::RasterizerInterface& rasterizer_, Tegra::G
     : GenericFenceManager{rasterizer_, gpu_, texture_cache_, buffer_cache_, query_cache_},
       scheduler{scheduler_} {}
 
+FenceManager::~FenceManager() {
+    StopFenceThread();
+}
+
 Fence FenceManager::CreateFence(bool is_stubbed) {
     return std::make_shared<InnerFence>(scheduler, is_stubbed);
 }

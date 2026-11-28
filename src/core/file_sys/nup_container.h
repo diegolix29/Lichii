@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/common_types.h"
@@ -29,7 +30,7 @@ struct NupDecompressCache;
  *   Table of Contents (packages, dir/file nodes, children array, string pool)
  *   Blob region (per-file extents, raw or zstd codec, 16-byte aligned)
  *
- * Per-package meta TLVs carry NPDM bytes, title names (default + localized),
+ * Per-package meta TLVs carry NPDM and NACP bytes, title names (default + localized),
  * icons and a display version. All integers little-endian.
  */
 class NupContainer {
@@ -57,6 +58,7 @@ public:
         u32 meta_size{};
 
         std::vector<u8> npdm;
+        std::vector<u8> nacp;
         std::string title_name;
         std::string publisher;
         std::string source_dump;
@@ -66,8 +68,21 @@ public:
         std::string display_version;
     };
 
+    struct ProgramSelection {
+        std::size_t package_index;
+        VirtualDir exefs;
+        u64 program_id;
+        std::optional<u64> embedded_program_id;
+    };
+
     /// Quick magic check without a full parse.
     static bool IsNupFile(const VirtualFile& file);
+
+    /// Deletes spill files in `dir` whose owning process ended (and old-format ones over an
+    /// hour old). Runs once per process for the default spill directory.
+    static void RemoveLeftoverSpills(const std::filesystem::path& dir);
+    /// The process ID spill file names start with.
+    static u64 CurrentProcessIdForSpills();
 
     /// Recursively merges overlay into a copy of base; overlay paths win.
     static VirtualDir MergeShadowDirs(const VirtualDir& base, const VirtualDir& overlay);
@@ -91,6 +106,9 @@ public:
     std::optional<std::size_t> FindBasePackage() const;
     /// Highest version among Update packages, if any.
     std::optional<std::size_t> FindBestUpdatePackage() const;
+    std::optional<ProgramSelection> SelectProgram();
+    /// Highest version of the selected Switch 2 program's marked upgrade pack, if any.
+    std::optional<std::size_t> FindUpgradePack(u64 program_id);
 
     /// Opens a member file by node index; raw extents are zero-copy views into
     /// the container, zstd extents are decompressed only as far as reads reach,
@@ -100,6 +118,7 @@ public:
     VirtualDir GetExeFSDir(std::size_t package_index);
     VirtualDir GetRomFSDir(std::size_t package_index);
     VirtualDir GetPackageDir(std::size_t package_index);
+    VirtualDir GetPackageSubdirectory(std::size_t package_index, std::string_view path);
 
     /// Stream-hashes every member file against its stored SHA-256.
     Loader::ResultStatus VerifyIntegrity(

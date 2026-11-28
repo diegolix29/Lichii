@@ -36,20 +36,31 @@ void GameCarousel::SetModel(GameListModel* model) {
     UpdateIconSize();
 }
 
-void GameCarousel::ApplyFilter(const QString& edit_filter_text, GameListModel* model) {
+int GameCarousel::ApplyFilter(const QString& edit_filter_text, GameListModel* model) {
     int row_count = model->rowCount();
+    int shown = 0;
 
     for (int i = 0; i < row_count; ++i) {
         QStandardItem* item = model->item(i, 0);
         if (!item)
             continue;
 
-        if (Lichii::FilterMatches(edit_filter_text, item)) {
-            setRowHidden(i, false);
-        } else {
-            setRowHidden(i, true);
-        }
+        const bool matches = Lichii::FilterMatches(edit_filter_text, item);
+        setRowHidden(i, !matches);
+        shown += matches ? 1 : 0;
     }
+
+    // Return activates the current game, so don't leave it on one the search hid.
+    if (currentIndex().isValid() && isRowHidden(currentIndex().row())) {
+        QModelIndex first_shown;
+        for (int i = 0; i < row_count && !first_shown.isValid(); ++i) {
+            if (!isRowHidden(i)) {
+                first_shown = model->index(i, 0);
+            }
+        }
+        setCurrentIndex(first_shown);
+    }
+    return shown;
 }
 
 void GameCarousel::UpdateIconSize() {

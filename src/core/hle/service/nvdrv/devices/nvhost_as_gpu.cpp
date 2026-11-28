@@ -542,7 +542,7 @@ NvResult nvhost_as_gpu::AllocAsEx(IoctlAllocAsEx& params) {
         vm.big_page_size_bits)};
     vm.big_page_allocator.emplace(start_big_pages, end_big_pages);
 
-    gmmu = std::make_unique<Tegra::MemoryManager>(system, max_big_page_bits, vm.va_range_split, vm.big_page_size_bits, VM::PAGE_SIZE_BITS);
+    gmmu = std::make_shared<Tegra::MemoryManager>(system, max_big_page_bits, vm.va_range_split, vm.big_page_size_bits, VM::PAGE_SIZE_BITS);
     system.GPU().InitAddressSpace(*gmmu);
     vm.initialised = true;
     LOG_INFO(Service_NVDRV, "GPU address space {} created: VA [{:#x}, {:#x}), big pages from {:#x}",

@@ -15,7 +15,7 @@ public:
 
     void SetModel(GameListModel* model);
 
-    QString GetLastFilterResultItem() const;
+    QModelIndex GetFilterResult() const;
     int FilterClosedResultCount(GameListModel* model);
     void ApplyFilter(const QString& edit_filter_text, GameListModel* model);
 

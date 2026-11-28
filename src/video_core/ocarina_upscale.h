@@ -16,10 +16,11 @@ enum class OcarinaUpscalePass {
     None,
     /// The 3/4 upscale (1080p to 1440p docked, 810p to 1080p handheld).
     ThreeQuarter,
-    /// The upscale to 2560x1440 from a 16:9 scene up to that size.
-    Pass1440p,
-    /// The same output pass at 1:1, 1920x1080 in handheld with the Max Resolution add-on.
-    FullSize,
+    /// The output pass at 1:1: 2560x1440 docked and 1920x1080 handheld with the Max Resolution
+    /// add-on.
+    OneToOne,
+    /// The upscale from a 16:9 scene the game's dynamic resolution or the DLSS render scale shrank.
+    Scaled,
 };
 
 /// The compute pass whose depth texture is the scene depth the upscaler reprojects.
@@ -33,18 +34,20 @@ constexpr OcarinaUpscalePass FindOcarinaUpscalePass(u64 native_key, u64 shader_h
     case 0x6f9367bd41dc0b58ULL: // shader e40f5efb5480e692
         return ThreeQuarter;
     case 0xda6df3e54c716df2ULL: // shader 6bd913e1f34e83eb
-    case 0xe4cda162ff6009e2ULL: // shader 9302bc0d6d1d9bc1, a scaled scene in the field (#903)
-        return Pass1440p;
+        return OneToOne;
+    case 0xe4cda162ff6009e2ULL: // shader 9302bc0d6d1d9bc1, in the field (#903)
+    case 0xd8efd9f0c95abd80ULL: // shader 03bf0ffc7d2d0bed, handheld (#1866)
+        return Scaled;
     }
     // No capture of these programs has their native key yet. None of them ran in a v131072
     // session on RADV, handheld with and without Max Resolution, into the Deku Tree.
     switch (shader_hash) {
     case 0xef542df87cacfe9eULL:
         return ThreeQuarter;
-    case 0x4c1ae2fe58f30a97ULL: // a scaled scene in menus (#903)
-        return Pass1440p;
+    case 0x4c1ae2fe58f30a97ULL: // in menus (#903)
+        return Scaled;
     case 0xc033c3ddc9f0897bULL:
-        return FullSize;
+        return OneToOne;
     }
     return None;
 }

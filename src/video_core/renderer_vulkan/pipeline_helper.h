@@ -14,6 +14,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
@@ -279,6 +280,22 @@ public:
         });
     }
 
+    /// The set and pipeline layouts from the cache, made on the first pipeline with these
+    /// bindings, set flags and push constant range.
+    const PipelineLayoutCache::Entry& GetLayouts(PipelineLayoutCache& cache,
+                                                 bool use_push_descriptor,
+                                                 bool use_descriptor_buffer = false) const {
+        return cache.Get(PipelineLayoutCache::MakeKey(use_push_descriptor, use_descriptor_buffer,
+                                                      is_compute, uses_mesh, mesh_emulation,
+                                                      std::span(bindings.data(), bindings.size())),
+                         [&] {
+            PipelineLayoutCache::Entry entry;
+            entry.set = CreateDescriptorSetLayout(use_push_descriptor, use_descriptor_buffer);
+            entry.pipeline = CreatePipelineLayout(*entry.set);
+            return entry;
+        });
+    }
+
     /// Mesh emulation: a graphics pipeline layout whose mesh program runs as a compute shader
     /// (its bindings carry VK_SHADER_STAGE_COMPUTE_BIT and so does the push constant range).
     void EnableMeshEmulation() noexcept {
@@ -454,11 +471,12 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
     for (const auto& desc : info.image_descriptors) {
         bool is_rescaled{};
         for (u32 index = 0; index < desc.count; ++index) {
-            ImageView& image_view{texture_cache.GetImageView((views++)->id)};
+            const VideoCommon::ImageViewId image_view_id{(views++)->id};
+            ImageView& image_view{texture_cache.GetImageView(image_view_id)};
             const VkImageView vk_image_view{
                 image_view.StorageView(desc.type, desc.format, desc.is_byte_addressed)};
             if (desc.is_written) {
-                texture_cache.MarkModification(image_view.image_id);
+                texture_cache.MarkStorageWrite(image_view_id);
             }
             guest_descriptor_queue.AddImage(vk_image_view);
             const bool element_rescaled{texture_cache.IsRescaling(image_view)};

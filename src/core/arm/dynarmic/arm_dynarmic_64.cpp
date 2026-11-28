@@ -36,7 +36,8 @@ void TraceJit(size_t core) {
     const auto& now = g_jit_counters[core];
     auto& traced = g_jit_traced[core];
     if (now.blocks_compiled == traced.blocks_compiled && now.cache_clears == traced.cache_clears &&
-        now.blocks_invalidated == traced.blocks_invalidated) {
+        now.blocks_invalidated == traced.blocks_invalidated &&
+        now.fastmem_recompiles == traced.fastmem_recompiles) {
         return;
     }
     VideoCommon::StutterTrace::AddJit(
@@ -91,9 +92,11 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     if (!m_memory.IsValidVirtualAddressRange(vaddr, sizeof(u32)))
         return std::nullopt;
     auto const aligned_vaddr = vaddr & ~Core::Memory::LICHII_PAGEMASK;
-    if (last_code_addr != aligned_vaddr) {
+    const u32 generation = code_generation.load(std::memory_order_acquire);
+    if (last_code_addr != aligned_vaddr || cached_code_generation != generation) {
         m_memory.ReadBlock(aligned_vaddr, &cached_code_page, sizeof(cached_code_page));
         last_code_addr = aligned_vaddr;
+        cached_code_generation = generation;
     }
     const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::LICHII_PAGEMASK) / sizeof(u32)];
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
@@ -283,18 +286,19 @@ u64 DynarmicCallbacks64::GetTicksRemaining() {
     return std::max<s64>(m_parent.m_system.CoreTiming().downcount, 0);
 }
 
-u64 DynarmicCallbacks64::GetCNTPCT() {
-    const u64 ticks = m_parent.m_system.CoreTiming().GetClockTicks();
-    // Guest code that waits by polling the counter (title 1's main thread reads it ~17 million
-    // times a second while waiting for the GPU) keeps a host core busy at full speed, and the
-    // GPU thread is often on the other half of that SMT core. Two reads within ~1.7 us of each
-    // other are such a loop: pause, which hands the core's resources to the sibling thread for a
-    // moment. The guest sees the same counter. EDEN_NX2_CNTPCT_PAUSE=0 turns it off.
+// Guest loops that read the counter within ~1.7 us of the previous read pause to give the GPU
+// thread on the other SMT sibling time to run. EDEN_NX2_CNTPCT_PAUSE=0 turns the pause off.
+static bool CntpctPauseEnabled() {
     static const bool pause_spins = [] {
         const char* value = std::getenv("EDEN_NX2_CNTPCT_PAUSE");
         return value == nullptr || value[0] != '0';
     }();
-    if (pause_spins && ticks - m_last_cntpct < m_spin_ticks) {
+    return pause_spins;
+}
+
+u64 DynarmicCallbacks64::GetCNTPCT() {
+    const u64 ticks = m_parent.m_system.CoreTiming().GetClockTicks();
+    if (CntpctPauseEnabled() && ticks - m_last_cntpct < m_spin_ticks) {
 #if defined(_M_X64) || defined(__x86_64__)
         _mm_pause();
         _mm_pause();
@@ -396,6 +400,18 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     // Timing
     config.wall_clock_cntpct = m_uses_wall_clock;
     config.enable_cycle_counting = !m_uses_wall_clock;
+
+#if defined(ARCHITECTURE_x86_64)
+    if (m_uses_wall_clock && page_table) {
+        if (const auto* mode = m_system.CoreTiming().InlineCntpctMode()) {
+            config.inline_cntpct_mode = mode;
+            config.inline_cntpct_factor = &Common::g_wall_clock.cntpct_rdtsc_factor;
+            config.inline_cntpct_last = &m_cb->m_last_cntpct;
+            config.inline_cntpct_spin_ticks =
+                CntpctPauseEnabled() ? static_cast<u16>(m_cb->m_spin_ticks) : 0;
+        }
+    }
+#endif
 
     // Code cache size
 #if defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
@@ -571,7 +587,7 @@ HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
                                  : Stats::Exit::Other;
     const auto& jit = g_jit_counters[m_core_index];
     Stats::EndRun(thread, m_core_index, start, end, exit, m_svc, jit.block_lookups,
-                  jit.blocks_compiled, jit.cache_clears);
+                  jit.blocks_compiled, jit.cache_clears, jit.fastmem_faults, jit.fastmem_recompiles);
     if (VideoCommon::StutterTrace::Enabled()) {
         TraceJit(m_core_index);
     }
@@ -609,7 +625,7 @@ void ArmDynarmic64::RewindBreakpointInstruction() {
 
 ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process, DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index)
     : ArmInterface{uses_wall_clock}, m_system{system}, m_exclusive_monitor{exclusive_monitor}
-    , m_cb(std::make_optional<DynarmicCallbacks64>(*this, process))
+    , m_cb(std::in_place, *this, process)
     , m_core_index{core_index}
 {
     auto& page_table = process->GetPageTable().GetBasePageTable();
@@ -664,7 +680,7 @@ void ArmDynarmic64::SignalInterrupt(Kernel::KThread* thread) {
 }
 
 void ArmDynarmic64::ClearInstructionCache() {
-    m_cb->last_code_addr = u64(-1);
+    m_cb->code_generation.fetch_add(1, std::memory_order_release);
     m_jit->ClearCache();
 }
 
@@ -672,7 +688,7 @@ void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
     // Drop the cached code page too: blocks recompiled after the invalidation would
     // otherwise still decode the old instructions (e.g. a gdbstub breakpoint written
     // into or removed from that page).
-    m_cb->last_code_addr = u64(-1);
+    m_cb->code_generation.fetch_add(1, std::memory_order_release);
     m_jit->InvalidateCacheRange(addr, size);
 }
 

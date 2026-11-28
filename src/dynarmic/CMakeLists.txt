@@ -94,9 +94,13 @@ else()
         -Wcast-qual
         -pedantic
         -Wno-missing-braces
-        -fno-rtti
         #-fno-exceptions
     )
+    # Not on Apple: see the RTTI comment in src/CMakeLists.txt. A hidden std typeinfo in this
+    # library also takes the place of libc++'s in everything linked with it.
+    if (NOT APPLE)
+        list(APPEND DYNARMIC_CXX_FLAGS -fno-rtti)
+    endif()
     if (CXX_GCC)
         # GCC produces bogus -Warray-bounds warnings from xbyak headers for code paths that are not
         # actually reachable.  Specifically, it happens in cases where some code casts an Operand&

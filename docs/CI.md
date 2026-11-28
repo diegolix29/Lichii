@@ -1,4 +1,12 @@
-# Eglantine CI and release guide
+# CI and release guide
+
+## Lichii release builds
+
+Run `release-binaries` on the desired branch. Set `publish_release`, `include_whats_new`, and `nsight_aftermath` to false for an unpublished test of the full release matrix. The PGO mismatch summary runs only for the Linux x86_64 and Windows x86_64 PGO jobs. It counts compiler warnings, including how many report discarding nonzero counts.
+
+Linux ARM64 PGO installations with the fallback updater (starting with build 116) select the standard ARM64 package on their next update to a release without PGO: AppImage for AppImage installations, `.tar.gz` for unpacked installations. A writable AppImage can be replaced in place; a tarball must be unpacked manually. Builds 75 and 83 match only PGO assets and can first update through an existing PGO release such as [build 386](https://github.com/zortos293/Lichii/releases/tag/build-386) while the updater still lists it. If no update appears, or if you use build 70, which shipped without an updater, download the standard ARM64 package from [GitHub Releases](https://github.com/zortos293/Lichii/releases).
+
+## Eglantine pipeline design (not Lichii's active workflow)
 
 This document describes the split GitHub Actions pipeline added with this change. It is not yet a live workflow until the files have been merged to the required branches and the repository settings below have been applied.
 
@@ -55,7 +63,7 @@ Open Actions → `ci` → Run workflow. Select the branch to build and choose:
 
 - **kind**: `branch` for a test build, or `daily` for a forced daily build of `nx2` only.
 - **platforms**: `all`, `linux`, `windows`, or `macos`. A single-platform run produces a partial release with only that platform's assets.
-- **pgo**: `none` or `both`. For manual runs, `none` is the default. `both` adds PGO variants where supported (Linux x86_64/ARM64 and Windows x86_64); macOS has no PGO variant.
+- **pgo**: `none` or `both`. For manual runs, `none` is the default. `both` adds the Linux x86_64 and Windows x86_64 PGO variants. Linux ARM64 and macOS have no PGO variant.
 - **publish**: enabled by default. Disable it to keep the build as workflow artifacts without creating/updating a GitHub release.
 
 For automatic `nx2` version releases and scheduled daily builds, the workflow requests both PGO variants by default. Label-triggered PR builds default to non-PGO to keep test builds quicker.
@@ -79,13 +87,21 @@ Both the scheme-preparation job and the publishing job check out CI helper scrip
 | Platform            | Default output               | Optional PGO output    |
 | ------------------- | ---------------------------- | ---------------------- |
 | Linux x86_64        | AppImage and `.tar.gz`       | AppImage and `.tar.gz` |
-| Linux aarch64       | AppImage and `.tar.gz`       | AppImage and `.tar.gz` |
+| Linux aarch64       | AppImage and `.tar.gz`       | Not built              |
 | Windows x86_64      | clang-cl + ThinLTO `.zip`    | clang-cl + ThinLTO + PGO `.zip` |
 | macOS Apple Silicon | App bundle `.zip` and `.dmg` | Not built              |
 
 The existing build steps use the repository's current CMake targets (`lichii` and `lichii-cmd`) and package the produced `eglantine` and `eden-cli` binaries. Linux AppImages require glibc 2.39 or newer. Linux tarballs hold the same files as the AppImage, unpacked, with `lichii` and `eden-cli` links at the top. The standard Windows build uses clang-cl from a pinned LLVM release (`tools/windows/install-llvm.ps1`, shared with the Windows build-check job) in Release mode with ThinLTO, against the MSVC headers, runtime and SDK. MSVC itself still builds the project for development but is not used for releases. Windows archives contain the deployed runtime dependencies. macOS artifacts are ad-hoc signed, not notarized; Gatekeeper may require the user to approve the app on first launch.
 
 Build artifacts are retained for seven days. Published GitHub Release assets remain available until a release is deleted. Daily releases are pruned to approximately the seven most recent; branch releases are rolling and are cleaned up when no longer needed.
+
+## Build caches
+
+`build-check.yml` and `release-binaries.yml` cache compiler objects (ccache on every platform, plus lld's ThinLTO cache for the Windows release builds), CPM downloads, the x86-64 release jobs' apt packages and fsr4-vk. A run can restore caches saved on its own ref and on `nx2`, the default branch, and the repository holds 10 GB of caches before GitHub evicts the least recently used.
+
+So only `nx2` saves compiler, CPM and apt caches. Pull requests and branch release builds restore `nx2`'s entries and save none: their own entries helped only that ref, and with one per pull request push they filled the 10 GB and evicted the release caches, whose builds then compiled from scratch. After each save, `tools/ci/prune-caches.sh` deletes the older `nx2` entries of the same family, and each build evicts the ccache entries it didn't use, so a family's entry stays one build's size. A run on `nx2` doesn't save when it was cancelled.
+
+The nightly `release-binaries` run (03:17 UTC) builds `nx2` without publishing to keep those caches close to `nx2`'s head. It skips a commit that already has a successful `nx2` build.
 
 ## Windows PGO profile
 

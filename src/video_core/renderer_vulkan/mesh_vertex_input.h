@@ -11,6 +11,13 @@
 
 namespace Vulkan {
 
+/// Only successful native mesh pipelines can lend vertex input to equivalent draws.
+/// A failed boot pipeline may otherwise hide an equivalent working cache entry.
+template <typename Pipeline>
+[[nodiscard]] constexpr bool CanSeedMeshVertexInput(const Pipeline* pipeline) {
+    return pipeline && pipeline->IsMeshPipeline() && !pipeline->Failed();
+}
+
 /// A native mesh draw's pipeline key holds the vertex input state the last vertex draw left in the
 /// registers, which a mesh pipeline has no use for (it has no vertex input state). That split one
 /// mesh pipeline into several, each a driver compile the draw waits for (#1986: 99 mesh pipelines

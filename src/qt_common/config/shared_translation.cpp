@@ -315,21 +315,28 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, bg_blue, QString(), QString());
 
     INSERT(Settings, frame_gen, tr("Enable Frame Generation"),
-           tr("Paused while HDR output is active."));
+           tr("Generates intermediate frames for smoother motion. Requires Vulkan.\n"
+              "Optical Flow Interpolation is built in. LSFG requires Lossless.dll in the "
+              "user directory's lossless folder."));
     INSERT(Settings, frame_gen_type, tr("Frame Generation Type"),
-           tr("Optical Flow Interpolation is built in and runs on any GPU.\nNVIDIA DLSS Frame "
-              "Generation (Windows only) needs a GeForce RTX 40 series or newer GPU (3x and 4x need "
-              "an RTX 50 series), Hardware-accelerated GPU scheduling on in Windows' graphics "
-              "settings, \"Use NVIDIA DLSS\" on and NVIDIA's files from the NVIDIA DLSS panel. "
-              "It takes the game's depth and motion vectors from the DLSS evaluation, so it runs "
-              "in The Legend of Zelda: Ocarina of Time only, docked, with DLSS as its upscaler. "
-              "Other games, and scRGB HDR output, use Optical Flow Interpolation instead.\nVSync "
-              "is off while it runs. Choosing it takes effect when a game starts."));
+           tr("Lichii Optical Flow Frame Generation is built in and runs on any GPU.\nFlyHigh needs a compatible Vulkan driver and a one-time model "
+              "download. It falls back to Lichii Optical Flow when unavailable.\nNVIDIA "
+              "DLSS Frame Generation (Windows only) needs a GeForce RTX 40 series or newer GPU (3x "
+              "and 4x need an RTX 50 series), Hardware-accelerated GPU scheduling on in Windows' "
+              "graphics settings, \"Use NVIDIA DLSS\" on and NVIDIA's files from the NVIDIA DLSS "
+              "panel. It takes the game's depth and motion vectors from the DLSS evaluation, so it "
+              "runs in The Legend of Zelda: Ocarina of Time only, docked, with DLSS as its "
+              "upscaler. Other games, and scRGB HDR output, use Lichii Optical Flow Frame "
+              "Generation instead.\nVSync is off while it runs. Choosing it takes effect when a "
+              "game starts."));
     INSERT(Settings, frame_gen_multiplier, tr("Frame Generation Multiplier"), QString());
     INSERT(Settings, frame_gen_target_rate, tr("Target Frame Rate"), QString());
     INSERT(Settings, frame_gen_flow_scale_auto, tr("Auto Flow Scale"), QString());
     INSERT(Settings, frame_gen_flow_scale, tr("Flow Scale"), QString());
     INSERT(Settings, frame_gen_queue_target, tr("Queue Target"), QString());
+    INSERT(Settings, frame_gen_flyhigh_protect_hud, tr("Keep HUD Still (FlyHigh)"),
+           tr("Pixels that have not changed for several frames, such as a HUD, are shown as they "
+              "are instead of being interpolated."));
     INSERT(Settings, frame_gen_dump_flow, tr("Dump Optical Flow"), QString());
 
     // Renderer (Advanced Graphics)
@@ -361,8 +368,12 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "falls back to Full when that cannot be proven.\nFull marks the whole binding (up to "
               "8 MiB), the original behaviour: it can delay the game's own writes to nearby memory "
               "(flickering effects) and copy far more data back from the GPU."));
-    INSERT(Settings, use_asynchronous_shaders, tr("Enable asynchronous shader compilation"),
-           tr("May reduce shader stutter."));
+    INSERT(Settings, use_asynchronous_shaders,
+           tr("Don't wait for shaders that are still compiling"),
+           tr("On (default): a draw or compute pass whose shader is still compiling is skipped "
+              "for a few frames, so a new shader costs a brief pop-in instead of a freeze.\nOff "
+              "(accurate): the game waits for every shader, so nothing is ever missing, but each "
+              "new shader can freeze the game for up to a few seconds."));
     INSERT(Settings, gpu_clock, tr("GPU Clocks"),
            tr("Makes the game believe GPU work finishes faster than it does, so it stops lowering "
               "resolution and render distance to fit the Switch's clocks."));
@@ -398,24 +409,34 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "the first time the game uses them: the compute shaders found in the game files. "
               "The first launch reads the game files and takes a few minutes; later launches "
               "only build what is new, until the GPU driver changes. The loading screen has a "
-              "Skip button.\nAsk asks at launch while the game has never been precached."));
+              "Skip button.\nAsk asks at launch while the game has never been precached.\n"
+              "Precompile All Shaders in a game's context menu does this for that game whatever "
+              "this says, and builds every shader its earlier sessions saved too."));
     INSERT(Settings, build_all_cached_shaders, tr("Build all cached shaders before game start"),
            tr("Builds every shader saved by earlier play sessions on the loading screen and keeps "
               "them built, so places you visited long ago don't stutter. Without it, only the "
               "shaders of recent sessions are built there and the rest in the background or when "
               "the game first needs them.\nLoading takes longer and uses more memory, about 0.3 "
               "MB per shader, up to a quarter of the RAM. Takes effect when a game starts."));
-    INSERT(Settings, native_async_draws, tr("Switch 2 draws with unbuilt pipelines:"),
-           tr("Only applies when asynchronous shader building is on. Decides what a Switch 2 draw "
-              "does when its graphics pipeline is still building.\n"
+    INSERT(Settings, native_async_draws, tr("Switch 2 draws and compute with unbuilt shaders:"),
+           tr("Only applies when \"Don't wait for shaders that are still compiling\" is on. Decides "
+              "what Switch 2 work does when its pipeline is still building. Only work that redraws "
+              "what an earlier frame drew can be skipped: draws that are depth-tested into a "
+              "target drawn before, and compute passes whose outputs the GPU wrote before. Other "
+              "work waits unless the separate mesh skip option applies.\n"
               "Wait stalls the GPU until the pipeline is ready (no missing effects, but long "
-              "stalls on new content). Skip drops the draw, which can leave an effect missing for "
-              "a few frames. Bounded waits up to the time below per frame, then skips. The "
-              "EDEN_NX2_ASYNC_DISCARD=1 environment variable still forces Skip."));
+              "stalls on new content). Skip drops that work, which can leave an effect missing "
+              "for a few frames. Bounded (default) waits up to the time below per frame, then "
+              "skips. The EDEN_NX2_ASYNC_DISCARD=1 environment variable still forces Skip."));
     INSERT(Settings, native_pipeline_wait_ms, tr("Pipeline wait per frame (ms):"),
-           tr("Used by the Bounded mode: the most time per frame that Switch 2 draws may wait in "
-              "total for pipelines that are still building. Once spent, the remaining unbuilt "
-              "draws of that frame are skipped."));
+           tr("Used by the Bounded mode: the most time per frame that Switch 2 draws and compute "
+              "passes may wait in total for pipelines that are still building. Once spent, the "
+              "remaining unbuilt work of that frame that can be skipped is skipped."));
+    INSERT(Settings, skip_unbuilt_mesh_draws, tr("Skip Switch 2 mesh draws with unbuilt shaders"),
+           tr("Only applies when \"Don't wait for shaders that are still compiling\" is on. Skips "
+              "Switch 2 mesh draws while their pipelines build, even in Wait mode. This can "
+              "reduce stalls, but some objects may not appear until their shaders finish "
+              "building."));
     INSERT(Settings, enable_compute_pipelines, tr("Enable Compute Pipelines (Intel Vulkan Only)"),
            tr("Required by some games.\nThis setting only exists for Intel "
               "proprietary drivers and may crash if enabled.\nCompute pipelines are always enabled "
@@ -456,6 +477,10 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, enable_buffer_history, tr("Enable buffer history"),
            tr("Enables access to previous buffer states.\nThis option may improve rendering "
               "quality and performance consistency in some games."));
+    INSERT(Settings, render_thread, tr("Render thread (experimental)"),
+           tr("The GPU render thread records Vulkan commands off the GPU back thread, so the two "
+              "run side by side on Switch 2 games. Experimental and off by default.\nTakes effect "
+              "after restarting the game."));
     INSERT(Settings, fix_bloom_effects, tr("Fix bloom effects"), tr("Removes bloom in Burnout."));
 
     // Renderer (Extensions)
@@ -659,8 +684,13 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
          }});
     translations->insert({Settings::EnumMetadata<Settings::CpuBackend>::Index(),
                           {
-                              PAIR(CpuBackend, Dynarmic, tr("Dynarmic")),
-                              PAIR(CpuBackend, Nce, tr("NCE")),
+                              PAIR(CpuBackend, Dynarmic, tr("Dynarmic (JIT)")),
+#ifdef HAS_NCE
+                              PAIR(CpuBackend, Nce, tr("Native (NCE)")),
+#endif
+#ifdef HAS_HYPERVISOR
+                              PAIR(CpuBackend, Hypervisor, tr("Hypervisor (requires multicore)")),
+#endif
                           }});
     translations->insert({Settings::EnumMetadata<Settings::FullscreenMode>::Index(),
                           {
@@ -690,12 +720,14 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
              PAIR(ResolutionSetup, Res7X, tr("7X (5040p/7560p)")),
              PAIR(ResolutionSetup, Res8X, tr("8X (5760p/8640p)")),
          }});
-    translations->insert({Settings::EnumMetadata<Settings::FrameGenType>::Index(),
-                          {
-                              PAIR(FrameGenType, Lsfg, tr("Lossless Scaling (LSFG)")),
-                              PAIR(FrameGenType, Fsr3, tr("Optical Flow Interpolation (built-in)")),
-                              PAIR(FrameGenType, NvidiaDlssG, tr("NVIDIA DLSS Frame Generation")),
-                          }});
+    translations->insert(
+        {Settings::EnumMetadata<Settings::FrameGenType>::Index(),
+         {
+             PAIR(FrameGenType, Lsfg, tr("Lossless Scaling (LSFG)")),
+             PAIR(FrameGenType, OpticalFlow, tr("Lichii Optical Flow Frame Generation")),
+             PAIR(FrameGenType, NvidiaDlssG, tr("NVIDIA DLSS Frame Generation")),
+             PAIR(FrameGenType, FlyHigh, tr("FlyHigh")),
+         }});
     translations->insert({Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
                           {
                               PAIR(ScalingFilter, NearestNeighbor, tr("Nearest Neighbor")),

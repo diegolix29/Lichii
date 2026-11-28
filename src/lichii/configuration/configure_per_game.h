@@ -14,8 +14,10 @@
 
 #include <QDialog>
 #include <QFutureWatcher>
+#include <QImage>
 #include <QList>
 #include <QPixmap>
+#include <QSet>
 #include "configuration/shared_widget.h"
 #include "core/file_sys/vfs/vfs_types.h"
 #include "frontend_common/config.h"
@@ -67,6 +69,7 @@ public:
     void ApplyConfiguration();
 
     void LoadFromFile(FileSys::VirtualFile file_);
+    void ReloadAddonsAfterModStore(const QSet<QString>& store_toggled);
 
     /// The name the library should show when the user renamed the game in this dialog: the custom
     /// name, or the game's own name after the field was cleared.
@@ -81,6 +84,8 @@ public:
     }
 
 signals:
+    void BrowseModsRequested();
+
     /// The custom artwork was saved or removed.
     void CustomArtworkChanged(u64 program_id);
 
@@ -93,14 +98,16 @@ private:
 
     void LoadConfiguration();
     void UpdateIconPreview(const QPixmap& map);
+    void StageCustomIcon(QImage icon);
     void OnUploadNupIcon();
     void OnDetectNupIcon();
+    void OnBrowseIiDB();
     void OnRemoveCustomIcon();
     void UpdateRemoveIconButton();
     bool SaveCustomMetadata(bool show_error = false);
 
     struct DetectIconResult {
-        std::vector<u8> icon_bytes;
+        QImage icon;
         std::string resolved_title;
         std::string error;
     };
@@ -108,14 +115,13 @@ private:
     std::unique_ptr<Ui::ConfigurePerGame> ui;
     FileSys::VirtualFile file;
     std::filesystem::path file_path;
-    u64 title_id;
+    const u64 title_id;
     bool is_nup_file{false};
     std::string original_title;
     std::string initial_title;
     std::optional<QString> renamed_title;
     bool title_changed{false};
-    std::vector<u8> pending_nup_icon;
-    bool nup_icon_modified{false};
+    QImage pending_custom_icon;
     /// The game's own icon, shown again when the custom artwork is removed.
     QPixmap file_icon;
     bool has_custom_icon{false};

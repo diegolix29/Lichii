@@ -1,0 +1,45 @@
+{
+  "summary": "Kirby boots on AMD, older GeForce cards render correctly again, and some games run faster.",
+  "changes": [
+    {
+      "icon": "gamepad",
+      "title": "Kirby and the Forgotten Land",
+      "body": "The Nintendo Switch 2 Edition no longer crashes at launch on affected AMD GPUs. Garbled loading text is also fixed."
+    },
+    {
+      "icon": "bug",
+      "title": "Graphics on older GeForce cards",
+      "body": "Fixes corruption on NVIDIA GeForce GTX 10-series and older cards. Your shader cache rebuilds once after updating."
+    },
+    {
+      "icon": "cpu",
+      "title": "Faster gameplay",
+      "body": "Ocarina of Time and Donkey Kong Bananza run faster in some scenes, and crowded scenes in Fire Emblem: Fortune's Weave can run more smoothly. Gains vary with your hardware and settings."
+    },
+    {
+      "icon": "clock",
+      "title": "Faster first-time shader compiles",
+      "body": "Some large shaders compile faster when you first encounter them, reducing stalls in games such as Ocarina of Time."
+    },
+    {
+      "icon": "apps",
+      "title": "Keep your window size",
+      "body": "Turn on View → Preserve Window Size Across Sessions to stop Lichii from resizing your window when a game starts."
+    },
+    {
+      "icon": "layers",
+      "title": "Safer NUP metadata edits",
+      "body": "Changing an NUP's name, version, or icon no longer strips the Build IDs used to match patches and cheats."
+    },
+    {
+      "icon": "gamepad",
+      "title": "More game graphics fixes",
+      "body": "Restores correct colors in Xenoblade Chronicles 2's Switch 2 Edition. Mario Kart World avoids a crash from an oversized lightmap on some low-VRAM GPUs."
+    },
+    {
+      "icon": "bug",
+      "title": "Album, HDR, and multiplayer fixes",
+      "body": "Album screenshots show thumbnails again. Games get notified when HDR turns on, and multiplayer rooms can connect over Tailscale and WireGuard."
+    }
+  ]
+}

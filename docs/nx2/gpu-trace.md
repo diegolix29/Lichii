@@ -2,6 +2,12 @@
 
 A GPU trace (`.lxtrace`) holds what the emulated GPU consumed over a window, in the order it consumed it, after a snapshot of the GPU state at the window's start. It records guest inputs (command words, guest memory, engine registers, maps and presents), never host Vulkan calls, so a replay runs the shader translation, the caches and the Vulkan backend of the build that replays it.
 
+Traces can contain game code, shaders, textures, buffers and personal information. Do not publish
+game-derived traces or add them to the repository. Ask a maintainer for handling instructions
+before sharing the minimum necessary material, and share only what you have permission to
+disclose. A private transfer does not by itself establish permission to redistribute game data.
+Use synthetic traces for public examples and tests.
+
 ## Replay
 
 ```sh
@@ -16,6 +22,10 @@ The replay needs no game, no window and no keys. It brings up the GPU on a bare 
 The window is a `VK_EXT_headless_surface` surface (`WindowSystemType::Headless`), so any Vulkan driver with that extension works, Mesa's lavapipe included.
 
 `eden-cli --gpu-trace-sample <trace>` writes a synthetic trace that needs no game: one Switch 2 channel whose four frames are two CPU-written images and two sets of 3D engine clears (whole and scissored). The unit tests read it back (`[gpu_trace]`).
+
+`eden-cli --gpu-trace-sample-draws <trace>` writes one that exercises the 3D draw path: four frames of 300 overlapping quads each (a third of them indexed) drawn by a minimal Switch 2 vertex and pixel program pair, with a constant buffer update before every draw, scissor, blend, color mask and viewport changes, and clears between them.
+
+`eden-cli --gpu-trace-sample-uploads <trace>` writes the same draws with new vertex and index data written before every eighth of a frame, so the buffer cache uploads between draws.
 
 ## Recording
 

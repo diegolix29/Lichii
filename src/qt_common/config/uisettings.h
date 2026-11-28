@@ -93,6 +93,7 @@ struct Values {
 
     Setting<bool> single_window_mode{linkage, true, "singleWindowMode", Category::Ui};
     Setting<bool> fullscreen{linkage, false, "fullscreen", Category::Ui};
+    Setting<bool> preserve_window_size{linkage, false, "preserveWindowSize", Category::Ui};
     Setting<bool> show_filter_bar{linkage, true, "showFilterBar", Category::Ui};
     Setting<bool> show_status_bar{linkage, true, "showStatusBar", Category::Ui};
 
@@ -105,9 +106,7 @@ struct Values {
                                                            true};
 
     Setting<bool> first_start{linkage, true, "firstStart", Category::Ui};
-    // The last What's new release shown, and whether to show the next one on launch
-    Setting<u32> whats_new_version{linkage, 0, "whats_new_version", Category::Ui};
-    Setting<bool> show_whats_new{linkage, true, "show_whats_new", Category::Ui};
+    Setting<u32> last_seen_release{linkage, 0, "last_seen_release", Category::Ui};
     Setting<bool> show_low_ram_warning{linkage, true, "show_low_ram_warning", Category::Ui};
     Setting<bool> pause_when_in_background{linkage,
                                            false,
@@ -158,6 +157,9 @@ struct Values {
 
     // Discord RPC
     Setting<bool> enable_discord_presence{linkage, false, "enable_discord_presence", Category::Ui};
+    Setting<std::string> mod_store_api_url{linkage, "https://lichii-api.zortos.me",
+                                           "mod_store_api_url", Category::Ui,
+                                           Settings::Specialization::Default, false};
 
     // logging
     Setting<bool> show_console{linkage, false, "showConsole", Category::Ui};
@@ -254,7 +256,7 @@ void SaveWindowState();
 void RestoreWindowState(std::unique_ptr<QtConfig>& qtConfig);
 
 // sync with uisettings.cpp
-extern const std::array<Shortcut, 34> default_hotkeys;
+extern const std::array<Shortcut, 35> default_hotkeys;
 
 } // namespace UISettings
 

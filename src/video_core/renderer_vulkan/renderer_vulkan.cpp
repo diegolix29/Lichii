@@ -22,6 +22,7 @@
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/present.h"
 #include "video_core/render_trace.h"
@@ -37,6 +38,7 @@
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/textures/decoders.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
+#include "video_core/vulkan_common/vulkan_address_map.h"
 #include "video_core/vulkan_common/vulkan_debug_callback.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_instance.h"
@@ -177,6 +179,8 @@ try
     // Create debug messenger if debug is enabled
     , debug_messenger(Settings::values.renderer_debug ? CreateDebugUtilsCallback(instance)
                                                     : vk::DebugUtilsMessenger{})
+    , address_messenger(AddressMap::Wanted() ? CreateAddressBindingCallback(instance, dld)
+                                             : vk::DebugUtilsMessenger{})
     // Create surface
     , surface(CreateSurface(instance, render_window.GetWindowInfo()))
     , device(CreateDevice(instance, dld, *surface))
@@ -273,10 +277,17 @@ try
 
 RendererVulkan::~RendererVulkan() {
     scheduler.RegisterOnSubmit([] {});
+#ifdef HAS_FLYHIGH
+    frame_gen.DrainFlyHighSubmissions();
+#endif
     void(device.GetLogical().WaitIdle());
 }
 
 void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
+    if (VideoCommon::GpuSplit::LendsToRender()) [[unlikely]] {
+        VideoCommon::GpuSplit::Get().LendRender([&] { Composite(framebuffers); });
+        return;
+    }
     const bool trace = Common::DkbFrameTrace::Enabled();
     const auto entered = trace ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
@@ -529,6 +540,11 @@ void RendererVulkan::RenderScreenshot(std::span<const Tegra::FramebufferConfig> 
 }
 
 std::vector<u8> RendererVulkan::GetAppletCaptureBuffer() {
+    if (VideoCommon::GpuSplit::LendsToRender()) [[unlikely]] {
+        std::vector<u8> lent;
+        VideoCommon::GpuSplit::Get().LendRender([&] { lent = GetAppletCaptureBuffer(); });
+        return lent;
+    }
     using namespace VideoCore::Capture;
 
     std::vector<u8> out(VideoCore::Capture::TiledSize);

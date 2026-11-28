@@ -22,6 +22,9 @@
 #include "input_common/drivers/sdl_driver.h"
 #include "input_common/helpers/dualsense_haptics.h"
 #include "input_common/helpers/rumble_mapping.h"
+#ifdef HAVE_SWITCH2_BLE
+#include "input_common/drivers/switch2_ble.h"
+#endif
 
 namespace InputCommon {
 
@@ -655,6 +658,11 @@ public:
             default:
                 break;
             }
+            if (SDL_GetGamepadVendor(sdl_controller.get()) == 0x057E &&
+                SDL_GetGamepadProduct(sdl_controller.get()) == 0x2069 &&
+                !SDL_IsJoystickVirtual(SDL_GetGamepadID(sdl_controller.get()))) {
+                return "Nintendo Switch 2 Pro Controller";
+            }
             const auto name = SDL_GetGamepadName(sdl_controller.get());
             if (name) {
                 return name;
@@ -933,6 +941,9 @@ void SDLDriver::PumpEvents() {
     if (!initialized) {
         return;
     }
+#ifdef HAVE_SWITCH2_BLE
+    switch2_ble->Pump();
+#endif
     SDL_PumpEvents();
     const auto now = std::chrono::steady_clock::now();
     if (now - last_motion_stall_check < std::chrono::milliseconds{250}) {
@@ -1060,6 +1071,9 @@ SDLDriver::SDLDriver(std::string input_engine_) : InputEngine(std::move(input_en
         SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_RAWINPUT_CORRELATE_XINPUT, "0", SDL_HINT_OVERRIDE);
         SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_WGI, "0", SDL_HINT_OVERRIDE);
     }
+    // SDL is built with libusb on Windows for Switch 2 controllers. Leave the GameCube adapter to
+    // the GC adapter driver, which claims it through libusb itself.
+    SDL_SetHint(SDL_HINT_HIDAPI_LIBUSB_GAMECUBE, "0");
 #endif
 
     // SDL3 defaults Steam Controller Bluetooth HIDAPI support to off, which can disable gyro.
@@ -1114,9 +1128,15 @@ SDLDriver::SDLDriver(std::string input_engine_) : InputEngine(std::move(input_en
         }
         SDL_free(joysticks);
     }
+#ifdef HAVE_SWITCH2_BLE
+    switch2_ble = std::make_unique<Switch2Ble>();
+#endif
 }
 
 SDLDriver::~SDLDriver() {
+#ifdef HAVE_SWITCH2_BLE
+    switch2_ble.reset();
+#endif
     CloseJoysticks();
     SDL_RemoveEventWatch(&SDLEventWatcher, this);
 

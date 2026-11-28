@@ -117,11 +117,17 @@ public:
 protected:
     explicit CDmaPusher(Host1x::Host1x& host1x, s32 id);
 
+    /// Stops and joins the thread that runs the command lists; later calls do nothing. The list
+    /// in progress ends at its next word. A derived class must call it first in its destructor:
+    /// the thread calls ProcessMethod, and uses the derived class's members through it, until it
+    /// sees the stop.
+    void StopThread();
+
     virtual void ProcessMethod(u32 method, u32 arg) = 0;
 
 private:
     /// Invoke command class devices to execute the command based on the current state
-    void ExecuteCommand(u32 state_offset, u32 data);
+    void ExecuteCommand(u32 state_offset, u32 data, const std::stop_token& stop_token);
 
 protected:
     ThiRegisters thi_regs{};

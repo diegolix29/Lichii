@@ -55,8 +55,7 @@ commits() { git log --no-merges --pretty='- %s (`%h`)' "$@" 2>/dev/null | head -
   x_std=$(linux_cell linux-x86_64)
   x_pgo=$(linux_cell linux-x86_64-pgo)
   a_std=$(linux_cell linux-aarch64)
-  a_pgo=$(linux_cell linux-aarch64-pgo)
-  if [[ -n "$x_std$x_pgo$a_std$a_pgo" ]]; then
+  if [[ -n "$x_std$x_pgo$a_std" ]]; then
     cat <<'EOF2'
 ## Linux
 
@@ -66,7 +65,7 @@ The AppImage is self-contained (needs glibc 2.39 or newer: Ubuntu 24.04, Fedora 
 | --- | --- | --- | --- |
 EOF2
     row amd64 "$x_std" "$x_pgo"
-    row 'ARM (aarch64)' "$a_std" "$a_pgo"
+    row 'ARM (aarch64)' "$a_std" ''
     printf '\n'
   fi
 
@@ -94,7 +93,7 @@ EOF2
     printf '\n'
   fi
 
-  if [[ -n "$x_pgo$a_pgo$w_pgo" ]]; then
+  if [[ -n "$x_pgo$w_pgo" ]]; then
     echo "The PGO builds are the same programs compiled with profile-guided optimization (clang plus Eglantine's profile); prefer them when your CPU supports it."
   fi
 } > "$out"

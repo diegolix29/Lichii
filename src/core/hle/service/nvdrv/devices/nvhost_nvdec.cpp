@@ -78,6 +78,8 @@ void nvhost_nvdec::OnOpen(NvCore::SessionId session_id, DeviceFD fd) {
 void nvhost_nvdec::OnClose(DeviceFD fd) {
     LOG_INFO(Service_NVDRV, "NVDEC video stream ended");
     host1x.StopDevice(fd, Tegra::Host1x::ChannelType::NvDec);
+    // The lists still queued or in progress were dropped with their syncpoint increments.
+    syncpoint_manager.CompleteSyncpoint(channel_syncpoint);
     system.SetNVDECActive(false);
     auto it = sessions.find(fd);
     if (it != sessions.end()) {

@@ -170,9 +170,13 @@ else()
     if (NOT MSVC)
         add_compile_options(
             $<$<COMPILE_LANGUAGE:C,CXX>:-fwrapv>
-            $<$<COMPILE_LANGUAGE:C,CXX>:-pipe>
-            # Disable RTTI (C++ only)
-            $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
+            $<$<COMPILE_LANGUAGE:C,CXX>:-pipe>)
+        # Disable RTTI (C++ only), except on Apple: its libc++abi matches exception types by
+        # typeinfo address, and with -fno-rtti each TU gets a hidden copy of the std exception
+        # typeinfo, so catch (const std::logic_error&) misses what libc++ throws.
+        if (NOT APPLE)
+            add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
+        endif()
     endif()
 
     if (ENABLE_WERROR)
