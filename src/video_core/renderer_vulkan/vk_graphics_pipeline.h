@@ -453,7 +453,7 @@ public:
 
     /// The shader info of a pipeline stage (vertex B to fragment), null for a stage it lacks.
     [[nodiscard]] const Shader::Info* StageInfo(size_t stage) const noexcept {
-        return stage_present[stage] ? &stage_infos[stage] : nullptr;
+        return stages_present[stage] ? &stage_infos[stage] : nullptr;
     }
 
     /// Built from a precompiled pipeline's recorded environments and shader infos (see
@@ -595,6 +595,7 @@ private:
     const bool worker_only_build;
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
+    bool precompiled{};
 
     // Mesh emulation (MeshEmulationSetup).
     std::optional<MeshEmulationSetup> mesh_emulation;
